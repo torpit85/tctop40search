@@ -27,6 +27,39 @@ def normalize_artist_key(value: str | None) -> str:
     return value.strip()
 
 
+def resolve_song_bucket_key(value: str | None) -> str:
+    text = normalize_spaces(value).lower()
+    if not text:
+        return ""
+
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+
+    prev = None
+    while text != prev:
+        prev = text
+
+        # Strip trailing "from ..." labels
+        text = re.sub(r'\s*-\s*from\s+"[^"]+"\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*-\s*from\s+'[^']+'\s*$", "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*-\s*from\s+[^-()]+\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+from\s+"[^"]+"\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+from\s+'[^']+'\s*$", "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+from\s+[^-()]+\s*$', "", text, flags=re.IGNORECASE)
+
+        # Explicit soundtrack/source-style parentheticals
+        text = re.sub(r'\s*\((original gangstas)\)\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\((from [^)]*)\)\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\((music from [^)]*)\)\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\(([^)]*soundtrack[^)]*)\)\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\(([^)]*motion picture[^)]*)\)\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\(([^)]*film[^)]*)\)\s*$', "", text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\(([^)]*movie[^)]*)\)\s*$', "", text, flags=re.IGNORECASE)
+
+    text = re.sub(r"\s+", " ", text).strip(" -")
+    return text
+
+
 def split_artist_roles(full_artist_display: str | None) -> tuple[str, str]:
     full_artist_display = normalize_spaces(full_artist_display)
     if not full_artist_display:
@@ -100,28 +133,60 @@ def populate_artist_role_columns(conn: sqlite3.Connection) -> int:
     return updated
 
 
-def rebuild_canonical_from_lead_artist(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
+def rebuild_canonical_from_song_title_latest_artist(conn: sqlite3.Connection) -> None:
+    """Option B: one resolved song bucket resolves to one newest lead/featured pairing."""
+    raw_rows = conn.execute(
         """
-        SELECT entry_id, normalized_song_title, normalized_lead_artist
-        FROM entry
-        ORDER BY entry_id
+        SELECT
+            e.entry_id,
+            e.normalized_song_title,
+            e.normalized_lead_artist,
+            e.normalized_featured_artist,
+            cw.chart_date
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE COALESCE(e.normalized_song_title, '') <> ''
+        ORDER BY cw.chart_date DESC, e.entry_id DESC
         """
     ).fetchall()
+
+    latest_pairing_by_bucket: dict[str, tuple[str, str]] = {}
+    entry_bucket_rows: list[tuple[int, str]] = []
+
+    for entry_id, normalized_song_title, normalized_lead_artist, normalized_featured_artist, _chart_date in raw_rows:
+        bucket_key = resolve_song_bucket_key(normalized_song_title)
+        if not bucket_key:
+            continue
+        entry_bucket_rows.append((entry_id, bucket_key))
+        if bucket_key not in latest_pairing_by_bucket:
+            latest_pairing_by_bucket[bucket_key] = (
+                normalize_spaces(normalized_lead_artist or ""),
+                normalize_spaces(normalized_featured_artist or ""),
+            )
 
     group_to_id: dict[str, int] = {}
     next_id = 1
     updates: list[tuple[int, str, str, str, int]] = []
 
-    for entry_id, normalized_song_title, normalized_lead_artist in rows:
-        title_key = normalize_spaces(normalized_song_title or "")
-        lead_key = normalize_spaces(normalized_lead_artist or "")
-        group_key = f"{title_key}||{lead_key}"
+    for entry_id, bucket_key in sorted(entry_bucket_rows, key=lambda x: x[0]):
+        lead_key, featured_key = latest_pairing_by_bucket[bucket_key]
+        artist_key = lead_key if not featured_key else f"{lead_key} feat {featured_key}"
+        group_key = f"{bucket_key}||{lead_key}||{featured_key}"
         if group_key not in group_to_id:
             group_to_id[group_key] = next_id
             next_id += 1
         canonical_song_id = group_to_id[group_key]
-        updates.append((canonical_song_id, title_key, lead_key, group_key, entry_id))
+        updates.append((canonical_song_id, bucket_key, artist_key, group_key, entry_id))
+
+    conn.execute(
+        """
+        UPDATE entry
+        SET canonical_song_id = NULL,
+            canonical_title_key = NULL,
+            canonical_artist_key = NULL,
+            canonical_group_key = NULL
+        """
+    )
 
     conn.executemany(
         """
@@ -357,7 +422,7 @@ def main() -> None:
         description=(
             "Split full artist credits into lead/featured roles, prefer the most recent "
             "lead/featured display strings when rebuilding canonical songs, and optionally "
-            "rebuild canonical identity using song title + lead artist."
+            "rebuild canonical identity using song title + the most recent lead/featured pairing."
         )
     )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Path to SQLite database")
@@ -394,7 +459,7 @@ def main() -> None:
         with conn:
             updated = populate_artist_role_columns(conn)
             if not args.no_rebuild_canonical:
-                rebuild_canonical_from_lead_artist(conn)
+                rebuild_canonical_from_song_title_latest_artist(conn)
                 rebuild_canonical_song_table(conn)
                 rederive_markers(conn)
 

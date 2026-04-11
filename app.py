@@ -18,7 +18,7 @@ DB_CANDIDATES = [
 DB_PATH = next((path for path in DB_CANDIDATES if path.exists()), DB_CANDIDATES[0])
 
 st.set_page_config(page_title="Torrey's Corner Top 40 Search Engine", layout="wide")
-
+st.caption(f"Using database: {DB_PATH}")
 
 @st.cache_resource
 def get_connection() -> sqlite3.Connection:
