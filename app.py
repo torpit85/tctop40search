@@ -174,6 +174,119 @@ def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
 
     params.append(limit)
 
+    sql = ENTRY_STATS_CTE + f"""
+        SELECT
+            cw.chart_date,
+            e.position,
+            es.last_week_position,
+            es.weeks_on_chart,
+            e.song_title_display AS song,
+            e.full_artist_display AS artist,
+            e.lead_artist_display AS lead_artist,
+            e.featured_artist_display AS featured_artist,
+            e.derived_marker,
+            e.canonical_song_id,
+            cw.row_count,
+            cw.source_file
+        FROM entry_fts f
+        JOIN entry e ON e.entry_id = f.rowid
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        LEFT JOIN entry_stats es ON es.entry_id = e.entry_id
+        {where_sql}
+        ORDER BY cw.chart_date DESC, e.position ASC
+        LIMIT ?
+    """
+    return pd.read_sql_query(sql, conn, params=params)
+
+@st.cache_data(show_spinner=False)
+def load_chart_dates() -> list[str]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT chart_date FROM chart_week ORDER BY chart_date DESC"
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def nearest_chart_date(selected_date: str, available_dates: list[str]) -> tuple[str | None, bool]:
+    if not available_dates:
+        return None, False
+    ordered = sorted(available_dates)
+    if selected_date in set(ordered):
+        return selected_date, False
+    prior = [d for d in ordered if d <= selected_date]
+    if prior:
+        return prior[-1], True
+    return ordered[0], True
+
+
+@st.cache_data(show_spinner=False)
+def load_overview() -> dict[str, object]:
+    conn = get_connection()
+    min_date, max_date, weeks = conn.execute(
+        "SELECT MIN(chart_date), MAX(chart_date), COUNT(*) FROM chart_week"
+    ).fetchone()
+    entries = conn.execute("SELECT COUNT(*) FROM entry").fetchone()[0]
+    table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if 'canonical_song' in table_names:
+        unique_songs = conn.execute("SELECT COUNT(*) FROM canonical_song").fetchone()[0]
+    else:
+        unique_songs = conn.execute(
+            "SELECT COUNT(DISTINCT normalized_song_title || '||' || normalized_full_artist) FROM entry "
+            "WHERE normalized_song_title <> '' AND normalized_full_artist <> ''"
+        ).fetchone()[0]
+
+    unique_full_artists = conn.execute(
+        "SELECT COUNT(DISTINCT normalized_full_artist) FROM entry WHERE COALESCE(normalized_full_artist, '') <> ''"
+    ).fetchone()[0]
+    unique_lead_artists = conn.execute(
+        "SELECT COUNT(DISTINCT normalized_lead_artist) FROM entry WHERE COALESCE(normalized_lead_artist, '') <> ''"
+    ).fetchone()[0]
+
+    return {
+        "min_date": min_date,
+        "max_date": max_date,
+        "weeks": weeks,
+        "entries": entries,
+        "unique_songs": unique_songs,
+        "unique_full_artists": unique_full_artists,
+        "unique_lead_artists": unique_lead_artists,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def marker_counts() -> dict[str, int]:
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN derived_is_debut = 1 THEN 1 ELSE 0 END) AS debuts,
+            SUM(CASE WHEN derived_is_top_debut = 1 THEN 1 ELSE 0 END) AS top_debuts,
+            SUM(CASE WHEN derived_is_reentry = 1 THEN 1 ELSE 0 END) AS reentries
+        FROM entry
+        """
+    ).fetchone()
+    return {
+        "debuts": int(row["debuts"] or 0),
+        "top_debuts": int(row["top_debuts"] or 0),
+        "reentries": int(row["reentries"] or 0),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
+    conn = get_connection()
+    where_sql = "WHERE entry_fts MATCH ?"
+    params: list[object] = [make_fts_query(query)]
+
+    if marker_filter == "DEBUT":
+        where_sql += " AND e.derived_is_debut = 1"
+    elif marker_filter == "TOP DEBUT":
+        where_sql += " AND e.derived_is_top_debut = 1"
+    elif marker_filter == "RE-ENTRY":
+        where_sql += " AND e.derived_is_reentry = 1"
+
+    params.append(limit)
+
 sql = ENTRY_STATS_CTE + """
     SELECT
         e.entry_id,
@@ -591,6 +704,7 @@ def load_analytics_base() -> pd.DataFrame:
     conn = get_connection()
     sql = ENTRY_STATS_CTE + """
         SELECT
+            e.entry_id,
             cw.chart_date,
             e.chart_week_id,
             e.position,
