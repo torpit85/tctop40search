@@ -10,8 +10,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = BASE_DIR / 'db' / 'torreys_corner_top40.sqlite'
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / 'db' / 'tctop40.sqlite'
 SCHEMA_PATH = BASE_DIR / 'schema.sql'
 
 DATE_PATTERNS = [

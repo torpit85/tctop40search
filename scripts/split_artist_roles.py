@@ -60,6 +60,33 @@ def resolve_song_bucket_key(value: str | None) -> str:
     return text
 
 
+def artist_family_tokens(lead_key: str, featured_key: str) -> set[str]:
+    text = " ".join(part for part in [lead_key or "", featured_key or ""] if part).strip()
+    if not text:
+        return set()
+    text = text.replace(" feat ", " ")
+    text = text.replace(" and ", " ")
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    stop = {"the", "and", "feat", "ft", "featuring"}
+    return {tok for tok in tokens if tok not in stop}
+
+
+def artist_families_related(a_lead: str, a_feat: str, b_lead: str, b_feat: str) -> bool:
+    a_tokens = artist_family_tokens(a_lead, a_feat)
+    b_tokens = artist_family_tokens(b_lead, b_feat)
+    if not a_tokens or not b_tokens:
+        return False
+    if a_tokens == b_tokens:
+        return True
+    if a_tokens & b_tokens:
+        return True
+    a_text = " ".join(sorted(a_tokens))
+    b_text = " ".join(sorted(b_tokens))
+    if a_text in b_text or b_text in a_text:
+        return True
+    return False
+
+
 def split_artist_roles(full_artist_display: str | None) -> tuple[str, str]:
     full_artist_display = normalize_spaces(full_artist_display)
     if not full_artist_display:
@@ -134,7 +161,7 @@ def populate_artist_role_columns(conn: sqlite3.Connection) -> int:
 
 
 def rebuild_canonical_from_song_title_latest_artist(conn: sqlite3.Connection) -> None:
-    """Option B: one resolved song bucket resolves to one newest lead/featured pairing."""
+    """Resolve by cleaned song bucket, but keep separate unrelated artist families within a title bucket."""
     raw_rows = conn.execute(
         """
         SELECT
@@ -150,26 +177,47 @@ def rebuild_canonical_from_song_title_latest_artist(conn: sqlite3.Connection) ->
         """
     ).fetchall()
 
-    latest_pairing_by_bucket: dict[str, tuple[str, str]] = {}
-    entry_bucket_rows: list[tuple[int, str]] = []
+    bucket_clusters: dict[str, list[dict[str, str]]] = {}
+    entry_assignments: list[tuple[int, str, int]] = []
 
     for entry_id, normalized_song_title, normalized_lead_artist, normalized_featured_artist, _chart_date in raw_rows:
         bucket_key = resolve_song_bucket_key(normalized_song_title)
         if not bucket_key:
             continue
-        entry_bucket_rows.append((entry_id, bucket_key))
-        if bucket_key not in latest_pairing_by_bucket:
-            latest_pairing_by_bucket[bucket_key] = (
-                normalize_spaces(normalized_lead_artist or ""),
-                normalize_spaces(normalized_featured_artist or ""),
-            )
+
+        lead_key = normalize_spaces(normalized_lead_artist or "")
+        featured_key = normalize_spaces(normalized_featured_artist or "")
+
+        clusters = bucket_clusters.setdefault(bucket_key, [])
+        cluster_index = None
+
+        for idx, cluster in enumerate(clusters):
+            if artist_families_related(
+                lead_key,
+                featured_key,
+                cluster["lead_key"],
+                cluster["featured_key"],
+            ):
+                cluster_index = idx
+                break
+
+        if cluster_index is None:
+            clusters.append({
+                "lead_key": lead_key,
+                "featured_key": featured_key,
+            })
+            cluster_index = len(clusters) - 1
+
+        entry_assignments.append((entry_id, bucket_key, cluster_index))
 
     group_to_id: dict[str, int] = {}
     next_id = 1
     updates: list[tuple[int, str, str, str, int]] = []
 
-    for entry_id, bucket_key in sorted(entry_bucket_rows, key=lambda x: x[0]):
-        lead_key, featured_key = latest_pairing_by_bucket[bucket_key]
+    for entry_id, bucket_key, cluster_index in sorted(entry_assignments, key=lambda x: x[0]):
+        cluster = bucket_clusters[bucket_key][cluster_index]
+        lead_key = cluster["lead_key"]
+        featured_key = cluster["featured_key"]
         artist_key = lead_key if not featured_key else f"{lead_key} feat {featured_key}"
         group_key = f"{bucket_key}||{lead_key}||{featured_key}"
         if group_key not in group_to_id:
