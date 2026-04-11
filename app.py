@@ -174,29 +174,29 @@ def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
 
     params.append(limit)
 
-    sql = ENTRY_STATS_CTE + f"""
-        SELECT
-            cw.chart_date,
-            e.position,
-            es.last_week_position,
-            es.weeks_on_chart,
-            e.song_title_display AS song,
-            e.full_artist_display AS artist,
-            e.lead_artist_display AS lead_artist,
-            e.featured_artist_display AS featured_artist,
-            e.derived_marker,
-            e.canonical_song_id,
-            cw.row_count,
-            cw.source_file
-        FROM entry_fts f
-        JOIN entry e ON e.entry_id = f.rowid
-        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
-        LEFT JOIN entry_stats es ON es.entry_id = e.entry_id
-        {where_sql}
-        ORDER BY cw.chart_date DESC, e.position ASC
-        LIMIT ?
-    """
-    return pd.read_sql_query(sql, conn, params=params)
+sql = ENTRY_STATS_CTE + """
+    SELECT
+        e.entry_id,
+        cw.chart_date,
+        e.chart_week_id,
+        e.position,
+        es.last_week_position,
+        es.weeks_on_chart,
+        e.song_title_display AS title,
+        e.full_artist_display AS artist,
+        e.lead_artist_display AS lead_artist,
+        e.featured_artist_display AS featured_artist,
+        e.derived_marker,
+        e.derived_is_debut,
+        e.derived_is_reentry,
+        e.canonical_song_id,
+        e.normalized_song_title,
+        e.normalized_full_artist,
+        e.normalized_lead_artist,
+        e.normalized_featured_artist
+    FROM entry e
+    ...
+"""
 
 
 @st.cache_data(show_spinner=False)
