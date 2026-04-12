@@ -2,11 +2,65 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
+import re
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 import streamlit as st
+
+def _fold_quotes(text: str) -> str:
+    text = (text or "")
+    return (
+        text.replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+    )
+
+
+def normalize_search_text(text: object) -> str:
+    text = _fold_quotes("" if text is None else str(text))
+    text = text.lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+ARTIST_KEY_ALIASES = {
+    "dino of h-town": "dino conner",
+    "dino of conner": "dino conner",
+    "jake": "jake&papa",
+    "papa": "jake&papa",
+    "jake & papa": "jake&papa",
+    "jake and papa": "jake&papa",
+    "jake+papa": "jake&papa",
+    "jake/papa": "jake&papa",
+    "jake; papa": "jake&papa",
+}
+
+PREFERRED_ARTIST_DISPLAY = {
+    "dino conner": "Dino Conner",
+    "jake&papa": "Jake&Papa",
+}
+
+
+def resolve_artist_key_alias(artist_key: object) -> object:
+    if artist_key is None or (isinstance(artist_key, float) and pd.isna(artist_key)):
+        return artist_key
+    key = normalize_search_text(artist_key)
+    return ARTIST_KEY_ALIASES.get(key, key)
+
+
+def preferred_artist_display(artist_key: object, fallback: object = "") -> str:
+    key = resolve_artist_key_alias(artist_key)
+    if key is None or (isinstance(key, float) and pd.isna(key)):
+        return "" if fallback is None else str(fallback)
+    key = normalize_search_text(key)
+    preferred = PREFERRED_ARTIST_DISPLAY.get(key)
+    if preferred:
+        return preferred
+    return "" if fallback is None else str(fallback)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_CANDIDATES = [
@@ -198,119 +252,6 @@ def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
     """
     return pd.read_sql_query(sql, conn, params=params)
 
-@st.cache_data(show_spinner=False)
-def load_chart_dates() -> list[str]:
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT chart_date FROM chart_week ORDER BY chart_date DESC"
-    ).fetchall()
-    return [row[0] for row in rows]
-
-
-def nearest_chart_date(selected_date: str, available_dates: list[str]) -> tuple[str | None, bool]:
-    if not available_dates:
-        return None, False
-    ordered = sorted(available_dates)
-    if selected_date in set(ordered):
-        return selected_date, False
-    prior = [d for d in ordered if d <= selected_date]
-    if prior:
-        return prior[-1], True
-    return ordered[0], True
-
-
-@st.cache_data(show_spinner=False)
-def load_overview() -> dict[str, object]:
-    conn = get_connection()
-    min_date, max_date, weeks = conn.execute(
-        "SELECT MIN(chart_date), MAX(chart_date), COUNT(*) FROM chart_week"
-    ).fetchone()
-    entries = conn.execute("SELECT COUNT(*) FROM entry").fetchone()[0]
-    table_names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if 'canonical_song' in table_names:
-        unique_songs = conn.execute("SELECT COUNT(*) FROM canonical_song").fetchone()[0]
-    else:
-        unique_songs = conn.execute(
-            "SELECT COUNT(DISTINCT normalized_song_title || '||' || normalized_full_artist) FROM entry "
-            "WHERE normalized_song_title <> '' AND normalized_full_artist <> ''"
-        ).fetchone()[0]
-
-    unique_full_artists = conn.execute(
-        "SELECT COUNT(DISTINCT normalized_full_artist) FROM entry WHERE COALESCE(normalized_full_artist, '') <> ''"
-    ).fetchone()[0]
-    unique_lead_artists = conn.execute(
-        "SELECT COUNT(DISTINCT normalized_lead_artist) FROM entry WHERE COALESCE(normalized_lead_artist, '') <> ''"
-    ).fetchone()[0]
-
-    return {
-        "min_date": min_date,
-        "max_date": max_date,
-        "weeks": weeks,
-        "entries": entries,
-        "unique_songs": unique_songs,
-        "unique_full_artists": unique_full_artists,
-        "unique_lead_artists": unique_lead_artists,
-    }
-
-
-@st.cache_data(show_spinner=False)
-def marker_counts() -> dict[str, int]:
-    conn = get_connection()
-    row = conn.execute(
-        """
-        SELECT
-            SUM(CASE WHEN derived_is_debut = 1 THEN 1 ELSE 0 END) AS debuts,
-            SUM(CASE WHEN derived_is_top_debut = 1 THEN 1 ELSE 0 END) AS top_debuts,
-            SUM(CASE WHEN derived_is_reentry = 1 THEN 1 ELSE 0 END) AS reentries
-        FROM entry
-        """
-    ).fetchone()
-    return {
-        "debuts": int(row["debuts"] or 0),
-        "top_debuts": int(row["top_debuts"] or 0),
-        "reentries": int(row["reentries"] or 0),
-    }
-
-
-@st.cache_data(show_spinner=False)
-def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
-    conn = get_connection()
-    where_sql = "WHERE entry_fts MATCH ?"
-    params: list[object] = [make_fts_query(query)]
-
-    if marker_filter == "DEBUT":
-        where_sql += " AND e.derived_is_debut = 1"
-    elif marker_filter == "TOP DEBUT":
-        where_sql += " AND e.derived_is_top_debut = 1"
-    elif marker_filter == "RE-ENTRY":
-        where_sql += " AND e.derived_is_reentry = 1"
-
-    params.append(limit)
-
-sql = ENTRY_STATS_CTE + """
-    SELECT
-        e.entry_id,
-        cw.chart_date,
-        e.chart_week_id,
-        e.position,
-        es.last_week_position,
-        es.weeks_on_chart,
-        e.song_title_display AS title,
-        e.full_artist_display AS artist,
-        e.lead_artist_display AS lead_artist,
-        e.featured_artist_display AS featured_artist,
-        e.derived_marker,
-        e.derived_is_debut,
-        e.derived_is_reentry,
-        e.canonical_song_id,
-        e.normalized_song_title,
-        e.normalized_full_artist,
-        e.normalized_lead_artist,
-        e.normalized_featured_artist
-    FROM entry e
-    ...
-"""
-
 
 @st.cache_data(show_spinner=False)
 def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]:
@@ -474,96 +415,105 @@ def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[s
 
 @st.cache_data(show_spinner=False)
 def artist_matches(term: str, role_mode: str, limit: int = 100) -> pd.DataFrame:
-    conn = get_connection()
-    cfg = artist_role_config(role_mode)
-    like = f"%{term.strip().lower()}%"
-    norm_col = cfg["norm_col"]
-    display_col = cfg["display_col"]
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame(columns=["normalized_artist", "display_artist", "chart_weeks", "first_date", "last_date", "peak"])
 
-    sql = f"""
-        SELECT
-            {norm_col} AS normalized_artist,
-            MIN({display_col}) AS display_artist,
-            COUNT(*) AS chart_weeks,
-            MIN(chart_week.chart_date) AS first_date,
-            MAX(chart_week.chart_date) AS last_date,
-            MIN(position) AS peak
-        FROM entry
-        JOIN chart_week USING(chart_week_id)
-        WHERE COALESCE({norm_col}, '') LIKE ?
-          AND COALESCE({norm_col}, '') <> ''
-        GROUP BY {norm_col}
-        ORDER BY chart_weeks DESC, last_date DESC, display_artist
-        LIMIT ?
-    """
-    return pd.read_sql_query(sql, conn, params=(like, limit))
+    credits = build_artist_credit_rows(chart)
+    if role_mode == "Lead artist":
+        credits = credits.loc[credits["artist_role_mode"] == "Lead"].copy()
+    elif role_mode == "Featured artist":
+        credits = credits.loc[credits["artist_role_mode"] == "Featured"].copy()
+
+    if credits.empty:
+        return pd.DataFrame(columns=["normalized_artist", "display_artist", "chart_weeks", "first_date", "last_date", "peak"])
+
+    term_norm = normalize_search_text(term)
+    if term_norm:
+        credits = credits.loc[
+            credits["artist_key"].fillna("").astype(str).str.contains(re.escape(term_norm), regex=True)
+            | credits["artist"].fillna("").astype(str).str.lower().str.contains(re.escape(term_norm), regex=True)
+        ].copy()
+
+    if credits.empty:
+        return pd.DataFrame(columns=["normalized_artist", "display_artist", "chart_weeks", "first_date", "last_date", "peak"])
+
+    out = (
+        credits.groupby(["artist_key"], dropna=True)
+        .agg(
+            chart_weeks=("entry_id", "count"),
+            first_date=("chart_date", "min"),
+            last_date=("chart_date", "max"),
+            peak=("position", "min"),
+            display_artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+        )
+        .reset_index()
+        .rename(columns={"artist_key": "normalized_artist"})
+    )
+    out["display_artist"] = out.apply(
+        lambda r: preferred_artist_display(r["normalized_artist"], r["display_artist"]),
+        axis=1,
+    )
+    return out.sort_values(["chart_weeks", "last_date", "display_artist"], ascending=[False, False, True]).head(limit)
+
 
 
 @st.cache_data(show_spinner=False)
 def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame, dict[str, object] | None, pd.DataFrame]:
-    conn = get_connection()
-    cfg = artist_role_config(role_mode)
-    norm_col = cfg["norm_col"]
-    display_col = cfg["display_col"]
-
-    stats_row = conn.execute(
-        f"""
-        SELECT
-            MIN({display_col}) AS artist,
-            COUNT(*) AS chart_weeks,
-            COUNT(DISTINCT COALESCE(canonical_song_id, normalized_song_title)) AS distinct_songs,
-            MIN(position) AS peak,
-            MIN(chart_week.chart_date) AS first_date,
-            MAX(chart_week.chart_date) AS last_date
-        FROM entry
-        JOIN chart_week USING(chart_week_id)
-        WHERE {norm_col} = ?
-          AND COALESCE({norm_col}, '') <> ''
-        """,
-        (normalized_artist,),
-    ).fetchone()
-    if stats_row is None or stats_row[0] is None:
+    chart = load_analytics_base()
+    if chart.empty:
         return pd.DataFrame(), None, pd.DataFrame()
 
-    sql = ENTRY_STATS_CTE + f"""
-        SELECT
-            cw.chart_date,
-            e.position,
-            es.last_week_position,
-            es.weeks_on_chart,
-            e.song_title_display AS song,
-            e.full_artist_display AS artist,
-            e.lead_artist_display AS lead_artist,
-            e.featured_artist_display AS featured_artist,
-            e.derived_marker,
-            cw.row_count,
-            cw.source_file
-        FROM entry e
-        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
-        LEFT JOIN entry_stats es ON es.entry_id = e.entry_id
-        WHERE e.{norm_col} = ?
-        ORDER BY cw.chart_date
-        """
-    history = pd.read_sql_query(sql, conn, params=(normalized_artist,))
-    songs = pd.read_sql_query(
-        f"""
-        SELECT
-            COALESCE(cs.canonical_title, entry.song_title_display) AS song,
-            COUNT(*) AS chart_weeks,
-            MIN(chart_week.chart_date) AS first_date,
-            MAX(chart_week.chart_date) AS last_date,
-            MIN(position) AS peak
-        FROM entry
-        JOIN chart_week USING(chart_week_id)
-        LEFT JOIN canonical_song cs ON cs.canonical_song_id = entry.canonical_song_id
-        WHERE entry.{norm_col} = ?
-        GROUP BY COALESCE(entry.canonical_song_id, entry.normalized_song_title), COALESCE(cs.canonical_title, entry.song_title_display)
-        ORDER BY peak ASC, chart_weeks DESC, last_date DESC, song
-        """,
-        conn,
-        params=(normalized_artist,),
+    credits = build_artist_credit_rows(chart)
+    if role_mode == "Lead artist":
+        credits = credits.loc[credits["artist_role_mode"] == "Lead"].copy()
+    elif role_mode == "Featured artist":
+        credits = credits.loc[credits["artist_role_mode"] == "Featured"].copy()
+
+    if credits.empty:
+        return pd.DataFrame(), None, pd.DataFrame()
+
+    credits = credits.loc[credits["artist_key"] == normalized_artist].copy()
+    if credits.empty:
+        return pd.DataFrame(), None, pd.DataFrame()
+
+    artist_name = credits["artist"].dropna().astype(str)
+    fallback_artist = artist_name.mode().iloc[0] if not artist_name.empty else normalized_artist
+    display_artist = preferred_artist_display(normalized_artist, fallback_artist)
+
+    stats = {
+        "artist": display_artist,
+        "chart_weeks": int(len(credits)),
+        "distinct_songs": int(credits["song_key"].nunique()),
+        "peak": int(credits["position"].min()),
+        "first_date": pd.to_datetime(credits["chart_date"]).min().strftime("%Y-%m-%d"),
+        "last_date": pd.to_datetime(credits["chart_date"]).max().strftime("%Y-%m-%d"),
+    }
+
+    history = (
+        credits.sort_values(["chart_date", "position", "entry_id"])
+        .drop_duplicates(subset=["entry_id"])
+        [["chart_date", "position", "last_week_position", "weeks_on_chart", "title", "artist", "lead_artist", "featured_artist", "derived_marker"]]
+        .rename(columns={"title": "song"})
+        .copy()
     )
-    return history, dict(stats_row), songs
+
+    songs = (
+        credits.groupby(["song_key", "title"], dropna=True)
+        .agg(
+            chart_weeks=("entry_id", "count"),
+            first_date=("chart_date", "min"),
+            last_date=("chart_date", "max"),
+            peak=("position", "min"),
+        )
+        .reset_index()
+        .rename(columns={"title": "song"})
+        .sort_values(["peak", "chart_weeks", "last_date", "song"], ascending=[True, False, False, True])
+        [["song", "chart_weeks", "first_date", "last_date", "peak"]]
+    )
+
+    return history, stats, songs
+
 
 
 @st.cache_data(show_spinner=False)
@@ -748,6 +698,7 @@ def load_analytics_base() -> pd.DataFrame:
     df["artist_key"] = df["normalized_lead_artist"].fillna("").astype(str).str.strip().str.lower()
     df.loc[df["artist_key"] == "", "artist_key"] = df["normalized_full_artist"].fillna("").astype(str).str.strip().str.lower()
     df["artist_key"] = df["artist_key"].replace("", pd.NA)
+    df["artist_key"] = df["artist_key"].map(resolve_artist_key_alias)
     df["is_debut"] = df["derived_is_debut"].eq(1)
     df["is_reentry"] = df["derived_is_reentry"].eq(1)
     df["has_prior_rank"] = df["last_week_position"].notna() & ~df["is_debut"] & ~df["is_reentry"]
@@ -786,22 +737,70 @@ def load_analytics_base() -> pd.DataFrame:
 
 
 
+
+def _split_credit_people(norm_value: object, display_value: object) -> list[tuple[str, str]]:
+    norm_text = "" if norm_value is None else str(norm_value).strip()
+    display_text = "" if display_value is None else str(display_value).strip()
+    if not norm_text and not display_text:
+        return []
+
+    norm_parts = [p.strip() for p in re.split(r"\s*;\s*", norm_text) if p.strip()] if norm_text else []
+    display_parts = [p.strip() for p in re.split(r"\s*;\s*", display_text) if p.strip()] if display_text else []
+
+    if not norm_parts and display_parts:
+        norm_parts = [p.lower() for p in display_parts]
+    if not display_parts and norm_parts:
+        display_parts = norm_parts[:]
+
+    n = max(len(norm_parts), len(display_parts))
+    if len(norm_parts) < n:
+        norm_parts.extend([""] * (n - len(norm_parts)))
+    if len(display_parts) < n:
+        display_parts.extend([""] * (n - len(display_parts)))
+
+    pairs: list[tuple[str, str]] = []
+    for norm_part, display_part in zip(norm_parts, display_parts):
+        norm_part = (norm_part or "").strip().lower()
+        display_part = (display_part or "").strip()
+        if norm_part and display_part:
+            pairs.append((norm_part, display_part))
+        elif norm_part:
+            pairs.append((norm_part, norm_part))
+        elif display_part:
+            pairs.append((display_part.lower(), display_part))
+    return pairs
+
+
 @st.cache_data(show_spinner=False)
 def build_artist_credit_rows(df_chart: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty:
         return pd.DataFrame()
 
-    lead = df_chart.copy()
-    lead["artist_key"] = lead["normalized_lead_artist"].fillna("").astype(str).str.strip().str.lower()
-    lead["artist"] = lead["lead_artist"].fillna("").astype(str).str.strip()
-    lead["artist_role_mode"] = "Lead"
+    rows: list[dict[str, object]] = []
 
-    featured = df_chart.copy()
-    featured["artist_key"] = featured["normalized_featured_artist"].fillna("").astype(str).str.strip().str.lower()
-    featured["artist"] = featured["featured_artist"].fillna("").astype(str).str.strip()
-    featured["artist_role_mode"] = "Featured"
+    for row in df_chart.to_dict("records"):
+        lead_people = _split_credit_people(row.get("normalized_lead_artist"), row.get("lead_artist"))
+        featured_people = _split_credit_people(row.get("normalized_featured_artist"), row.get("featured_artist"))
 
-    credits = pd.concat([lead, featured], ignore_index=True)
+        for artist_key, artist in lead_people:
+            credit_row = dict(row)
+            credit_row["artist_key"] = artist_key
+            credit_row["artist"] = artist
+            credit_row["artist_role_mode"] = "Lead"
+            rows.append(credit_row)
+
+        for artist_key, artist in featured_people:
+            credit_row = dict(row)
+            credit_row["artist_key"] = artist_key
+            credit_row["artist"] = artist
+            credit_row["artist_role_mode"] = "Featured"
+            rows.append(credit_row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    credits = pd.DataFrame(rows)
+    credits["artist_key"] = credits["artist_key"].map(resolve_artist_key_alias)
     credits["artist_key"] = credits["artist_key"].replace("", pd.NA)
     credits["artist"] = credits["artist"].replace("", pd.NA)
     credits = credits.loc[credits["artist_key"].notna() & credits["artist"].notna()].copy()
@@ -934,13 +933,17 @@ def build_song_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
 def build_artist_weekly_presence(df_artist_credits: pd.DataFrame) -> pd.DataFrame:
     if df_artist_credits.empty:
         return pd.DataFrame()
-    grouped = df_artist_credits.groupby(["chart_date", "artist_key", "artist"], dropna=True)
+
+    grouped = df_artist_credits.groupby(["chart_date", "artist_key"], dropna=True)
     rows = []
-    for (chart_date, artist_key, artist), g in grouped:
+    for (chart_date, artist_key), g in grouped:
+        artist_vals = g["artist"].dropna().astype(str)
+        fallback_artist = artist_vals.mode().iloc[0] if not artist_vals.empty else str(artist_key)
+        artist_display = preferred_artist_display(artist_key, fallback_artist)
         rows.append({
             "chart_date": chart_date,
             "artist_key": artist_key,
-            "artist": artist,
+            "artist": artist_display,
             "entries_on_chart": int(g["song_key"].nunique()),
             "entries_top20": int(g.loc[g["position"] <= 20, "song_key"].nunique()),
             "entries_top10": int(g.loc[g["position"] <= 10, "song_key"].nunique()),
@@ -955,18 +958,28 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
     if df_artist_credits.empty:
         return pd.DataFrame()
 
+    artist_name_map = (
+        df_artist_credits.groupby("artist_key", dropna=True)["artist"]
+        .agg(lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else "")
+        .reset_index()
+    )
+    artist_name_map["artist"] = artist_name_map.apply(
+        lambda r: preferred_artist_display(r["artist_key"], r["artist"]),
+        axis=1,
+    )
+
     song_artist = (
-        df_artist_credits.groupby(["song_key", "artist_key", "artist"], dropna=True)
+        df_artist_credits.groupby(["song_key", "artist_key"], dropna=True)
         .size()
         .reset_index(name="song_artist_weeks")
     )
-    song_with_artist = df_song.drop(columns=["artist"], errors="ignore").merge(
-        song_artist[["song_key", "artist_key", "artist"]],
+    song_with_artist = df_song.merge(
+        song_artist[["song_key", "artist_key"]],
         on="song_key",
         how="inner",
     )
 
-    song_agg = song_with_artist.groupby(["artist_key", "artist"], dropna=True).agg(
+    song_agg = song_with_artist.groupby(["artist_key"], dropna=True).agg(
         distinct_songs=("song_key", "nunique"),
         top20_hits=("peak_position", lambda s: int((s <= 20).sum())),
         top10_hits=("peak_position", lambda s: int((s <= 10).sum())),
@@ -979,7 +992,7 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
         last_chart_date=("last_chart_date", "max"),
     ).reset_index()
 
-    week_agg = df_artist_credits.groupby(["artist_key", "artist"], dropna=True).agg(
+    week_agg = df_artist_credits.groupby(["artist_key"], dropna=True).agg(
         total_chart_entries=("song_key", "nunique"),
         total_chart_weeks=("song_key", "size"),
         total_top20_weeks=("top20_flag", "sum"),
@@ -991,7 +1004,7 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
     ).reset_index()
 
     role_song_agg = (
-        df_artist_credits.groupby(["artist_key", "artist", "artist_role_mode"], dropna=True)["song_key"]
+        df_artist_credits.groupby(["artist_key", "artist_role_mode"], dropna=True)["song_key"]
         .nunique()
         .unstack(fill_value=0)
         .reset_index()
@@ -1004,9 +1017,11 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
         "chart_date": "week_of_max_simultaneous_entries",
     })
 
-    out = week_agg.merge(song_agg, on=["artist_key", "artist"], how="outer")
-    out = out.merge(role_song_agg, on=["artist_key", "artist"], how="left")
+    out = week_agg.merge(song_agg, on=["artist_key"], how="outer")
+    out = out.merge(role_song_agg, on=["artist_key"], how="left")
     out = out.merge(max_presence, on="artist_key", how="left")
+    out = out.merge(artist_name_map, on="artist_key", how="left")
+    out["artist"] = out["artist"].fillna(out["artist_key"].astype(str))
     out["lead_distinct_songs"] = out["lead_distinct_songs"].fillna(0).astype(int)
     out["featured_distinct_songs"] = out["featured_distinct_songs"].fillna(0).astype(int)
     out["active_span_weeks"] = (

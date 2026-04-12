@@ -15,14 +15,25 @@ FEAT_SPLIT_RE = re.compile(r"\s+(?:featuring|feat\.?|ft\.?|f/)\s+", re.IGNORECAS
 
 
 def normalize_spaces(value: str | None) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip())
+    value = (value or "").replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def normalize_title_key(value: str | None) -> str:
+    value = normalize_spaces(value).lower()
+    value = value.replace("&", " and ")
+    value = value.replace("'", "")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
 
 
 def normalize_artist_key(value: str | None) -> str:
     value = normalize_spaces(value).lower()
     value = value.replace("&", " and ")
+    value = value.replace("'", "")
     value = re.sub(r"\b(featuring|feat\.?|ft\.?|f/)\b", " feat ", value)
-    value = re.sub(r"[^a-z0-9;,/+'()& -]+", " ", value)
+    value = re.sub(r"[^a-z0-9;,/+()& -]+", " ", value)
     value = re.sub(r"\s+", " ", value)
     return value.strip()
 
@@ -101,6 +112,33 @@ def split_artist_roles(full_artist_display: str | None) -> tuple[str, str]:
     return lead, featured
 
 
+def split_credit_people_list(value: str | None) -> str:
+    text = normalize_spaces(value)
+    if not text:
+        return ""
+
+    text = re.sub(r"\s*;\s*", ";", text)
+
+    # Only treat commas as artist separators when there are multiple commas.
+    if text.count(",") >= 2:
+        text = re.sub(r"\s*,\s*", ";", text)
+
+    text = re.sub(r"\s*&\s*", ";", text)
+    text = re.sub(r"\s+(?:and|x|with)\s+", ";", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\+\s*", ";", text)
+
+    parts = [normalize_spaces(part) for part in text.split(";") if normalize_spaces(part)]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        key = part.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(part)
+    return "; ".join(deduped)
+
+
 def make_backup(db_path: Path) -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup = db_path.with_name(f"{db_path.stem}.backup_artist_roles_{timestamp}{db_path.suffix}")
@@ -134,27 +172,33 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 def populate_artist_role_columns(conn: sqlite3.Connection) -> int:
     rows = conn.execute(
         """
-        SELECT entry_id, full_artist_display
+        SELECT entry_id, song_title_display, full_artist_display
         FROM entry
         ORDER BY entry_id
         """
     ).fetchall()
 
     updated = 0
-    for entry_id, full_artist_display in rows:
+    for entry_id, song_title_display, full_artist_display in rows:
         lead, featured = split_artist_roles(full_artist_display)
+        lead = split_credit_people_list(lead)
+        featured = split_credit_people_list(featured)
+        norm_title = normalize_title_key(song_title_display)
+        norm_full = normalize_artist_key(full_artist_display)
         norm_lead = normalize_artist_key(lead)
         norm_featured = normalize_artist_key(featured)
         conn.execute(
             """
             UPDATE entry
-            SET lead_artist_display = ?,
+            SET normalized_song_title = ?,
+                normalized_full_artist = ?,
+                lead_artist_display = ?,
                 featured_artist_display = ?,
                 normalized_lead_artist = ?,
                 normalized_featured_artist = ?
             WHERE entry_id = ?
             """,
-            (lead, featured, norm_lead, norm_featured, entry_id),
+            (norm_title, norm_full, lead, featured, norm_lead, norm_featured, entry_id),
         )
         updated += 1
     return updated
