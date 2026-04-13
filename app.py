@@ -968,18 +968,17 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
         axis=1,
     )
 
-    song_artist = (
-        df_artist_credits.groupby(["song_key", "artist_key"], dropna=True)
-        .size()
-        .reset_index(name="song_artist_weeks")
-    )
-    song_with_artist = df_song.merge(
-        song_artist[["song_key", "artist_key"]],
-        on="song_key",
-        how="inner",
+    song_level = (
+        df_artist_credits.groupby(["artist_key", "song_key"], dropna=True)
+        .agg(
+            peak_position=("position", "min"),
+            first_chart_date=("chart_date", "min"),
+            last_chart_date=("chart_date", "max"),
+        )
+        .reset_index()
     )
 
-    song_agg = song_with_artist.groupby(["artist_key"], dropna=True).agg(
+    song_agg = song_level.groupby(["artist_key"], dropna=True).agg(
         distinct_songs=("song_key", "nunique"),
         top20_hits=("peak_position", lambda s: int((s <= 20).sum())),
         top10_hits=("peak_position", lambda s: int((s <= 10).sum())),
@@ -1021,15 +1020,16 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
     out = out.merge(role_song_agg, on=["artist_key"], how="left")
     out = out.merge(max_presence, on="artist_key", how="left")
     out = out.merge(artist_name_map, on="artist_key", how="left")
-    out["artist"] = out["artist"].fillna(out["artist_key"].astype(str))
+    out["artist"] = out.apply(
+        lambda r: preferred_artist_display(r["artist_key"], r.get("artist", "")),
+        axis=1,
+    )
     out["lead_distinct_songs"] = out["lead_distinct_songs"].fillna(0).astype(int)
     out["featured_distinct_songs"] = out["featured_distinct_songs"].fillna(0).astype(int)
     out["active_span_weeks"] = (
         (pd.to_datetime(out["last_chart_date"]) - pd.to_datetime(out["first_chart_date"])) / pd.Timedelta(days=7)
     ).fillna(0).round().astype(int) + 1
     return out
-
-
 @st.cache_data(show_spinner=False)
 def build_yearly_summary(df_chart: pd.DataFrame, df_weekly: pd.DataFrame, df_song: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty or df_weekly.empty:
