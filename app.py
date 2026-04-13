@@ -1639,9 +1639,23 @@ def main() -> None:
                 "Artists with most appearances on a single chart",
             ],
         )
-        limit = st.slider("Rows", 10, 500, 100, 10, key="special_limit")
-        table = load_special_entries(table_kind, limit)
-        _display_df(table)
+
+        if table_kind == "#1 hits":
+            conn = get_connection()
+            year_rows = conn.execute(
+                "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
+            ).fetchall()
+            year_options = ["All years"] + [row[0] for row in year_rows if row[0]]
+            selected_year = st.selectbox("Year", year_options, key="special_num1_year")
+
+            table = load_special_entries(table_kind, 1000000)
+            if selected_year != "All years" and not table.empty and "chart_date" in table.columns:
+                table = table.loc[table["chart_date"].astype(str).str.startswith(selected_year)].copy()
+            _display_df(table)
+        else:
+            limit = st.slider("Rows", 10, 500, 100, 10, key="special_limit")
+            table = load_special_entries(table_kind, limit)
+            _display_df(table)
 
     with tab_analytics:
         render_analytics_tab()
