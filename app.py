@@ -44,11 +44,65 @@ PREFERRED_ARTIST_DISPLAY = {
 }
 
 
+@st.cache_data(show_spinner=False)
+def load_artist_key_override_map() -> dict[str, str]:
+    if not Path(DB_PATH).exists():
+        return {}
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "artist_key_override" not in tables:
+            return {}
+        rows = conn.execute(
+            "SELECT source_artist_key, target_artist_key FROM artist_key_override WHERE COALESCE(source_artist_key, '') <> '' AND COALESCE(target_artist_key, '') <> ''"
+        ).fetchall()
+        return {normalize_search_text(src): normalize_search_text(dst) for src, dst in rows if src and dst}
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def load_artist_display_override_map() -> dict[str, str]:
+    if not Path(DB_PATH).exists():
+        return {}
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "artist_key_override" not in tables:
+            return {}
+        rows = conn.execute(
+            "SELECT target_artist_key, preferred_display FROM artist_key_override WHERE COALESCE(target_artist_key, '') <> '' AND COALESCE(preferred_display, '') <> ''"
+        ).fetchall()
+        out: dict[str, str] = {}
+        for target, display in rows:
+            key = normalize_search_text(target)
+            if key and display:
+                out[key] = str(display)
+        return out
+    finally:
+        conn.close()
+
+
+def _follow_artist_key_override_chain(key: str) -> str:
+    overrides = load_artist_key_override_map()
+    seen: set[str] = set()
+    cur = normalize_search_text(key)
+    while cur in overrides and cur not in seen:
+        seen.add(cur)
+        nxt = normalize_search_text(overrides[cur])
+        if not nxt or nxt == cur:
+            break
+        cur = nxt
+    return cur
+
+
 def resolve_artist_key_alias(artist_key: object) -> object:
     if artist_key is None or (isinstance(artist_key, float) and pd.isna(artist_key)):
         return artist_key
     key = normalize_search_text(artist_key)
-    return ARTIST_KEY_ALIASES.get(key, key)
+    key = ARTIST_KEY_ALIASES.get(key, key)
+    key = _follow_artist_key_override_chain(key)
+    return key
 
 
 def preferred_artist_display(artist_key: object, fallback: object = "") -> str:
@@ -56,7 +110,8 @@ def preferred_artist_display(artist_key: object, fallback: object = "") -> str:
     if key is None or (isinstance(key, float) and pd.isna(key)):
         return "" if fallback is None else str(fallback)
     key = normalize_search_text(key)
-    preferred = PREFERRED_ARTIST_DISPLAY.get(key)
+    display_overrides = load_artist_display_override_map()
+    preferred = display_overrides.get(key) or PREFERRED_ARTIST_DISPLAY.get(key)
     if preferred:
         return preferred
     return "" if fallback is None else str(fallback)
@@ -1447,6 +1502,589 @@ def _render_records_outliers(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         _display_df(weekly.sort_values(["avg_chart_age", "chart_date"], ascending=[True, False]).head(top_n), ["chart_date", "avg_chart_age", "avg_top10_age"])
 
 
+
+
+def _admin_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+@st.cache_data(show_spinner=False)
+def _admin_table_columns(table_name: str) -> list[str]:
+    conn = get_connection()
+    if not _admin_table_exists(conn, table_name):
+        return []
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return [str(row[1]) for row in rows]
+
+
+def _reset_app_caches() -> None:
+    st.cache_data.clear()
+    try:
+        get_connection.clear()
+    except Exception:
+        pass
+
+
+@st.cache_data(show_spinner=False)
+def admin_song_options() -> pd.DataFrame:
+    conn = get_connection()
+    if not _admin_table_exists(conn, "canonical_song"):
+        return pd.DataFrame(columns=["canonical_song_id", "canonical_title", "canonical_artist", "chart_weeks"])
+    return pd.read_sql_query(
+        """
+        SELECT
+            canonical_song_id,
+            canonical_title,
+            COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist,
+            entry_count AS chart_weeks,
+            first_chart_date,
+            last_chart_date
+        FROM canonical_song
+        ORDER BY LOWER(canonical_title), LOWER(COALESCE(canonical_full_artist, canonical_artist)), canonical_song_id
+        """,
+        conn,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def admin_song_aliases(canonical_song_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    if not _admin_table_exists(conn, "song_alias"):
+        return pd.DataFrame(columns=["song", "artist", "chart_weeks", "week_count", "first_date", "last_date"])
+    return pd.read_sql_query(
+        """
+        SELECT
+            alias_song_title AS song,
+            alias_artist AS artist,
+            entry_count AS chart_weeks,
+            week_count,
+            first_chart_date AS first_date,
+            last_chart_date AS last_date
+        FROM song_alias
+        WHERE canonical_song_id = ?
+        ORDER BY last_date DESC, week_count DESC, song, artist
+        """,
+        conn,
+        params=(canonical_song_id,),
+    )
+
+
+def _insert_song_alias_row(cur: sqlite3.Cursor, canonical_song_id: int, old_title: str, old_artist: str) -> None:
+    cols = _admin_table_columns("song_alias")
+    if not cols:
+        return
+
+    payload: dict[str, object] = {}
+    if "canonical_song_id" in cols:
+        payload["canonical_song_id"] = canonical_song_id
+    if "alias_song_title" in cols:
+        payload["alias_song_title"] = old_title
+    if "alias_artist" in cols:
+        payload["alias_artist"] = old_artist
+    if "week_count" in cols:
+        payload["week_count"] = 0
+    if "entry_count" in cols:
+        payload["entry_count"] = 0
+    if "first_chart_date" in cols:
+        payload["first_chart_date"] = None
+    if "last_chart_date" in cols:
+        payload["last_chart_date"] = None
+    if "alias_display_key" in cols:
+        payload["alias_display_key"] = normalize_search_text(f"{old_title}||{old_artist}")
+
+    if not payload or "canonical_song_id" not in payload or "alias_song_title" not in payload:
+        return
+
+    where_bits = []
+    where_vals: list[object] = []
+    for key in payload:
+        if payload[key] is None:
+            where_bits.append(f"{key} IS NULL")
+        else:
+            where_bits.append(f"{key} = ?")
+            where_vals.append(payload[key])
+    exists_sql = f"SELECT 1 FROM song_alias WHERE {' AND '.join(where_bits)} LIMIT 1"
+    exists = cur.execute(exists_sql, tuple(where_vals)).fetchone()
+    if exists:
+        return
+
+    insert_cols = list(payload.keys())
+    insert_vals = [payload[c] for c in insert_cols]
+    placeholders = ", ".join(["?"] * len(insert_cols))
+    cur.execute(
+        f"INSERT INTO song_alias ({', '.join(insert_cols)}) VALUES ({placeholders})",
+        insert_vals,
+    )
+
+
+def admin_rename_canonical_song(canonical_song_id: int, new_title: str) -> tuple[bool, str]:
+    new_title = (new_title or "").strip()
+    if not new_title:
+        return False, "New canonical song title cannot be blank."
+
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        row = cur.execute(
+            """
+            SELECT
+                canonical_song_id,
+                canonical_title,
+                COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (canonical_song_id,),
+        ).fetchone()
+        if row is None:
+            return False, "Selected canonical song was not found."
+
+        old_title = (row["canonical_title"] or "").strip()
+        old_artist = (row["canonical_artist"] or "").strip()
+        if normalize_search_text(old_title) == normalize_search_text(new_title):
+            return False, "The new title matches the current canonical title."
+
+        collision = cur.execute(
+            """
+            SELECT canonical_song_id
+            FROM canonical_song
+            WHERE LOWER(TRIM(canonical_title)) = LOWER(TRIM(?))
+              AND canonical_song_id <> ?
+            LIMIT 1
+            """,
+            (new_title, canonical_song_id),
+        ).fetchone()
+        if collision is not None:
+            return False, "Another canonical song already uses that exact title."
+
+        cur.execute("BEGIN")
+        cur.execute(
+            "UPDATE canonical_song SET canonical_title = ? WHERE canonical_song_id = ?",
+            (new_title, canonical_song_id),
+        )
+        try:
+            _insert_song_alias_row(cur, canonical_song_id, old_title, old_artist)
+        except Exception:
+            pass
+        conn.commit()
+        _reset_app_caches()
+        return True, f'Renamed "{old_title}" to "{new_title}".'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Song rename failed: {exc}"
+    finally:
+        conn.close()
+
+
+def _ensure_artist_key_override_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS artist_key_override (
+            source_artist_key TEXT PRIMARY KEY,
+            target_artist_key TEXT NOT NULL,
+            preferred_display TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def admin_save_artist_key_merge(source_artist_key: str, target_artist_key: str, preferred_display: str) -> tuple[bool, str]:
+    source_key = normalize_search_text(source_artist_key)
+    target_key = normalize_search_text(target_artist_key)
+    preferred_display = (preferred_display or "").strip()
+    if not source_key:
+        return False, "Source artist key is blank."
+    if not target_key:
+        return False, "Target artist key is blank."
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_artist_key_override_table(conn)
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            INSERT INTO artist_key_override (source_artist_key, target_artist_key, preferred_display, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(source_artist_key) DO UPDATE SET
+                target_artist_key = excluded.target_artist_key,
+                preferred_display = CASE
+                    WHEN excluded.preferred_display IS NULL OR excluded.preferred_display = '' THEN artist_key_override.preferred_display
+                    ELSE excluded.preferred_display
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (source_key, target_key, preferred_display or None),
+        )
+        if preferred_display:
+            conn.execute(
+                """
+                INSERT INTO artist_key_override (source_artist_key, target_artist_key, preferred_display, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(source_artist_key) DO UPDATE SET
+                    target_artist_key = excluded.target_artist_key,
+                    preferred_display = excluded.preferred_display,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (target_key, target_key, preferred_display),
+            )
+        conn.commit()
+        _reset_app_caches()
+        if source_key == target_key:
+            return True, f'Saved preferred display for "{target_key}".'
+        return True, f'Merged "{source_key}" into "{target_key}".'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Artist merge failed: {exc}"
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def admin_artist_key_override_rows() -> pd.DataFrame:
+    if not Path(DB_PATH).exists():
+        return pd.DataFrame(columns=["source_artist_key", "target_artist_key", "preferred_display", "updated_at"])
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "artist_key_override" not in tables:
+            return pd.DataFrame(columns=["source_artist_key", "target_artist_key", "preferred_display", "updated_at"])
+        return pd.read_sql_query(
+            "SELECT source_artist_key, target_artist_key, COALESCE(preferred_display, '') AS preferred_display, updated_at FROM artist_key_override ORDER BY target_artist_key, source_artist_key",
+            conn,
+        )
+    finally:
+        conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def admin_artist_alias_audit() -> pd.DataFrame:
+    chart = load_analytics_base()
+    credits = build_artist_credit_rows(chart)
+    if credits.empty:
+        return pd.DataFrame(columns=["artist_key", "display_artist", "raw_artist_variants", "lead_weeks", "featured_weeks"])
+
+    grouped = (
+        credits.groupby(["artist_key"], dropna=True)
+        .agg(
+            raw_artist_variants=("artist", lambda s: int(s.dropna().astype(str).nunique())),
+            lead_weeks=("artist_role_mode", lambda s: int((s == "Lead").sum())),
+            featured_weeks=("artist_role_mode", lambda s: int((s == "Featured").sum())),
+        )
+        .reset_index()
+    )
+    name_map = (
+        credits.groupby("artist_key", dropna=True)["artist"]
+        .agg(lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else "")
+        .reset_index()
+        .rename(columns={"artist": "display_artist"})
+    )
+    out = grouped.merge(name_map, on="artist_key", how="left")
+    out["display_artist"] = out.apply(
+        lambda r: preferred_artist_display(r["artist_key"], r["display_artist"]),
+        axis=1,
+    )
+    return out.sort_values(["raw_artist_variants", "lead_weeks", "display_artist"], ascending=[False, False, True])
+
+
+@st.cache_data(show_spinner=False)
+def admin_artist_variants_for_key(artist_key: str) -> pd.DataFrame:
+    chart = load_analytics_base()
+    credits = build_artist_credit_rows(chart)
+    if credits.empty:
+        return pd.DataFrame(columns=["artist_variant", "role_mode", "chart_weeks", "first_date", "last_date", "best_peak"])
+    subset = credits.loc[credits["artist_key"] == artist_key].copy()
+    if subset.empty:
+        return pd.DataFrame(columns=["artist_variant", "role_mode", "chart_weeks", "first_date", "last_date", "best_peak"])
+    return (
+        subset.groupby(["artist", "artist_role_mode"], dropna=True)
+        .agg(
+            chart_weeks=("entry_id", "count"),
+            first_date=("chart_date", "min"),
+            last_date=("chart_date", "max"),
+            best_peak=("position", "min"),
+        )
+        .reset_index()
+        .rename(columns={"artist": "artist_variant", "artist_role_mode": "role_mode"})
+        .sort_values(["chart_weeks", "best_peak", "artist_variant"], ascending=[False, True, True])
+    )
+
+
+@st.cache_data(show_spinner=False)
+def admin_db_stats() -> dict[str, object]:
+    conn = get_connection()
+
+    def scalar(sql: str) -> object:
+        row = conn.execute(sql).fetchone()
+        return row[0] if row is not None else None
+
+    stats = {
+        "chart_weeks": scalar("SELECT COUNT(*) FROM chart_week") if _admin_table_exists(conn, "chart_week") else 0,
+        "entries": scalar("SELECT COUNT(*) FROM entry") if _admin_table_exists(conn, "entry") else 0,
+        "canonical_songs": scalar("SELECT COUNT(*) FROM canonical_song") if _admin_table_exists(conn, "canonical_song") else 0,
+        "song_aliases": scalar("SELECT COUNT(*) FROM song_alias") if _admin_table_exists(conn, "song_alias") else 0,
+        "first_chart_date": scalar("SELECT MIN(chart_date) FROM chart_week") if _admin_table_exists(conn, "chart_week") else None,
+        "last_chart_date": scalar("SELECT MAX(chart_date) FROM chart_week") if _admin_table_exists(conn, "chart_week") else None,
+    }
+    artist_audit = admin_artist_alias_audit()
+    stats["artist_keys"] = int(artist_audit["artist_key"].nunique()) if not artist_audit.empty else 0
+    stats["artist_variants"] = int(artist_audit["raw_artist_variants"].sum()) if not artist_audit.empty else 0
+    return stats
+
+
+
+
+@st.cache_data(show_spinner=False)
+def admin_known_anomalies() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "chart_date": "2004-02-24",
+                "issue_type": "Source anomaly",
+                "severity": "Info",
+                "summary": "Original written chart duplicates Janet Jackson's 'Anyplace, Anyplace' at #19 and #23.",
+                "status": "Preserve as written",
+                "notes": "Treat as a documented historical source anomaly rather than a DB/import error.",
+            },
+        ]
+    )
+
+@st.cache_data(show_spinner=False)
+def admin_data_quality_checks() -> dict[str, pd.DataFrame]:
+    conn = get_connection()
+    checks: dict[str, pd.DataFrame] = {}
+
+    if _admin_table_exists(conn, "chart_week"):
+        checks["duplicate_chart_dates"] = pd.read_sql_query(
+            """
+            SELECT chart_date, COUNT(*) AS chart_count
+            FROM chart_week
+            GROUP BY chart_date
+            HAVING COUNT(*) > 1
+            ORDER BY chart_date
+            """,
+            conn,
+        )
+    else:
+        checks["duplicate_chart_dates"] = pd.DataFrame()
+
+    if _admin_table_exists(conn, "entry") and _admin_table_exists(conn, "chart_week"):
+        checks["entry_count_issues"] = pd.read_sql_query(
+            """
+            SELECT
+                cw.chart_date,
+                COUNT(*) AS entry_count
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            GROUP BY e.chart_week_id, cw.chart_date
+            HAVING COUNT(*) <> 40
+            ORDER BY cw.chart_date
+            """,
+            conn,
+        )
+        checks["duplicate_positions"] = pd.read_sql_query(
+            """
+            SELECT
+                cw.chart_date,
+                e.position,
+                COUNT(*) AS row_count
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            GROUP BY e.chart_week_id, cw.chart_date, e.position
+            HAVING COUNT(*) > 1
+            ORDER BY cw.chart_date, e.position
+            """,
+            conn,
+        )
+        checks["duplicate_canonical_song_rows"] = pd.read_sql_query(
+            """
+            SELECT
+                cw.chart_date,
+                e.canonical_song_id,
+                COALESCE(cs.canonical_title, e.song_title_display) AS song,
+                COUNT(*) AS appearances
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            LEFT JOIN canonical_song cs ON cs.canonical_song_id = e.canonical_song_id
+            WHERE e.canonical_song_id IS NOT NULL
+            GROUP BY e.chart_week_id, cw.chart_date, e.canonical_song_id, song
+            HAVING COUNT(*) > 1
+            ORDER BY cw.chart_date, song
+            """,
+            conn,
+        )
+        checks["missing_song_mappings"] = pd.read_sql_query(
+            """
+            SELECT
+                cw.chart_date,
+                e.position,
+                e.song_title_display AS song,
+                e.full_artist_display AS artist
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id IS NULL
+            ORDER BY cw.chart_date, e.position
+            """,
+            conn,
+        )
+    else:
+        checks["entry_count_issues"] = pd.DataFrame()
+        checks["duplicate_positions"] = pd.DataFrame()
+        checks["duplicate_canonical_song_rows"] = pd.DataFrame()
+        checks["missing_song_mappings"] = pd.DataFrame()
+
+    return checks
+
+
+def render_admin_tab() -> None:
+    st.subheader("Admin")
+    tab_songs, tab_artists, tab_quality, tab_maintenance = st.tabs(
+        ["Songs", "Artists", "Data Quality", "Maintenance"]
+    )
+
+    with tab_songs:
+        st.markdown("### Canonical songs")
+        songs = admin_song_options()
+        if songs.empty:
+            st.info("No canonical_song rows are available in the database.")
+        else:
+            song_options = {
+                f"{row.canonical_title} — {row.canonical_artist} | {int(row.chart_weeks or 0)} weeks | {row.first_chart_date} to {row.last_chart_date}": int(row.canonical_song_id)
+                for row in songs.itertuples(index=False)
+            }
+            selected_label = st.selectbox("Choose a canonical song to manage", list(song_options.keys()), key="admin_song_pick")
+            selected_song_id = song_options[selected_label]
+            selected_row = songs.loc[songs["canonical_song_id"] == selected_song_id].iloc[0]
+            st.caption(f"Current canonical title: {selected_row['canonical_title']}")
+            new_title = st.text_input("New canonical song title", value="", key="admin_song_new_title")
+            if st.button("Rename canonical song", key="admin_song_rename_btn"):
+                ok, msg = admin_rename_canonical_song(selected_song_id, new_title)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            st.markdown("**Alias variants for this canonical song**")
+            _display_df(admin_song_aliases(selected_song_id))
+
+    with tab_artists:
+        st.markdown("### Artist alias audit")
+        st.caption("Use this section to pick the correct display name for an artist key or merge one artist key into another.")
+        artist_audit = admin_artist_alias_audit()
+        if artist_audit.empty:
+            st.info("No artist-key rows are available to audit.")
+        else:
+            display_map = {
+                f"{row.display_artist} | {int(row.raw_artist_variants)} raw variants | {int(row.lead_weeks)} lead weeks | {int(row.featured_weeks)} featured weeks": row.artist_key
+                for row in artist_audit.head(2000).itertuples(index=False)
+            }
+            selected_artist_label = st.selectbox(
+                "Choose an artist key",
+                list(display_map.keys()),
+                key="admin_artist_audit_pick",
+            )
+            selected_artist_key = display_map[selected_artist_label]
+            selected_row = artist_audit.loc[artist_audit["artist_key"] == selected_artist_key].iloc[0]
+            variants_df = admin_artist_variants_for_key(selected_artist_key)
+            st.markdown("**Raw artist variants mapped to this artist key**")
+            _display_df(variants_df)
+
+            merge_cols = st.columns([1.2, 1.2])
+            target_options = {row.artist_key: row.display_artist for row in artist_audit.itertuples(index=False)}
+            default_target_index = list(target_options.keys()).index(selected_artist_key)
+            target_artist_key = merge_cols[0].selectbox(
+                "Merge selected key into",
+                list(target_options.keys()),
+                index=default_target_index,
+                format_func=lambda k: f"{target_options[k]} [{k}]",
+                key="admin_artist_merge_target",
+            )
+            preferred_choices = []
+            if not variants_df.empty and "artist_variant" in variants_df.columns:
+                preferred_choices = sorted({str(v) for v in variants_df["artist_variant"].dropna().tolist()})
+            default_preferred = selected_row["display_artist"] if "display_artist" in selected_row else ""
+            if preferred_choices:
+                if default_preferred not in preferred_choices:
+                    preferred_choices = [default_preferred] + preferred_choices
+                preferred_display = merge_cols[1].selectbox(
+                    "Correct display name",
+                    preferred_choices,
+                    index=preferred_choices.index(default_preferred) if default_preferred in preferred_choices else 0,
+                    key="admin_artist_preferred_display",
+                )
+            else:
+                preferred_display = merge_cols[1].text_input(
+                    "Correct display name",
+                    value=default_preferred,
+                    key="admin_artist_preferred_display_text",
+                )
+
+            if st.button("Save artist merge", key="admin_artist_merge_btn"):
+                ok, msg = admin_save_artist_key_merge(selected_artist_key, target_artist_key, preferred_display)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            st.markdown("**Saved artist-key merges / display overrides**")
+            _display_df(admin_artist_key_override_rows())
+            st.markdown("**Artist-key audit summary**")
+            _display_df(artist_audit.head(250), ["display_artist", "artist_key", "raw_artist_variants", "lead_weeks", "featured_weeks"])
+
+    with tab_quality:
+        st.markdown("### Data quality checks")
+        checks = admin_data_quality_checks()
+        sections = [
+            ("Duplicate chart dates", "duplicate_chart_dates"),
+            ("Charts with non-40 entry counts", "entry_count_issues"),
+            ("Duplicate positions within a chart", "duplicate_positions"),
+            ("Duplicate canonical-song rows within a chart", "duplicate_canonical_song_rows"),
+            ("Rows missing canonical song mapping", "missing_song_mappings"),
+        ]
+        for title, key in sections:
+            df = checks.get(key, pd.DataFrame())
+            with st.expander(f"{title} ({len(df)})", expanded=False):
+                if df.empty:
+                    st.caption("No issues found.")
+                else:
+                    _display_df(df)
+
+        st.markdown("### Known anomalies")
+        st.caption("These are documented source-chart issues that should not be treated like ordinary import or database errors.")
+        known_anomalies = admin_known_anomalies()
+        with st.expander(f"Known anomalies ({len(known_anomalies)})", expanded=True):
+            if known_anomalies.empty:
+                st.caption("No known anomalies have been documented yet.")
+            else:
+                _display_df(known_anomalies, ["chart_date", "issue_type", "severity", "summary", "status", "notes"])
+
+    with tab_maintenance:
+        st.markdown("### Maintenance")
+        stats = admin_db_stats()
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Chart weeks", stats["chart_weeks"])
+        a2.metric("Entries", stats["entries"])
+        a3.metric("Canonical songs", stats["canonical_songs"])
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Song aliases", stats["song_aliases"])
+        b2.metric("Artist keys", stats["artist_keys"])
+        b3.metric("Artist variants", stats["artist_variants"])
+        st.caption(f"Coverage: {stats['first_chart_date'] or '—'} through {stats['last_chart_date'] or '—'}")
+        if st.button("Clear cached data and reconnect", key="admin_clear_cache_btn"):
+            _reset_app_caches()
+            st.success("Cached data cleared.")
+            st.rerun()
+
 def render_analytics_tab() -> None:
     st.subheader("Analytics")
     base = load_analytics_base()
@@ -1501,8 +2139,8 @@ def main() -> None:
         ("Re-entries", derived["reentries"]),
     ])
 
-    tab_search, tab_week, tab_song, tab_artist, tab_special, tab_analytics = st.tabs(
-        ["Full-text search", "Week browser", "Canonical song history", "Artist history", "Quick tables", "Analytics"]
+    tab_search, tab_week, tab_song, tab_artist, tab_special, tab_analytics, tab_admin = st.tabs(
+        ["Full-text search", "Week browser", "Canonical song history", "Artist history", "Quick tables", "Analytics", "Admin"]
     )
 
     with tab_search:
@@ -1659,6 +2297,9 @@ def main() -> None:
 
     with tab_analytics:
         render_analytics_tab()
+
+    with tab_admin:
+        render_admin_tab()
 
 
 if __name__ == "__main__":

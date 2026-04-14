@@ -123,7 +123,8 @@ def split_credit_people_list(value: str | None) -> str:
     if text.count(",") >= 2:
         text = re.sub(r"\s*,\s*", ";", text)
 
-    text = re.sub(r"\s*&\s*", ";", text)
+    # Preserve ampersands so group names like 'Lil Jon & The East Side Boyz'
+    # stay intact. Collaboration splitting is handled by clearer textual markers.
     text = re.sub(r"\s+(?:and|x|with)\s+", ";", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*\+\s*", ";", text)
 
