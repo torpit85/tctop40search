@@ -1685,6 +1685,124 @@ def admin_rename_canonical_song(canonical_song_id: int, new_title: str) -> tuple
         conn.close()
 
 
+def _refresh_canonical_song_rollup(cur: sqlite3.Cursor, canonical_song_id: int) -> None:
+    row = cur.execute(
+        """
+        SELECT
+            COUNT(*) AS entry_count,
+            MIN(cw.chart_date) AS first_chart_date,
+            MAX(cw.chart_date) AS last_chart_date
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.canonical_song_id = ?
+        """,
+        (canonical_song_id,),
+    ).fetchone()
+    entry_count = int(row[0] or 0) if row is not None else 0
+    first_chart_date = row[1] if row is not None else None
+    last_chart_date = row[2] if row is not None else None
+    alias_count_row = cur.execute(
+        "SELECT COUNT(*) FROM song_alias WHERE canonical_song_id = ?",
+        (canonical_song_id,),
+    ).fetchone()
+    alias_count = int(alias_count_row[0] or 0) if alias_count_row is not None else 0
+    cur.execute(
+        """
+        UPDATE canonical_song
+        SET entry_count = ?, alias_count = ?, first_chart_date = ?, last_chart_date = ?
+        WHERE canonical_song_id = ?
+        """,
+        (entry_count, alias_count, first_chart_date, last_chart_date, canonical_song_id),
+    )
+
+
+def admin_merge_canonical_songs(source_canonical_song_id: int, target_canonical_song_id: int) -> tuple[bool, str]:
+    if source_canonical_song_id == target_canonical_song_id:
+        return False, "Choose two different canonical songs."
+
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        src = cur.execute(
+            """
+            SELECT canonical_song_id, canonical_title, COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist,
+                   canonical_title_key, canonical_artist_key, canonical_group_key
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (source_canonical_song_id,),
+        ).fetchone()
+        tgt = cur.execute(
+            """
+            SELECT canonical_song_id, canonical_title, COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist,
+                   canonical_title_key, canonical_artist_key, canonical_group_key
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (target_canonical_song_id,),
+        ).fetchone()
+        if src is None or tgt is None:
+            return False, "Source or target canonical song was not found."
+
+        cur.execute("BEGIN")
+
+        cur.execute(
+            """
+            UPDATE entry
+            SET canonical_song_id = ?,
+                canonical_title_key = ?,
+                canonical_artist_key = ?,
+                canonical_group_key = ?
+            WHERE canonical_song_id = ?
+            """,
+            (
+                int(tgt["canonical_song_id"]),
+                tgt["canonical_title_key"],
+                tgt["canonical_artist_key"],
+                tgt["canonical_group_key"],
+                int(src["canonical_song_id"]),
+            ),
+        )
+
+        try:
+            _insert_song_alias_row(cur, int(tgt["canonical_song_id"]), (src["canonical_title"] or "").strip(), (src["canonical_artist"] or "").strip())
+        except Exception:
+            pass
+
+        if "song_alias" in {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
+            alias_rows = cur.execute(
+                """
+                SELECT alias_song_title, alias_artist
+                FROM song_alias
+                WHERE canonical_song_id = ?
+                """,
+                (int(src["canonical_song_id"]),),
+            ).fetchall()
+            for alias_song_title, alias_artist in alias_rows:
+                try:
+                    _insert_song_alias_row(cur, int(tgt["canonical_song_id"]), alias_song_title, alias_artist)
+                except Exception:
+                    pass
+            cur.execute("DELETE FROM song_alias WHERE canonical_song_id = ?", (int(src["canonical_song_id"]),))
+
+        cur.execute("DELETE FROM canonical_song WHERE canonical_song_id = ?", (int(src["canonical_song_id"]),))
+        _refresh_canonical_song_rollup(cur, int(tgt["canonical_song_id"]))
+
+        conn.commit()
+        _reset_app_caches()
+        return True, f'Merged "{src["canonical_title"]}" into "{tgt["canonical_title"]}".'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Song merge failed: {exc}"
+    finally:
+        conn.close()
+
+
 def _ensure_artist_key_override_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -1745,6 +1863,30 @@ def admin_save_artist_key_merge(source_artist_key: str, target_artist_key: str, 
     except Exception as exc:
         conn.rollback()
         return False, f"Artist merge failed: {exc}"
+    finally:
+        conn.close()
+
+
+def admin_delete_artist_key_override(source_artist_key: str) -> tuple[bool, str]:
+    source_key = normalize_search_text(source_artist_key)
+    if not source_key:
+        return False, "Source artist key is blank."
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        _ensure_artist_key_override_table(conn)
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        cur.execute("DELETE FROM artist_key_override WHERE source_artist_key = ?", (source_key,))
+        deleted = cur.rowcount
+        conn.commit()
+        _reset_app_caches()
+        if deleted:
+            return True, f'Deleted saved override for "{source_key}".'
+        return False, f'No saved override exists for "{source_key}".'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Delete override failed: {exc}"
     finally:
         conn.close()
 
@@ -1961,6 +2103,8 @@ def render_admin_tab() -> None:
                 f"{row.canonical_title} — {row.canonical_artist} | {int(row.chart_weeks or 0)} weeks | {row.first_chart_date} to {row.last_chart_date}": int(row.canonical_song_id)
                 for row in songs.itertuples(index=False)
             }
+
+            st.markdown("#### Rename canonical song")
             selected_label = st.selectbox("Choose a canonical song to manage", list(song_options.keys()), key="admin_song_pick")
             selected_song_id = song_options[selected_label]
             selected_row = songs.loc[songs["canonical_song_id"] == selected_song_id].iloc[0]
@@ -1976,16 +2120,43 @@ def render_admin_tab() -> None:
             st.markdown("**Alias variants for this canonical song**")
             _display_df(admin_song_aliases(selected_song_id))
 
+            st.markdown("#### Merge duplicate canonical songs")
+            merge_cols = st.columns([1.2, 1.2])
+            merge_source_label = merge_cols[0].selectbox(
+                "Duplicate/source canonical song",
+                list(song_options.keys()),
+                key="admin_song_merge_source",
+            )
+            merge_source_id = song_options[merge_source_label]
+            target_labels = [label for label, cid in song_options.items() if cid != merge_source_id]
+            if not target_labels:
+                st.caption("No second canonical song is available to merge into.")
+            else:
+                merge_target_label = merge_cols[1].selectbox(
+                    "Keep/target canonical song",
+                    target_labels,
+                    key="admin_song_merge_target",
+                )
+                merge_target_id = song_options[merge_target_label]
+                st.caption("This rewrites entry rows in the DB to the kept canonical song, migrates aliases where possible, and deletes the duplicate canonical_song row.")
+                if st.button("Merge canonical songs", key="admin_song_merge_btn"):
+                    ok, msg = admin_merge_canonical_songs(merge_source_id, merge_target_id)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
     with tab_artists:
         st.markdown("### Artist alias audit")
-        st.caption("Use this section to pick the correct display name for an artist key or merge one artist key into another.")
+        st.caption("Use this section to pick the correct display name for an artist key or merge one artist key into another. These saved DB overrides are used throughout artist analytics.")
         artist_audit = admin_artist_alias_audit()
         if artist_audit.empty:
             st.info("No artist-key rows are available to audit.")
         else:
             display_map = {
                 f"{row.display_artist} | {int(row.raw_artist_variants)} raw variants | {int(row.lead_weeks)} lead weeks | {int(row.featured_weeks)} featured weeks": row.artist_key
-                for row in artist_audit.head(2000).itertuples(index=False)
+                for row in artist_audit.head(3000).itertuples(index=False)
             }
             selected_artist_label = st.selectbox(
                 "Choose an artist key",
@@ -2028,8 +2199,16 @@ def render_admin_tab() -> None:
                     key="admin_artist_preferred_display_text",
                 )
 
-            if st.button("Save artist merge", key="admin_artist_merge_btn"):
+            action_cols = st.columns([1,1])
+            if action_cols[0].button("Save artist merge", key="admin_artist_merge_btn"):
                 ok, msg = admin_save_artist_key_merge(selected_artist_key, target_artist_key, preferred_display)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            if action_cols[1].button("Delete saved override for selected key", key="admin_artist_delete_override_btn"):
+                ok, msg = admin_delete_artist_key_override(selected_artist_key)
                 if ok:
                     st.success(msg)
                     st.rerun()
@@ -2037,9 +2216,29 @@ def render_admin_tab() -> None:
                     st.error(msg)
 
             st.markdown("**Saved artist-key merges / display overrides**")
-            _display_df(admin_artist_key_override_rows())
+            overrides_df = admin_artist_key_override_rows()
+            _display_df(overrides_df)
+
+            if not overrides_df.empty:
+                delete_label_map = {
+                    f"{row.source_artist_key} → {row.target_artist_key} | {row.preferred_display}": row.source_artist_key
+                    for row in overrides_df.itertuples(index=False)
+                }
+                delete_label = st.selectbox(
+                    "Delete a specific saved override",
+                    list(delete_label_map.keys()),
+                    key="admin_artist_saved_override_pick",
+                )
+                if st.button("Delete selected saved override", key="admin_artist_delete_saved_override_btn"):
+                    ok, msg = admin_delete_artist_key_override(delete_label_map[delete_label])
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
             st.markdown("**Artist-key audit summary**")
-            _display_df(artist_audit.head(250), ["display_artist", "artist_key", "raw_artist_variants", "lead_weeks", "featured_weeks"])
+            _display_df(artist_audit.head(400), ["display_artist", "artist_key", "raw_artist_variants", "lead_weeks", "featured_weeks"])
 
     with tab_quality:
         st.markdown("### Data quality checks")
