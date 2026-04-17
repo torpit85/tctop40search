@@ -1803,6 +1803,218 @@ def admin_merge_canonical_songs(source_canonical_song_id: int, target_canonical_
         conn.close()
 
 
+@st.cache_data(show_spinner=False)
+def admin_song_entry_rows(canonical_song_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    if not _admin_table_exists(conn, "entry") or not _admin_table_exists(conn, "chart_week"):
+        return pd.DataFrame(columns=["entry_id", "chart_date", "position", "song", "artist", "lead_artist", "featured_artist"])
+    return pd.read_sql_query(
+        """
+        SELECT
+            e.entry_id,
+            cw.chart_date,
+            e.position,
+            e.song_title_display AS song,
+            e.full_artist_display AS artist,
+            e.lead_artist_display AS lead_artist,
+            e.featured_artist_display AS featured_artist,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            e.normalized_lead_artist,
+            e.normalized_featured_artist
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.canonical_song_id = ?
+        ORDER BY cw.chart_date, e.position, e.entry_id
+        """,
+        conn,
+        params=(canonical_song_id,),
+    )
+
+
+def _rebuild_song_aliases_for_canonical_song(cur: sqlite3.Cursor, canonical_song_id: int) -> None:
+    tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "song_alias" not in tables:
+        return
+    cur.execute("DELETE FROM song_alias WHERE canonical_song_id = ?", (canonical_song_id,))
+    rows = cur.execute(
+        """
+        SELECT
+            e.song_title_display,
+            e.full_artist_display,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            e.canonical_group_key,
+            COUNT(*) AS entry_count,
+            COUNT(DISTINCT e.chart_week_id) AS week_count,
+            MIN(cw.chart_date) AS first_chart_date,
+            MAX(cw.chart_date) AS last_chart_date
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.canonical_song_id = ?
+        GROUP BY
+            e.song_title_display,
+            e.full_artist_display,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            e.canonical_group_key
+        ORDER BY MAX(cw.chart_date) DESC, e.song_title_display, e.full_artist_display
+        """,
+        (canonical_song_id,),
+    ).fetchall()
+    for song_title_display, full_artist_display, normalized_song_title, normalized_full_artist, canonical_group_key, entry_count, week_count, first_chart_date, last_chart_date in rows:
+        alias_display_key = normalize_search_text(f"{song_title_display}||{full_artist_display}")
+        cur.execute(
+            """
+            INSERT INTO song_alias (
+                alias_song_title, alias_artist, alias_title_key, alias_artist_key, alias_group_key,
+                alias_display_key, canonical_song_id, entry_count, week_count, first_chart_date, last_chart_date
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                song_title_display,
+                full_artist_display,
+                normalized_song_title or normalize_search_text(song_title_display),
+                normalized_full_artist or normalize_search_text(full_artist_display),
+                canonical_group_key or f"{normalize_search_text(song_title_display)}||{normalize_search_text(full_artist_display)}",
+                alias_display_key,
+                canonical_song_id,
+                int(entry_count or 0),
+                int(week_count or 0),
+                first_chart_date,
+                last_chart_date,
+            ),
+        )
+
+
+def admin_split_canonical_song(source_canonical_song_id: int, entry_ids: list[int], new_title: str = "", new_full_artist: str = "") -> tuple[bool, str]:
+    if not entry_ids:
+        return False, "Select at least one entry row to split."
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+
+    entry_ids = [int(eid) for eid in entry_ids]
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        src = cur.execute(
+            """
+            SELECT canonical_song_id, canonical_title, COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (source_canonical_song_id,),
+        ).fetchone()
+        if src is None:
+            return False, "Source canonical song was not found."
+
+        placeholders = ",".join(["?"] * len(entry_ids))
+        selected = cur.execute(
+            f"""
+            SELECT
+                e.entry_id,
+                e.song_title_display,
+                e.full_artist_display,
+                e.lead_artist_display,
+                e.featured_artist_display,
+                e.normalized_song_title,
+                e.normalized_full_artist,
+                e.normalized_lead_artist,
+                e.normalized_featured_artist,
+                cw.chart_date
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id = ?
+              AND e.entry_id IN ({placeholders})
+            ORDER BY cw.chart_date DESC, e.entry_id DESC
+            """,
+            [source_canonical_song_id, *entry_ids],
+        ).fetchall()
+        if not selected:
+            return False, "No matching entry rows were found for this canonical song."
+
+        total_rows = cur.execute("SELECT COUNT(*) FROM entry WHERE canonical_song_id = ?", (source_canonical_song_id,)).fetchone()[0]
+        if len(selected) >= int(total_rows or 0):
+            return False, "Select fewer than all rows; use merge/rename for whole-song changes."
+
+        latest = selected[0]
+        final_title = (new_title or latest["song_title_display"] or "").strip()
+        final_full_artist = (new_full_artist or latest["full_artist_display"] or "").strip()
+        if not final_title or not final_full_artist:
+            return False, "New canonical title and artist could not be determined."
+
+        final_title_key = normalize_search_text(final_title)
+        final_artist_key = normalize_search_text(final_full_artist)
+        final_lead_artist = (latest["lead_artist_display"] or final_full_artist).strip()
+        final_featured_artist = (latest["featured_artist_display"] or "").strip()
+        final_group_key = f"{final_title_key}||{final_artist_key}"
+
+        collision = cur.execute(
+            """
+            SELECT canonical_song_id
+            FROM canonical_song
+            WHERE canonical_song_id <> ?
+              AND LOWER(TRIM(canonical_title)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(canonical_full_artist, canonical_artist))) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (source_canonical_song_id, final_title, final_full_artist),
+        ).fetchone()
+        if collision is not None:
+            return False, "A canonical song with that title and artist already exists. Use merge instead."
+
+        cur.execute("BEGIN")
+        cur.execute(
+            """
+            INSERT INTO canonical_song (
+                canonical_title, canonical_artist, canonical_title_key, canonical_artist_key, canonical_group_key,
+                entry_count, alias_count, first_chart_date, last_chart_date,
+                canonical_full_artist, canonical_lead_artist, canonical_featured_artist
+            ) VALUES (?, ?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?, ?)
+            """,
+            (
+                final_title,
+                final_full_artist,
+                final_title_key,
+                final_artist_key,
+                final_group_key,
+                final_full_artist,
+                final_lead_artist,
+                final_featured_artist,
+            ),
+        )
+        new_canonical_song_id = int(cur.lastrowid)
+
+        cur.execute(
+            f"""
+            UPDATE entry
+            SET canonical_song_id = ?,
+                canonical_title_key = ?,
+                canonical_artist_key = ?,
+                canonical_group_key = ?
+            WHERE canonical_song_id = ?
+              AND entry_id IN ({placeholders})
+            """,
+            [new_canonical_song_id, final_title_key, final_artist_key, final_group_key, source_canonical_song_id, *entry_ids],
+        )
+
+        _rebuild_song_aliases_for_canonical_song(cur, int(source_canonical_song_id))
+        _rebuild_song_aliases_for_canonical_song(cur, new_canonical_song_id)
+        _refresh_canonical_song_rollup(cur, int(source_canonical_song_id))
+        _refresh_canonical_song_rollup(cur, new_canonical_song_id)
+
+        conn.commit()
+        _reset_app_caches()
+        return True, f'Split {len(entry_ids)} row(s) from "{src["canonical_title"]}" into new canonical song "{final_title}".'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Song split failed: {exc}"
+    finally:
+        conn.close()
+
+
 def _ensure_artist_key_override_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -2089,11 +2301,13 @@ def admin_data_quality_checks() -> dict[str, pd.DataFrame]:
 
 def render_admin_tab() -> None:
     st.subheader("Admin")
-    tab_songs, tab_artists, tab_quality, tab_maintenance = st.tabs(
-        ["Songs", "Artists", "Data Quality", "Maintenance"]
+    admin_section = st.selectbox(
+        "Admin section",
+        ["Songs", "Artists", "Data Quality", "Maintenance"],
+        key="admin_section_selector",
     )
 
-    with tab_songs:
+    if admin_section == "Songs":
         st.markdown("### Canonical songs")
         songs = admin_song_options()
         if songs.empty:
@@ -2147,7 +2361,42 @@ def render_admin_tab() -> None:
                     else:
                         st.error(msg)
 
-    with tab_artists:
+            st.markdown("#### Manual split canonical song")
+            st.caption("Move selected entry rows into a brand-new canonical song. Use this when one canonical song has swallowed two different songs.")
+            split_rows_df = admin_song_entry_rows(selected_song_id)
+            if split_rows_df.empty:
+                st.caption("No entry rows are available for this canonical song.")
+            else:
+                split_label_map = {
+                    f"{row.chart_date} | #{int(row.position)} | {row.song} — {row.artist}": int(row.entry_id)
+                    for row in split_rows_df.itertuples(index=False)
+                }
+                selected_split_labels = st.multiselect(
+                    "Select rows to move into a new canonical song",
+                    list(split_label_map.keys()),
+                    key="admin_song_split_rows",
+                )
+                split_cols = st.columns(2)
+                split_new_title = split_cols[0].text_input(
+                    "New canonical title for selected rows (optional)",
+                    value="",
+                    key="admin_song_split_new_title",
+                )
+                split_new_artist = split_cols[1].text_input(
+                    "New canonical full artist for selected rows (optional)",
+                    value="",
+                    key="admin_song_split_new_artist",
+                )
+                if st.button("Split selected rows into new canonical song", key="admin_song_split_btn"):
+                    entry_ids = [split_label_map[label] for label in selected_split_labels]
+                    ok, msg = admin_split_canonical_song(selected_song_id, entry_ids, split_new_title, split_new_artist)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    elif admin_section == "Artists":
         st.markdown("### Artist alias audit")
         st.caption("Use this section to pick the correct display name for an artist key or merge one artist key into another. These saved DB overrides are used throughout artist analytics.")
         artist_audit = admin_artist_alias_audit()
@@ -2199,7 +2448,7 @@ def render_admin_tab() -> None:
                     key="admin_artist_preferred_display_text",
                 )
 
-            action_cols = st.columns([1,1])
+            action_cols = st.columns([1, 1])
             if action_cols[0].button("Save artist merge", key="admin_artist_merge_btn"):
                 ok, msg = admin_save_artist_key_merge(selected_artist_key, target_artist_key, preferred_display)
                 if ok:
@@ -2237,10 +2486,10 @@ def render_admin_tab() -> None:
                     else:
                         st.error(msg)
 
-            st.markdown("**Artist-key audit summary**")
-            _display_df(artist_audit.head(400), ["display_artist", "artist_key", "raw_artist_variants", "lead_weeks", "featured_weeks"])
+            with st.expander("Artist-key audit summary", expanded=False):
+                _display_df(artist_audit.head(400), ["display_artist", "artist_key", "raw_artist_variants", "lead_weeks", "featured_weeks"])
 
-    with tab_quality:
+    elif admin_section == "Data Quality":
         st.markdown("### Data quality checks")
         checks = admin_data_quality_checks()
         sections = [
@@ -2267,7 +2516,7 @@ def render_admin_tab() -> None:
             else:
                 _display_df(known_anomalies, ["chart_date", "issue_type", "severity", "summary", "status", "notes"])
 
-    with tab_maintenance:
+    else:
         st.markdown("### Maintenance")
         stats = admin_db_stats()
         a1, a2, a3 = st.columns(3)
@@ -2318,6 +2567,158 @@ def render_analytics_tab() -> None:
         _render_records_outliers(pkg, top_n)
 
 
+def render_search_tab() -> None:
+    st.subheader("Full-text search")
+    query = st.text_input(
+        "Search songs, artists, slugs, or mixed text",
+        placeholder='Examples: "slow jamz", janet jackson, prof "big dog"',
+    )
+    filter_cols = st.columns(2)
+    marker_filter = filter_cols[0].selectbox("Marker filter", ["All", "DEBUT", "TOP DEBUT", "RE-ENTRY"])
+    limit = filter_cols[1].slider("Result limit", 10, 200, 50, 10, key="fts_limit")
+    if query.strip():
+        try:
+            results = run_search(query.strip(), limit, marker_filter)
+            st.write(f"{len(results):,} result(s)")
+            _display_df(results)
+        except Exception as exc:
+            st.error(f"Search query could not be run: {exc}")
+    else:
+        st.info("Enter a search query to browse the database.")
+
+def render_week_browser_tab() -> None:
+    st.subheader("Browse a chart week")
+    dates = load_chart_dates()
+    if dates:
+        valid_dates = sorted(dates)
+        min_date = dt.date.fromisoformat(valid_dates[0])
+        max_date = dt.date.fromisoformat(valid_dates[-1])
+        selected_date_obj = st.date_input(
+            "Chart date",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+            format="YYYY-MM-DD",
+        )
+        selected_date, snapped = nearest_chart_date(selected_date_obj.isoformat(), valid_dates)
+        if selected_date:
+            if snapped:
+                st.info(f"No chart exists for {selected_date_obj.isoformat()}. Showing nearest prior chart week: {selected_date}.")
+            df, meta = load_chart(selected_date)
+            if meta:
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Rows stored", meta["row_count"])
+                k2.metric("Chart ID", meta["chart_id"] or "—")
+                k3.metric("Source ZIP", meta["source_zip"] or "—")
+                st.caption(f"Source file: {meta['source_file']}")
+                if meta.get("notes"):
+                    st.warning(meta["notes"])
+            _display_df(df)
+    else:
+        st.info("No chart weeks are available in the database.")
+
+def render_song_history_tab() -> None:
+    st.subheader("Canonical song history")
+    song_term = st.text_input("Find song or artist", placeholder="Type part of a title or artist", key="song_term")
+    if song_term.strip():
+        candidates = canonical_song_matches(song_term)
+        if candidates.empty:
+            st.info("No canonical songs matched that search.")
+        else:
+            display_options = {
+                f"{row.canonical_title} — {row.canonical_artist} | peak #{int(row.peak)} | {int(row.chart_weeks)} weeks | {row.first_date} to {row.last_date}": int(row.canonical_song_id)
+                for row in candidates.itertuples(index=False)
+            }
+            selected_label = st.selectbox("Choose a canonical song", list(display_options.keys()))
+            selected_song_id = display_options[selected_label]
+            history, stats, aliases = canonical_song_history(selected_song_id)
+            if stats:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Peak", f"#{int(stats['peak'])}")
+                c2.metric("Chart weeks", int(stats["chart_weeks"]))
+                c3.metric("First week", stats["first_date"])
+                c4.metric("Last week", stats["last_date"])
+                st.caption(
+                    f"Canonical full credit: {stats['artist']} | "
+                    f"Lead: {stats['lead_artist']} | "
+                    f"Featured: {stats['featured_artist'] or '—'} | "
+                    f"Alias variants: {int(stats['alias_count'])}"
+                )
+                chart_df = history.set_index("chart_date")["position"].sort_index()
+                st.line_chart((-chart_df).rename("inverted_position"))
+                st.caption("Line chart uses inverted positions so higher placements plot higher.")
+                st.markdown("**Week-by-week history**")
+                _display_df(history)
+                st.markdown("**Alias variants in this canonical song**")
+                _display_df(aliases)
+    else:
+        st.info("Type part of a title or artist to load a canonical song history.")
+
+def render_artist_history_tab() -> None:
+    st.subheader("Artist history")
+    artist_cols = st.columns([2, 1])
+    artist_term = artist_cols[0].text_input("Find artist", placeholder="Type part of an artist name", key="artist_term")
+    role_mode = artist_cols[1].selectbox("Browse by", ["Full credit", "Lead artist", "Featured artist"])
+    if artist_term.strip():
+        candidates = artist_matches(artist_term, role_mode)
+        if candidates.empty:
+            st.info(f"No {artist_role_config(role_mode)['label']} matches found.")
+        else:
+            display_options = {
+                f"{row.display_artist} | peak #{int(row.peak)} | {int(row.chart_weeks)} weeks | {row.first_date} to {row.last_date}": row.normalized_artist
+                for row in candidates.itertuples(index=False)
+            }
+            selected_label = st.selectbox("Choose an artist", list(display_options.keys()), key="artist_pick")
+            selected_artist = display_options[selected_label]
+            history, stats, songs = artist_history(selected_artist, role_mode)
+            if stats:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Peak", f"#{int(stats['peak'])}")
+                c2.metric("Chart weeks", int(stats["chart_weeks"]))
+                c3.metric("Distinct songs", int(stats["distinct_songs"]))
+                c4.metric("Span", f"{stats['first_date']} to {stats['last_date']}")
+                st.caption(f"Mode: {artist_role_config(role_mode)['label']}")
+                st.markdown("**Song summary**")
+                _display_df(songs)
+                st.markdown("**Full week-by-week history**")
+                _display_df(history)
+    else:
+        st.info("Type part of an artist name to load an artist history.")
+
+def render_special_tables_tab() -> None:
+    st.subheader("Quick tables")
+    table_kind = st.selectbox(
+        "View",
+        [
+            "#1 hits",
+            "Top 10 hits",
+            "Top debuts",
+            "Top 5 debuts",
+            "Debut weeks",
+            "Re-entries",
+            "Biggest climbers",
+            "Artists with most Top 10 weeks",
+            "Artists with most appearances on a single chart",
+        ],
+    )
+
+    if table_kind == "#1 hits":
+        conn = get_connection()
+        year_rows = conn.execute(
+            "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
+        ).fetchall()
+        year_options = ["All years"] + [row[0] for row in year_rows if row[0]]
+        selected_year = st.selectbox("Year", year_options, key="special_num1_year")
+
+        table = load_special_entries(table_kind, 1000000)
+        if selected_year != "All years" and not table.empty and "chart_date" in table.columns:
+            table = table.loc[table["chart_date"].astype(str).str.startswith(selected_year)].copy()
+        _display_df(table)
+    else:
+        limit = st.slider("Rows", 10, 500, 100, 10, key="special_limit")
+        table = load_special_entries(table_kind, limit)
+        _display_df(table)
+
 def main() -> None:
     st.title("Torrey's Corner Top 40 Search Engine")
     st.caption("SQLite + FTS5 chart browser for the Torrey's Corner Top 40 database")
@@ -2338,11 +2739,21 @@ def main() -> None:
         ("Re-entries", derived["reentries"]),
     ])
 
-    tab_search, tab_week, tab_song, tab_artist, tab_special, tab_analytics, tab_admin = st.tabs(
-        ["Full-text search", "Week browser", "Canonical song history", "Artist history", "Quick tables", "Analytics", "Admin"]
+    main_section = st.selectbox(
+        "Section",
+        [
+            "Full-text search",
+            "Week browser",
+            "Canonical song history",
+            "Artist history",
+            "Quick tables",
+            "Analytics",
+            "Admin",
+        ],
+        key="main_section_selector",
     )
 
-    with tab_search:
+    if main_section == "Full-text search":
         st.subheader("Full-text search")
         query = st.text_input(
             "Search songs, artists, slugs, or mixed text",
@@ -2361,143 +2772,17 @@ def main() -> None:
         else:
             st.info("Enter a search query to browse the database.")
 
-    with tab_week:
-        st.subheader("Browse a chart week")
-        dates = load_chart_dates()
-        if dates:
-            valid_dates = sorted(dates)
-            min_date = dt.date.fromisoformat(valid_dates[0])
-            max_date = dt.date.fromisoformat(valid_dates[-1])
-            selected_date_obj = st.date_input(
-                "Chart date",
-                value=max_date,
-                min_value=min_date,
-                max_value=max_date,
-                format="YYYY-MM-DD",
-            )
-            selected_date, snapped = nearest_chart_date(selected_date_obj.isoformat(), valid_dates)
-            if selected_date:
-                if snapped:
-                    st.info(f"No chart exists for {selected_date_obj.isoformat()}. Showing nearest prior chart week: {selected_date}.")
-                df, meta = load_chart(selected_date)
-                if meta:
-                    k1, k2, k3 = st.columns(3)
-                    k1.metric("Rows stored", meta["row_count"])
-                    k2.metric("Chart ID", meta["chart_id"] or "—")
-                    k3.metric("Source ZIP", meta["source_zip"] or "—")
-                    st.caption(f"Source file: {meta['source_file']}")
-                    if meta.get("notes"):
-                        st.warning(meta["notes"])
-                _display_df(df)
-        else:
-            st.info("No chart weeks are available in the database.")
-
-    with tab_song:
-        st.subheader("Canonical song history")
-        song_term = st.text_input("Find song or artist", placeholder="Type part of a title or artist", key="song_term")
-        if song_term.strip():
-            candidates = canonical_song_matches(song_term)
-            if candidates.empty:
-                st.info("No canonical songs matched that search.")
-            else:
-                display_options = {
-                    f"{row.canonical_title} — {row.canonical_artist} | peak #{int(row.peak)} | {int(row.chart_weeks)} weeks | {row.first_date} to {row.last_date}": int(row.canonical_song_id)
-                    for row in candidates.itertuples(index=False)
-                }
-                selected_label = st.selectbox("Choose a canonical song", list(display_options.keys()))
-                selected_song_id = display_options[selected_label]
-                history, stats, aliases = canonical_song_history(selected_song_id)
-                if stats:
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Peak", f"#{int(stats['peak'])}")
-                    c2.metric("Chart weeks", int(stats["chart_weeks"]))
-                    c3.metric("First week", stats["first_date"])
-                    c4.metric("Last week", stats["last_date"])
-                    st.caption(
-                        f"Canonical full credit: {stats['artist']} | "
-                        f"Lead: {stats['lead_artist']} | "
-                        f"Featured: {stats['featured_artist'] or '—'} | "
-                        f"Alias variants: {int(stats['alias_count'])}"
-                    )
-                    chart_df = history.set_index("chart_date")["position"].sort_index()
-                    st.line_chart((-chart_df).rename("inverted_position"))
-                    st.caption("Line chart uses inverted positions so higher placements plot higher.")
-                    st.markdown("**Week-by-week history**")
-                    _display_df(history)
-                    st.markdown("**Alias variants in this canonical song**")
-                    _display_df(aliases)
-        else:
-            st.info("Type part of a title or artist to load a canonical song history.")
-
-    with tab_artist:
-        st.subheader("Artist history")
-        artist_cols = st.columns([2, 1])
-        artist_term = artist_cols[0].text_input("Find artist", placeholder="Type part of an artist name", key="artist_term")
-        role_mode = artist_cols[1].selectbox("Browse by", ["Full credit", "Lead artist", "Featured artist"])
-        if artist_term.strip():
-            candidates = artist_matches(artist_term, role_mode)
-            if candidates.empty:
-                st.info(f"No {artist_role_config(role_mode)['label']} matches found.")
-            else:
-                display_options = {
-                    f"{row.display_artist} | peak #{int(row.peak)} | {int(row.chart_weeks)} weeks | {row.first_date} to {row.last_date}": row.normalized_artist
-                    for row in candidates.itertuples(index=False)
-                }
-                selected_label = st.selectbox("Choose an artist", list(display_options.keys()), key="artist_pick")
-                selected_artist = display_options[selected_label]
-                history, stats, songs = artist_history(selected_artist, role_mode)
-                if stats:
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Peak", f"#{int(stats['peak'])}")
-                    c2.metric("Chart weeks", int(stats["chart_weeks"]))
-                    c3.metric("Distinct songs", int(stats["distinct_songs"]))
-                    c4.metric("Span", f"{stats['first_date']} to {stats['last_date']}")
-                    st.caption(f"Mode: {artist_role_config(role_mode)['label']}")
-                    st.markdown("**Song summary**")
-                    _display_df(songs)
-                    st.markdown("**Full week-by-week history**")
-                    _display_df(history)
-        else:
-            st.info("Type part of an artist name to load an artist history.")
-
-    with tab_special:
-        st.subheader("Quick tables")
-        table_kind = st.selectbox(
-            "View",
-            [
-                "#1 hits",
-                "Top 10 hits",
-                "Top debuts",
-                "Top 5 debuts",
-                "Debut weeks",
-                "Re-entries",
-                "Biggest climbers",
-                "Artists with most Top 10 weeks",
-                "Artists with most appearances on a single chart",
-            ],
-        )
-
-        if table_kind == "#1 hits":
-            conn = get_connection()
-            year_rows = conn.execute(
-                "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
-            ).fetchall()
-            year_options = ["All years"] + [row[0] for row in year_rows if row[0]]
-            selected_year = st.selectbox("Year", year_options, key="special_num1_year")
-
-            table = load_special_entries(table_kind, 1000000)
-            if selected_year != "All years" and not table.empty and "chart_date" in table.columns:
-                table = table.loc[table["chart_date"].astype(str).str.startswith(selected_year)].copy()
-            _display_df(table)
-        else:
-            limit = st.slider("Rows", 10, 500, 100, 10, key="special_limit")
-            table = load_special_entries(table_kind, limit)
-            _display_df(table)
-
-    with tab_analytics:
+    elif main_section == "Week browser":
+        render_week_browser_tab()
+    elif main_section == "Canonical song history":
+        render_song_history_tab()
+    elif main_section == "Artist history":
+        render_artist_history_tab()
+    elif main_section == "Quick tables":
+        render_special_tables_tab()
+    elif main_section == "Analytics":
         render_analytics_tab()
-
-    with tab_admin:
+    else:
         render_admin_tab()
 
 
