@@ -311,13 +311,28 @@ def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]:
     conn = get_connection()
+
+    # Be tolerant of older deployed DBs that may not have every chart_week metadata column.
+    chart_week_cols = {row[1] for row in conn.execute("PRAGMA table_info(chart_week)").fetchall()}
+    select_cols = ["chart_date"]
+    for col in ["chart_id", "source_file", "source_zip", "row_count", "notes"]:
+        if col in chart_week_cols:
+            select_cols.append(col)
+
     meta_row = conn.execute(
-        "SELECT chart_date, chart_id, source_file, source_zip, row_count, notes FROM chart_week WHERE chart_date = ?",
+        f"SELECT {', '.join(select_cols)} FROM chart_week WHERE chart_date = ?",
         (chart_date,),
     ).fetchone()
     if meta_row is None:
         return pd.DataFrame(), None
+
     meta = dict(meta_row)
+    meta.setdefault("chart_id", meta.get("chart_week_id", ""))
+    meta.setdefault("source_file", "")
+    meta.setdefault("source_zip", "")
+    meta.setdefault("row_count", None)
+    meta.setdefault("notes", "")
+
     sql = ENTRY_STATS_CTE + """
         SELECT
             e.position,
@@ -1803,218 +1818,6 @@ def admin_merge_canonical_songs(source_canonical_song_id: int, target_canonical_
         conn.close()
 
 
-@st.cache_data(show_spinner=False)
-def admin_song_entry_rows(canonical_song_id: int) -> pd.DataFrame:
-    conn = get_connection()
-    if not _admin_table_exists(conn, "entry") or not _admin_table_exists(conn, "chart_week"):
-        return pd.DataFrame(columns=["entry_id", "chart_date", "position", "song", "artist", "lead_artist", "featured_artist"])
-    return pd.read_sql_query(
-        """
-        SELECT
-            e.entry_id,
-            cw.chart_date,
-            e.position,
-            e.song_title_display AS song,
-            e.full_artist_display AS artist,
-            e.lead_artist_display AS lead_artist,
-            e.featured_artist_display AS featured_artist,
-            e.normalized_song_title,
-            e.normalized_full_artist,
-            e.normalized_lead_artist,
-            e.normalized_featured_artist
-        FROM entry e
-        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
-        WHERE e.canonical_song_id = ?
-        ORDER BY cw.chart_date, e.position, e.entry_id
-        """,
-        conn,
-        params=(canonical_song_id,),
-    )
-
-
-def _rebuild_song_aliases_for_canonical_song(cur: sqlite3.Cursor, canonical_song_id: int) -> None:
-    tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    if "song_alias" not in tables:
-        return
-    cur.execute("DELETE FROM song_alias WHERE canonical_song_id = ?", (canonical_song_id,))
-    rows = cur.execute(
-        """
-        SELECT
-            e.song_title_display,
-            e.full_artist_display,
-            e.normalized_song_title,
-            e.normalized_full_artist,
-            e.canonical_group_key,
-            COUNT(*) AS entry_count,
-            COUNT(DISTINCT e.chart_week_id) AS week_count,
-            MIN(cw.chart_date) AS first_chart_date,
-            MAX(cw.chart_date) AS last_chart_date
-        FROM entry e
-        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
-        WHERE e.canonical_song_id = ?
-        GROUP BY
-            e.song_title_display,
-            e.full_artist_display,
-            e.normalized_song_title,
-            e.normalized_full_artist,
-            e.canonical_group_key
-        ORDER BY MAX(cw.chart_date) DESC, e.song_title_display, e.full_artist_display
-        """,
-        (canonical_song_id,),
-    ).fetchall()
-    for song_title_display, full_artist_display, normalized_song_title, normalized_full_artist, canonical_group_key, entry_count, week_count, first_chart_date, last_chart_date in rows:
-        alias_display_key = normalize_search_text(f"{song_title_display}||{full_artist_display}")
-        cur.execute(
-            """
-            INSERT INTO song_alias (
-                alias_song_title, alias_artist, alias_title_key, alias_artist_key, alias_group_key,
-                alias_display_key, canonical_song_id, entry_count, week_count, first_chart_date, last_chart_date
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                song_title_display,
-                full_artist_display,
-                normalized_song_title or normalize_search_text(song_title_display),
-                normalized_full_artist or normalize_search_text(full_artist_display),
-                canonical_group_key or f"{normalize_search_text(song_title_display)}||{normalize_search_text(full_artist_display)}",
-                alias_display_key,
-                canonical_song_id,
-                int(entry_count or 0),
-                int(week_count or 0),
-                first_chart_date,
-                last_chart_date,
-            ),
-        )
-
-
-def admin_split_canonical_song(source_canonical_song_id: int, entry_ids: list[int], new_title: str = "", new_full_artist: str = "") -> tuple[bool, str]:
-    if not entry_ids:
-        return False, "Select at least one entry row to split."
-    if not Path(DB_PATH).exists():
-        return False, f"Database not found: {DB_PATH}"
-
-    entry_ids = [int(eid) for eid in entry_ids]
-    conn = sqlite3.connect(str(DB_PATH))
-    try:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        src = cur.execute(
-            """
-            SELECT canonical_song_id, canonical_title, COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist
-            FROM canonical_song
-            WHERE canonical_song_id = ?
-            """,
-            (source_canonical_song_id,),
-        ).fetchone()
-        if src is None:
-            return False, "Source canonical song was not found."
-
-        placeholders = ",".join(["?"] * len(entry_ids))
-        selected = cur.execute(
-            f"""
-            SELECT
-                e.entry_id,
-                e.song_title_display,
-                e.full_artist_display,
-                e.lead_artist_display,
-                e.featured_artist_display,
-                e.normalized_song_title,
-                e.normalized_full_artist,
-                e.normalized_lead_artist,
-                e.normalized_featured_artist,
-                cw.chart_date
-            FROM entry e
-            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
-            WHERE e.canonical_song_id = ?
-              AND e.entry_id IN ({placeholders})
-            ORDER BY cw.chart_date DESC, e.entry_id DESC
-            """,
-            [source_canonical_song_id, *entry_ids],
-        ).fetchall()
-        if not selected:
-            return False, "No matching entry rows were found for this canonical song."
-
-        total_rows = cur.execute("SELECT COUNT(*) FROM entry WHERE canonical_song_id = ?", (source_canonical_song_id,)).fetchone()[0]
-        if len(selected) >= int(total_rows or 0):
-            return False, "Select fewer than all rows; use merge/rename for whole-song changes."
-
-        latest = selected[0]
-        final_title = (new_title or latest["song_title_display"] or "").strip()
-        final_full_artist = (new_full_artist or latest["full_artist_display"] or "").strip()
-        if not final_title or not final_full_artist:
-            return False, "New canonical title and artist could not be determined."
-
-        final_title_key = normalize_search_text(final_title)
-        final_artist_key = normalize_search_text(final_full_artist)
-        final_lead_artist = (latest["lead_artist_display"] or final_full_artist).strip()
-        final_featured_artist = (latest["featured_artist_display"] or "").strip()
-        final_group_key = f"{final_title_key}||{final_artist_key}"
-
-        collision = cur.execute(
-            """
-            SELECT canonical_song_id
-            FROM canonical_song
-            WHERE canonical_song_id <> ?
-              AND LOWER(TRIM(canonical_title)) = LOWER(TRIM(?))
-              AND LOWER(TRIM(COALESCE(canonical_full_artist, canonical_artist))) = LOWER(TRIM(?))
-            LIMIT 1
-            """,
-            (source_canonical_song_id, final_title, final_full_artist),
-        ).fetchone()
-        if collision is not None:
-            return False, "A canonical song with that title and artist already exists. Use merge instead."
-
-        cur.execute("BEGIN")
-        cur.execute(
-            """
-            INSERT INTO canonical_song (
-                canonical_title, canonical_artist, canonical_title_key, canonical_artist_key, canonical_group_key,
-                entry_count, alias_count, first_chart_date, last_chart_date,
-                canonical_full_artist, canonical_lead_artist, canonical_featured_artist
-            ) VALUES (?, ?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?, ?)
-            """,
-            (
-                final_title,
-                final_full_artist,
-                final_title_key,
-                final_artist_key,
-                final_group_key,
-                final_full_artist,
-                final_lead_artist,
-                final_featured_artist,
-            ),
-        )
-        new_canonical_song_id = int(cur.lastrowid)
-
-        cur.execute(
-            f"""
-            UPDATE entry
-            SET canonical_song_id = ?,
-                canonical_title_key = ?,
-                canonical_artist_key = ?,
-                canonical_group_key = ?
-            WHERE canonical_song_id = ?
-              AND entry_id IN ({placeholders})
-            """,
-            [new_canonical_song_id, final_title_key, final_artist_key, final_group_key, source_canonical_song_id, *entry_ids],
-        )
-
-        _rebuild_song_aliases_for_canonical_song(cur, int(source_canonical_song_id))
-        _rebuild_song_aliases_for_canonical_song(cur, new_canonical_song_id)
-        _refresh_canonical_song_rollup(cur, int(source_canonical_song_id))
-        _refresh_canonical_song_rollup(cur, new_canonical_song_id)
-
-        conn.commit()
-        _reset_app_caches()
-        return True, f'Split {len(entry_ids)} row(s) from "{src["canonical_title"]}" into new canonical song "{final_title}".'
-    except Exception as exc:
-        conn.rollback()
-        return False, f"Song split failed: {exc}"
-    finally:
-        conn.close()
-
-
 def _ensure_artist_key_override_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -2355,41 +2158,6 @@ def render_admin_tab() -> None:
                 st.caption("This rewrites entry rows in the DB to the kept canonical song, migrates aliases where possible, and deletes the duplicate canonical_song row.")
                 if st.button("Merge canonical songs", key="admin_song_merge_btn"):
                     ok, msg = admin_merge_canonical_songs(merge_source_id, merge_target_id)
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-            st.markdown("#### Manual split canonical song")
-            st.caption("Move selected entry rows into a brand-new canonical song. Use this when one canonical song has swallowed two different songs.")
-            split_rows_df = admin_song_entry_rows(selected_song_id)
-            if split_rows_df.empty:
-                st.caption("No entry rows are available for this canonical song.")
-            else:
-                split_label_map = {
-                    f"{row.chart_date} | #{int(row.position)} | {row.song} — {row.artist}": int(row.entry_id)
-                    for row in split_rows_df.itertuples(index=False)
-                }
-                selected_split_labels = st.multiselect(
-                    "Select rows to move into a new canonical song",
-                    list(split_label_map.keys()),
-                    key="admin_song_split_rows",
-                )
-                split_cols = st.columns(2)
-                split_new_title = split_cols[0].text_input(
-                    "New canonical title for selected rows (optional)",
-                    value="",
-                    key="admin_song_split_new_title",
-                )
-                split_new_artist = split_cols[1].text_input(
-                    "New canonical full artist for selected rows (optional)",
-                    value="",
-                    key="admin_song_split_new_artist",
-                )
-                if st.button("Split selected rows into new canonical song", key="admin_song_split_btn"):
-                    entry_ids = [split_label_map[label] for label in selected_split_labels]
-                    ok, msg = admin_split_canonical_song(selected_song_id, entry_ids, split_new_title, split_new_artist)
                     if ok:
                         st.success(msg)
                         st.rerun()
