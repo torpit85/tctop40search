@@ -117,6 +117,37 @@ def preferred_artist_display(artist_key: object, fallback: object = "") -> str:
     return "" if fallback is None else str(fallback)
 
 
+def artist_key_and_display(artist_key: object, fallback_display: object = "") -> tuple[object, str]:
+    """Resolve an artist key and preferred display name in one place."""
+    resolved_key = resolve_artist_key_alias(artist_key)
+    if resolved_key is None or (isinstance(resolved_key, float) and pd.isna(resolved_key)):
+        return resolved_key, "" if fallback_display is None else str(fallback_display)
+    resolved_key = normalize_search_text(resolved_key)
+    return resolved_key, preferred_artist_display(resolved_key, fallback_display)
+
+
+def apply_artist_display_overrides(df: pd.DataFrame, key_col: str = "artist_key", display_col: str = "artist") -> pd.DataFrame:
+    """Return a copy with resolved artist keys and preferred display names."""
+    if df.empty or key_col not in df.columns:
+        return df
+    out = df.copy()
+    out[key_col] = out[key_col].map(resolve_artist_key_alias).replace("", pd.NA)
+    if display_col in out.columns:
+        display_overrides = load_artist_display_override_map()
+
+        def _display_for_row(r: pd.Series) -> str:
+            key = r.get(key_col)
+            fallback = r.get(display_col, "")
+            if key is None or (isinstance(key, float) and pd.isna(key)):
+                return "" if fallback is None else str(fallback)
+            key = normalize_search_text(key)
+            preferred = display_overrides.get(key) or PREFERRED_ARTIST_DISPLAY.get(key)
+            return preferred or ("" if fallback is None else str(fallback))
+
+        out[display_col] = out.apply(_display_for_row, axis=1)
+    return out
+
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_CANDIDATES = [
     BASE_DIR / 'db' / 'tctop40.sqlite',
@@ -591,6 +622,7 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
     if credits.empty:
         return pd.DataFrame(), None, pd.DataFrame()
 
+    normalized_artist = resolve_artist_key_alias(normalized_artist)
     credits = credits.loc[credits["artist_key"] == normalized_artist].copy()
     if credits.empty:
         return pd.DataFrame(), None, pd.DataFrame()
@@ -616,16 +648,18 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
         .copy()
     )
 
+    # Group by song_key only so already-merged canonical songs do not split back out
+    # just because an old entry used different title casing/punctuation.
     songs = (
-        credits.groupby(["song_key", "title"], dropna=True)
+        credits.groupby(["song_key"], dropna=True)
         .agg(
+            song=("title", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
             chart_weeks=("entry_id", "count"),
             first_date=("chart_date", "min"),
             last_date=("chart_date", "max"),
             peak=("position", "min"),
         )
         .reset_index()
-        .rename(columns={"title": "song"})
         .sort_values(["peak", "chart_weeks", "last_date", "song"], ascending=[True, False, False, True])
         [["song", "chart_weeks", "first_date", "last_date", "peak"]]
     )
@@ -662,46 +696,55 @@ def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
         return pd.read_sql_query(sql, conn, params=(limit,))
 
     if kind == "Artists with most Top 10 weeks":
-        sql = """
-            SELECT
-                lead_artist_display AS lead_artist,
-                COUNT(*) AS top_10_weeks,
-                COUNT(DISTINCT canonical_song_id) AS distinct_songs,
-                MIN(chart_week.chart_date) AS first_date,
-                MAX(chart_week.chart_date) AS last_date,
-                MIN(position) AS best_peak
-            FROM entry
-            JOIN chart_week USING(chart_week_id)
-            WHERE position <= 10
-              AND COALESCE(normalized_lead_artist, '') <> ''
-            GROUP BY normalized_lead_artist, lead_artist_display
-            ORDER BY top_10_weeks DESC, best_peak ASC, last_date DESC, lead_artist
-            LIMIT ?
-        """
-        return pd.read_sql_query(sql, conn, params=(limit,))
+        chart = load_analytics_base()
+        credits = build_artist_credit_rows(chart)
+        if credits.empty:
+            return pd.DataFrame(columns=["lead_artist", "top_10_weeks", "distinct_songs", "first_date", "last_date", "best_peak"])
+        top10 = credits.loc[(credits["artist_role_mode"] == "Lead") & (credits["position"] <= 10)].copy()
+        if top10.empty:
+            return pd.DataFrame(columns=["lead_artist", "top_10_weeks", "distinct_songs", "first_date", "last_date", "best_peak"])
+        out = (
+            top10.groupby("artist_key", dropna=True)
+            .agg(
+                lead_artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+                top_10_weeks=("entry_id", "count"),
+                distinct_songs=("song_key", "nunique"),
+                first_date=("chart_date", "min"),
+                last_date=("chart_date", "max"),
+                best_peak=("position", "min"),
+            )
+            .reset_index()
+        )
+        out["lead_artist"] = out.apply(lambda r: preferred_artist_display(r["artist_key"], r["lead_artist"]), axis=1)
+        out = (
+            out.drop(columns=["artist_key"])
+            .sort_values(["top_10_weeks", "best_peak", "last_date", "lead_artist"], ascending=[False, True, False, True])
+            .head(limit)
+        )
+        return out
 
     if kind == "Artists with most appearances on a single chart":
-        sql = """
-            WITH artist_week_counts AS (
-                SELECT
-                    chart_week.chart_date,
-                    lead_artist_display AS lead_artist,
-                    normalized_lead_artist,
-                    COUNT(*) AS appearances_on_chart
-                FROM entry
-                JOIN chart_week USING(chart_week_id)
-                WHERE COALESCE(normalized_lead_artist, '') <> ''
-                GROUP BY chart_week.chart_date, normalized_lead_artist, lead_artist_display
+        chart = load_analytics_base()
+        credits = build_artist_credit_rows(chart)
+        if credits.empty:
+            return pd.DataFrame(columns=["lead_artist", "appearances_on_chart", "chart_date"])
+        lead = credits.loc[credits["artist_role_mode"] == "Lead"].copy()
+        if lead.empty:
+            return pd.DataFrame(columns=["lead_artist", "appearances_on_chart", "chart_date"])
+        grouped = (
+            lead.groupby(["chart_date", "artist_key"], dropna=True)
+            .agg(
+                lead_artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+                appearances_on_chart=("song_key", "nunique"),
             )
-            SELECT
-                lead_artist,
-                appearances_on_chart,
-                chart_date
-            FROM artist_week_counts
-            ORDER BY appearances_on_chart DESC, chart_date DESC, lead_artist
-            LIMIT ?
-        """
-        return pd.read_sql_query(sql, conn, params=(limit,))
+            .reset_index()
+        )
+        grouped["lead_artist"] = grouped.apply(lambda r: preferred_artist_display(r["artist_key"], r["lead_artist"]), axis=1)
+        grouped = (
+            grouped.sort_values(["appearances_on_chart", "chart_date", "lead_artist"], ascending=[False, False, True])
+            .head(limit)
+        )
+        return grouped[["lead_artist", "appearances_on_chart", "chart_date"]]
 
     conditions = {
         "#1 hits": "e.position = 1",
@@ -878,14 +921,17 @@ def _split_credit_people(norm_value: object, display_value: object) -> list[tupl
 
     pairs: list[tuple[str, str]] = []
     for norm_part, display_part in zip(norm_parts, display_parts):
-        norm_part = (norm_part or "").strip().lower()
+        norm_part = normalize_search_text(norm_part)
         display_part = (display_part or "").strip()
-        if norm_part and display_part:
-            pairs.append((norm_part, display_part))
-        elif norm_part:
-            pairs.append((norm_part, norm_part))
-        elif display_part:
-            pairs.append((display_part.lower(), display_part))
+        raw_key = norm_part or normalize_search_text(display_part)
+        if not raw_key:
+            continue
+        resolved_key = resolve_artist_key_alias(raw_key)
+        if resolved_key is None or (isinstance(resolved_key, float) and pd.isna(resolved_key)):
+            continue
+        resolved_key = normalize_search_text(resolved_key)
+        if resolved_key:
+            pairs.append((resolved_key, display_part or raw_key))
     return pairs
 
 
@@ -918,7 +964,7 @@ def build_artist_credit_rows(df_chart: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     credits = pd.DataFrame(rows)
-    credits["artist_key"] = credits["artist_key"].map(resolve_artist_key_alias)
+    credits = apply_artist_display_overrides(credits, "artist_key", "artist")
     credits["artist_key"] = credits["artist_key"].replace("", pd.NA)
     credits["artist"] = credits["artist"].replace("", pd.NA)
     credits = credits.loc[credits["artist_key"].notna() & credits["artist"].notna()].copy()
@@ -942,12 +988,18 @@ def build_weekly_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
         abs_moves = g.loc[g["abs_move"].notna(), "abs_move"]
         top10 = g.loc[g["position"] <= 10, "weeks_on_chart"]
         bottom10 = g.loc[g["position"] >= 31, "weeks_on_chart"]
+        week_credits = build_artist_credit_rows(g)
+        unique_artist_count = (
+            int(week_credits["artist_key"].dropna().nunique())
+            if not week_credits.empty
+            else int(g["artist_key"].dropna().nunique())
+        )
         rows.append({
             "chart_date": chart_date,
             "year": int(g["year"].iloc[0]),
             "month": int(g["month"].iloc[0]),
             "unique_titles": int(g["song_key"].nunique()),
-            "unique_artists": int(g["artist_key"].dropna().nunique()),
+            "unique_artists": unique_artist_count,
             "debuts": int(g["is_debut"].sum()),
             "reentries": int(g["is_reentry"].sum()),
             "dropouts": int(g["dropped_out_next_week"].sum()),
@@ -1152,10 +1204,20 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
 def build_yearly_summary(df_chart: pd.DataFrame, df_weekly: pd.DataFrame, df_song: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty or df_weekly.empty:
         return pd.DataFrame()
-    year_base = df_chart.groupby("year").agg(
-        unique_songs=("song_key", "nunique"),
-        unique_artists=("artist_key", lambda s: s.dropna().nunique()),
-    ).reset_index()
+    year_rows = []
+    for year, g in df_chart.groupby("year", sort=True):
+        year_credits = build_artist_credit_rows(g)
+        unique_artists = (
+            int(year_credits["artist_key"].dropna().nunique())
+            if not year_credits.empty
+            else int(g["artist_key"].dropna().nunique())
+        )
+        year_rows.append({
+            "year": year,
+            "unique_songs": int(g["song_key"].nunique()),
+            "unique_artists": unique_artists,
+        })
+    year_base = pd.DataFrame(year_rows)
     weekly_year = df_weekly.groupby("year").agg(
         debuts=("debuts", "sum"),
         reentries=("reentries", "sum"),
@@ -1960,6 +2022,15 @@ def _insert_song_alias_row(cur: sqlite3.Cursor, canonical_song_id: int, old_titl
         payload["alias_song_title"] = old_title
     if "alias_artist" in cols:
         payload["alias_artist"] = old_artist
+    alias_title_key = normalize_search_text(old_title)
+    alias_artist_key = normalize_search_text(old_artist)
+    alias_group_key = f"{alias_title_key}||{alias_artist_key}"
+    if "alias_title_key" in cols:
+        payload["alias_title_key"] = alias_title_key
+    if "alias_artist_key" in cols:
+        payload["alias_artist_key"] = alias_artist_key
+    if "alias_group_key" in cols:
+        payload["alias_group_key"] = alias_group_key
     if "week_count" in cols:
         payload["week_count"] = 0
     if "entry_count" in cols:
@@ -2177,6 +2248,165 @@ def admin_merge_canonical_songs(source_canonical_song_id: int, target_canonical_
     finally:
         conn.close()
 
+
+
+
+@st.cache_data(show_spinner=False)
+def admin_entries_for_canonical_song(canonical_song_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    if not _admin_table_exists(conn, "entry"):
+        return pd.DataFrame(columns=["entry_id", "chart_date", "position", "song", "artist", "lead_artist", "featured_artist", "derived_marker"])
+    return pd.read_sql_query(
+        """
+        SELECT
+            e.entry_id,
+            cw.chart_date,
+            e.position,
+            e.song_title_display AS song,
+            e.full_artist_display AS artist,
+            e.lead_artist_display AS lead_artist,
+            e.featured_artist_display AS featured_artist,
+            e.derived_marker
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.canonical_song_id = ?
+        ORDER BY cw.chart_date, e.position, e.entry_id
+        """,
+        conn,
+        params=(canonical_song_id,),
+    )
+
+
+def _song_key_parts(title: object, artist: object) -> tuple[str, str, str]:
+    title_key = normalize_search_text(title)
+    artist_key = normalize_search_text(artist)
+    group_key = f"{title_key}||{artist_key}"
+    return title_key, artist_key, group_key
+
+
+def _create_canonical_song_row(cur: sqlite3.Cursor, title: str, artist: str) -> int:
+    title = (title or "").strip()
+    artist = (artist or "").strip()
+    title_key, artist_key, group_key = _song_key_parts(title, artist)
+    cur.execute(
+        """
+        INSERT INTO canonical_song (
+            canonical_title,
+            canonical_artist,
+            canonical_title_key,
+            canonical_artist_key,
+            canonical_group_key,
+            entry_count,
+            alias_count,
+            first_chart_date,
+            last_chart_date,
+            canonical_full_artist,
+            canonical_lead_artist,
+            canonical_featured_artist
+        ) VALUES (?, ?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?, '')
+        """,
+        (title, artist, title_key, artist_key, group_key, artist, artist),
+    )
+    return int(cur.lastrowid)
+
+
+def admin_split_canonical_song(source_canonical_song_id: int, entry_ids: list[int], new_title: str, new_artist: str) -> tuple[bool, str]:
+    entry_ids = [int(x) for x in (entry_ids or [])]
+    new_title = (new_title or "").strip()
+    new_artist = (new_artist or "").strip()
+
+    if not entry_ids:
+        return False, "Choose at least one chart entry to split out."
+    if not new_title:
+        return False, "New canonical song title cannot be blank."
+    if not new_artist:
+        return False, "New canonical artist cannot be blank."
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+
+    placeholders = ",".join("?" for _ in entry_ids)
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        src = cur.execute(
+            """
+            SELECT canonical_song_id, canonical_title, COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (source_canonical_song_id,),
+        ).fetchone()
+        if src is None:
+            return False, "Source canonical song was not found."
+
+        selected = cur.execute(
+            f"""
+            SELECT
+                e.entry_id,
+                e.song_title_display,
+                e.full_artist_display,
+                cw.chart_date,
+                e.position
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id = ?
+              AND e.entry_id IN ({placeholders})
+            ORDER BY cw.chart_date, e.position, e.entry_id
+            """,
+            (source_canonical_song_id, *entry_ids),
+        ).fetchall()
+        if len(selected) != len(set(entry_ids)):
+            return False, "One or more selected entries no longer belongs to the source canonical song."
+
+        title_key, artist_key, group_key = _song_key_parts(new_title, new_artist)
+
+        cur.execute("BEGIN")
+        new_canonical_song_id = _create_canonical_song_row(cur, new_title, new_artist)
+
+        cur.execute(
+            f"""
+            UPDATE entry
+            SET canonical_song_id = ?,
+                canonical_title_key = ?,
+                canonical_artist_key = ?,
+                canonical_group_key = ?
+            WHERE canonical_song_id = ?
+              AND entry_id IN ({placeholders})
+            """,
+            (new_canonical_song_id, title_key, artist_key, group_key, source_canonical_song_id, *entry_ids),
+        )
+
+        # Preserve the selected visible variants as aliases for the new canonical song.
+        for row in selected:
+            try:
+                _insert_song_alias_row(
+                    cur,
+                    new_canonical_song_id,
+                    (row["song_title_display"] or "").strip() or new_title,
+                    (row["full_artist_display"] or "").strip() or new_artist,
+                )
+            except Exception:
+                pass
+
+        # Also keep the new canonical label as an alias, which helps future imports land here.
+        try:
+            _insert_song_alias_row(cur, new_canonical_song_id, new_title, new_artist)
+        except Exception:
+            pass
+
+        _refresh_canonical_song_rollup(cur, source_canonical_song_id)
+        _refresh_canonical_song_rollup(cur, new_canonical_song_id)
+
+        conn.commit()
+        _reset_app_caches()
+        return True, f'Split {len(selected)} chart entr{"y" if len(selected) == 1 else "ies"} from "{src["canonical_title"]}" into new canonical song "{new_title}".'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Song split failed: {exc}"
+    finally:
+        conn.close()
 
 def _ensure_artist_key_override_table(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -2518,6 +2748,44 @@ def render_admin_tab() -> None:
                 st.caption("This rewrites entry rows in the DB to the kept canonical song, migrates aliases where possible, and deletes the duplicate canonical_song row.")
                 if st.button("Merge canonical songs", key="admin_song_merge_btn"):
                     ok, msg = admin_merge_canonical_songs(merge_source_id, merge_target_id)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            st.markdown("#### Split selected chart entries into a new canonical song")
+            st.caption("Use this when a canonical song accidentally contains entries from two different songs. The selected chart rows are moved to a newly created canonical_song row; the original canonical song is kept for the unselected rows.")
+            split_entries = admin_entries_for_canonical_song(selected_song_id)
+            if split_entries.empty:
+                st.caption("No chart entries are attached to this canonical song.")
+            else:
+                _display_df(split_entries, ["entry_id", "chart_date", "position", "song", "artist", "lead_artist", "featured_artist", "derived_marker"])
+                split_label_map = {
+                    f"{row.chart_date} | #{int(row.position)} | {row.song} — {row.artist} | entry {int(row.entry_id)}": int(row.entry_id)
+                    for row in split_entries.itertuples(index=False)
+                }
+                split_labels = st.multiselect(
+                    "Entries to split out",
+                    list(split_label_map.keys()),
+                    key="admin_song_split_entries",
+                )
+                default_split_title = str(selected_row["canonical_title"] or "")
+                default_split_artist = str(selected_row["canonical_artist"] or "")
+                split_cols = st.columns([1.2, 1.2])
+                split_title = split_cols[0].text_input(
+                    "New canonical title for selected entries",
+                    value=default_split_title,
+                    key="admin_song_split_title",
+                )
+                split_artist = split_cols[1].text_input(
+                    "New canonical artist for selected entries",
+                    value=default_split_artist,
+                    key="admin_song_split_artist",
+                )
+                if st.button("Split selected entries", key="admin_song_split_btn"):
+                    selected_entry_ids = [split_label_map[label] for label in split_labels]
+                    ok, msg = admin_split_canonical_song(selected_song_id, selected_entry_ids, split_title, split_artist)
                     if ok:
                         st.success(msg)
                         st.rerun()
