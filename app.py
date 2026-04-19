@@ -175,21 +175,69 @@ WITH ordered_weeks AS (
         LAG(chart_week_id) OVER (ORDER BY chart_date, chart_week_id) AS prev_chart_week_id
     FROM chart_week
 ),
-entry_stats AS (
+entry_keyed AS (
     SELECT
         e.entry_id,
-        cw.chart_date,
-        cw.prev_chart_week_id,
-        prev.position AS last_week_position,
+        e.chart_week_id,
+        e.position,
+        e.canonical_song_id,
+        ow.chart_date,
+        ow.prev_chart_week_id,
+        CASE
+            WHEN COALESCE(TRIM(e.normalized_song_title), '') <> ''
+             AND COALESCE(TRIM(e.normalized_full_artist), '') <> ''
+            THEN LOWER(TRIM(REPLACE(COALESCE(e.normalized_song_title, ''), '.', '')))
+              || '||'
+              || LOWER(TRIM(REPLACE(COALESCE(e.normalized_full_artist, ''), '.', '')))
+            ELSE 'entry:' || e.entry_id
+        END AS fallback_song_key,
         ROW_NUMBER() OVER (
             PARTITION BY e.canonical_song_id
-            ORDER BY cw.chart_date, e.position, e.entry_id
-        ) AS weeks_on_chart
+            ORDER BY ow.chart_date, e.position, e.entry_id
+        ) AS canonical_weeks_on_chart,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                CASE
+                    WHEN COALESCE(TRIM(e.normalized_song_title), '') <> ''
+                     AND COALESCE(TRIM(e.normalized_full_artist), '') <> ''
+                    THEN LOWER(TRIM(REPLACE(COALESCE(e.normalized_song_title, ''), '.', '')))
+                      || '||'
+                      || LOWER(TRIM(REPLACE(COALESCE(e.normalized_full_artist, ''), '.', '')))
+                    ELSE 'entry:' || e.entry_id
+                END
+            ORDER BY ow.chart_date, e.position, e.entry_id
+        ) AS fallback_weeks_on_chart
     FROM entry e
-    JOIN ordered_weeks cw ON cw.chart_week_id = e.chart_week_id
-    LEFT JOIN entry prev
-      ON prev.chart_week_id = cw.prev_chart_week_id
-     AND prev.canonical_song_id = e.canonical_song_id
+    JOIN ordered_weeks ow ON ow.chart_week_id = e.chart_week_id
+),
+entry_stats AS (
+    SELECT
+        cur.entry_id,
+        cur.chart_date,
+        cur.prev_chart_week_id,
+        CASE
+            WHEN cur.canonical_song_id IS NOT NULL THEN COALESCE(MIN(prev_canon.position), MIN(prev_fallback.position))
+            ELSE MIN(prev_fallback.position)
+        END AS last_week_position,
+        CASE
+            WHEN cur.canonical_song_id IS NOT NULL THEN cur.canonical_weeks_on_chart
+            ELSE cur.fallback_weeks_on_chart
+        END AS weeks_on_chart
+    FROM entry_keyed cur
+    LEFT JOIN entry_keyed prev_canon
+      ON cur.canonical_song_id IS NOT NULL
+     AND prev_canon.chart_week_id = cur.prev_chart_week_id
+     AND prev_canon.canonical_song_id = cur.canonical_song_id
+    LEFT JOIN entry_keyed prev_fallback
+      ON prev_fallback.chart_week_id = cur.prev_chart_week_id
+     AND prev_fallback.fallback_song_key = cur.fallback_song_key
+    GROUP BY
+        cur.entry_id,
+        cur.chart_date,
+        cur.prev_chart_week_id,
+        cur.canonical_song_id,
+        cur.canonical_weeks_on_chart,
+        cur.fallback_weeks_on_chart
 )
 """
 
