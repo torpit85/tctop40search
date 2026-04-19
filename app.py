@@ -1198,6 +1198,307 @@ def _display_df(df: pd.DataFrame, columns: list[str] | None = None, hide_index: 
     st.dataframe(df, width="stretch", hide_index=hide_index)
 
 
+
+
+def _forecast_tier(position: object) -> str:
+    pos = _safe_int(position)
+    if pos is None:
+        return "Unknown"
+    if pos == 1:
+        return "#1"
+    if pos <= 5:
+        return "Top 5"
+    if pos <= 10:
+        return "Top 10"
+    if pos <= 20:
+        return "Top 20"
+    if pos <= 30:
+        return "21-30"
+    return "31-40"
+
+
+def _forecast_direction(move: object) -> str:
+    if move is None or (isinstance(move, float) and pd.isna(move)):
+        return "New/returning"
+    try:
+        value = float(move)
+    except Exception:
+        return "New/returning"
+    if value > 0:
+        return "Up"
+    if value < 0:
+        return "Down"
+    return "Hold"
+
+
+@st.cache_data(show_spinner=False)
+def build_forecast_neighbor_table(df_chart: pd.DataFrame) -> pd.DataFrame:
+    """Prepare historical rows that have a known next-week outcome."""
+    if df_chart.empty:
+        return pd.DataFrame()
+    hist = df_chart.loc[df_chart["next_chart_date"].notna()].copy()
+    if hist.empty:
+        return hist
+    hist["position"] = pd.to_numeric(hist["position"], errors="coerce")
+    hist["next_position"] = pd.to_numeric(hist["next_position"], errors="coerce")
+    hist["weeks_on_chart"] = pd.to_numeric(hist["weeks_on_chart"], errors="coerce").fillna(1)
+    hist["move"] = pd.to_numeric(hist["move"], errors="coerce")
+    hist["move_filled"] = hist["move"].fillna(0)
+    hist["next_move"] = hist["position"] - hist["next_position"]
+    hist["forecast_tier"] = hist["position"].apply(_forecast_tier)
+    hist["forecast_direction"] = hist["move"].apply(_forecast_direction)
+    return hist
+
+
+def _similar_cases_for_row(history: pd.DataFrame, row: pd.Series, max_neighbors: int) -> pd.DataFrame:
+    if history.empty:
+        return history
+    pos = float(row.get("position", 40) or 40)
+    weeks = float(row.get("weeks_on_chart", 1) or 1)
+    move = row.get("move")
+    move_val = 0.0 if pd.isna(move) else float(move)
+    tier = _forecast_tier(row.get("position"))
+    direction = _forecast_direction(row.get("move"))
+    is_debut = bool(row.get("is_debut", False))
+    is_reentry = bool(row.get("is_reentry", False))
+
+    scored = history.copy()
+    scored["similarity_score"] = (
+        (scored["position"] - pos).abs() * 1.15
+        + (scored["weeks_on_chart"].fillna(1) - weeks).abs().clip(upper=20) * 0.28
+        + (scored["move_filled"].fillna(0) - move_val).abs().clip(upper=25) * 0.55
+        + (scored["forecast_tier"].ne(tier).astype(int) * 3.5)
+        + (scored["forecast_direction"].ne(direction).astype(int) * 2.0)
+        + (scored["is_debut"].ne(is_debut).astype(int) * 5.0)
+        + (scored["is_reentry"].ne(is_reentry).astype(int) * 4.0)
+    )
+    return scored.sort_values(["similarity_score", "chart_date"], ascending=[True, False]).head(max_neighbors)
+
+
+def _forecast_for_chart_date(df_chart: pd.DataFrame, chart_date: pd.Timestamp, max_neighbors: int = 125) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df_chart.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    chart_date = pd.to_datetime(chart_date)
+    current = df_chart.loc[df_chart["chart_date"] == chart_date].copy().sort_values("position")
+    history = build_forecast_neighbor_table(df_chart.loc[df_chart["chart_date"] < chart_date].copy())
+    if current.empty or history.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    similar_rows: list[pd.DataFrame] = []
+    for _, row in current.iterrows():
+        cases = _similar_cases_for_row(history, row, max_neighbors=max_neighbors)
+        if cases.empty:
+            continue
+        present = cases.loc[cases["next_position"].notna()].copy()
+        p_stay = float(cases["present_next_week"].mean()) if "present_next_week" in cases else float(len(present) / len(cases))
+        p_dropout = 1.0 - p_stay
+        if present.empty:
+            exp_next_position = 41.0
+            median_next_position = 41.0
+            avg_next_move = float("nan")
+            p_up = p_down = p_hold = 0.0
+            p_top20 = p_top10 = p_top5 = p_num1 = 0.0
+        else:
+            exp_next_position = float(present["next_position"].mean())
+            median_next_position = float(present["next_position"].median())
+            avg_next_move = float(present["next_move"].mean())
+            p_up = float((present["next_position"] < row["position"]).mean())
+            p_down = float((present["next_position"] > row["position"]).mean())
+            p_hold = float((present["next_position"] == row["position"]).mean())
+            p_top20 = float((present["next_position"] <= 20).mean())
+            p_top10 = float((present["next_position"] <= 10).mean())
+            p_top5 = float((present["next_position"] <= 5).mean())
+            p_num1 = float((present["next_position"] == 1).mean())
+
+        momentum_score = (
+            max(0.0, 41.0 - float(row["position"]))
+            + max(0.0, float(row["move"] if pd.notna(row.get("move")) else 0.0)) * 1.7
+            + p_top10 * 18.0
+            + p_top5 * 12.0
+            + p_num1 * 20.0
+            - p_dropout * 26.0
+            - min(float(row.get("weeks_on_chart", 1) or 1), 40.0) * 0.18
+        )
+
+        rows.append({
+            "chart_date": chart_date,
+            "position": int(row["position"]),
+            "title": row.get("title", ""),
+            "artist": row.get("artist", ""),
+            "last_week_position": row.get("last_week_position"),
+            "move": row.get("move"),
+            "weeks_on_chart": row.get("weeks_on_chart"),
+            "derived_marker": row.get("derived_marker", ""),
+            "similar_cases": int(len(cases)),
+            "stay_probability": p_stay,
+            "dropout_risk": p_dropout,
+            "up_probability": p_up,
+            "down_probability": p_down,
+            "hold_probability": p_hold,
+            "top20_probability": p_top20,
+            "top10_probability": p_top10,
+            "top5_probability": p_top5,
+            "num1_probability": p_num1,
+            "expected_next_position": exp_next_position,
+            "median_next_position": median_next_position,
+            "expected_next_move": avg_next_move,
+            "momentum_score": momentum_score,
+        })
+        keep = cases.head(10).copy()
+        keep["source_current_position"] = int(row["position"])
+        keep["source_title"] = row.get("title", "")
+        keep["source_artist"] = row.get("artist", "")
+        similar_rows.append(keep)
+
+    forecast = pd.DataFrame(rows)
+    similar = pd.concat(similar_rows, ignore_index=True) if similar_rows else pd.DataFrame()
+    if forecast.empty:
+        return forecast, similar
+
+    forecast = forecast.sort_values(["expected_next_position", "dropout_risk", "position"], ascending=[True, True, True]).reset_index(drop=True)
+    forecast["projected_rank"] = forecast.index + 1
+    forecast["forecast_note"] = ""
+    forecast.loc[forecast["dropout_risk"] >= 0.55, "forecast_note"] = "High dropout risk"
+    forecast.loc[(forecast["num1_probability"] >= 0.08) | (forecast["projected_rank"] <= 3), "forecast_note"] = "#1 contender"
+    forecast.loc[(forecast["top10_probability"] >= 0.45) & (forecast["position"] > 10), "forecast_note"] = "Top 10 watch"
+    forecast.loc[(forecast["top10_probability"] < 0.45) & (forecast["position"] <= 10), "forecast_note"] = "Top 10 danger"
+    return forecast.sort_values("projected_rank"), similar
+
+
+def _format_probability_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in [
+        "stay_probability", "dropout_risk", "up_probability", "down_probability", "hold_probability",
+        "top20_probability", "top10_probability", "top5_probability", "num1_probability",
+    ]:
+        if col in out.columns:
+            out[col] = (pd.to_numeric(out[col], errors="coerce") * 100).round(1).astype(str) + "%"
+    for col in ["expected_next_position", "median_next_position", "expected_next_move", "momentum_score", "rank_error"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+    return out
+
+
+def _render_forecast_lab(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
+    chart = pkg["chart"]
+    if chart.empty:
+        st.info("No chart rows available for forecasting.")
+        return
+
+    chart_dates = sorted(chart["chart_date"].dropna().unique())
+    if len(chart_dates) < 8:
+        st.info("Forecast Lab needs several historical chart weeks before it can compare similar past cases.")
+        return
+
+    latest_date = chart_dates[-1]
+    st.markdown("### Next Week Predictor")
+    st.caption(
+        "This forecast compares each song on the selected chart with similar historical chart situations. "
+        "It estimates movement and dropout risk for current songs, but it does not guess brand-new debuts because play-count inputs are not in the database."
+    )
+
+    controls = st.columns([1.4, 1.0, 1.0])
+    date_labels = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in chart_dates]
+    selected_label = controls[0].selectbox("Forecast from chart week", date_labels, index=len(date_labels) - 1, key="forecast_lab_chart_date")
+    max_neighbors = int(controls[1].slider("Similar cases per song", 25, 250, 125, 25, key="forecast_lab_neighbors"))
+    show_similar = controls[2].checkbox("Show similar-case samples", value=False, key="forecast_lab_show_similar")
+    selected_date = pd.to_datetime(selected_label)
+
+    forecast, similar = _forecast_for_chart_date(chart, selected_date, max_neighbors=max_neighbors)
+    if forecast.empty:
+        st.info("Not enough earlier chart history exists before this selected week to build a forecast.")
+        return
+
+    current_rows = chart.loc[chart["chart_date"] == selected_date]
+    avg_dropout = forecast["dropout_risk"].mean()
+    expected_unknown_slots = int(round(forecast["dropout_risk"].sum()))
+    top_contender = forecast.sort_values(["num1_probability", "expected_next_position"], ascending=[False, True]).head(1)
+    render_kpis([
+        ("Forecast week", selected_date.strftime("%Y-%m-%d")),
+        ("Songs evaluated", int(len(current_rows))),
+        ("Expected unknown slots", expected_unknown_slots),
+        ("Avg dropout risk", f"{avg_dropout * 100:.1f}%"),
+        ("Top #1 contender", top_contender["title"].iloc[0] if not top_contender.empty else "—"),
+    ])
+
+    st.markdown("**Projected current-song order for next week**")
+    projection = forecast.sort_values("projected_rank").copy()
+    _display_df(
+        _format_probability_columns(projection),
+        [
+            "projected_rank", "title", "artist", "position", "last_week_position", "move", "weeks_on_chart",
+            "expected_next_position", "dropout_risk", "up_probability", "top10_probability", "num1_probability", "forecast_note", "similar_cases",
+        ],
+    )
+    st.caption(f"Expected unknown debut/re-entry/dropout replacement slots next week: about {expected_unknown_slots}. Those titles are intentionally not guessed.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**#1 contenders**")
+        contenders = forecast.sort_values(["num1_probability", "top5_probability", "expected_next_position"], ascending=[False, False, True]).head(top_n)
+        _display_df(
+            _format_probability_columns(contenders),
+            ["title", "artist", "position", "expected_next_position", "num1_probability", "top5_probability", "momentum_score", "similar_cases"],
+        )
+        st.markdown("**Top 10 watch**")
+        top10_watch = forecast.loc[(forecast["position"] > 10) | (forecast["top10_probability"] < 0.75)].sort_values("top10_probability", ascending=False).head(top_n)
+        _display_df(
+            _format_probability_columns(top10_watch),
+            ["title", "artist", "position", "expected_next_position", "top10_probability", "dropout_risk", "forecast_note"],
+        )
+    with c2:
+        st.markdown("**Dropout watch**")
+        dropouts = forecast.sort_values(["dropout_risk", "position"], ascending=[False, False]).head(top_n)
+        _display_df(
+            _format_probability_columns(dropouts),
+            ["title", "artist", "position", "weeks_on_chart", "move", "dropout_risk", "stay_probability", "similar_cases"],
+        )
+        st.markdown("**Momentum scores**")
+        momentum = forecast.sort_values("momentum_score", ascending=False).head(top_n)
+        _display_df(
+            _format_probability_columns(momentum),
+            ["title", "artist", "position", "move", "weeks_on_chart", "momentum_score", "up_probability", "top10_probability", "dropout_risk"],
+        )
+
+    if selected_date < latest_date:
+        compare = forecast.merge(
+            chart.loc[chart["chart_date"] == selected_date, ["title", "artist", "position", "next_position", "dropped_out_next_week"]],
+            on=["title", "artist", "position"],
+            how="left",
+        )
+        present_actual = compare.loc[compare["next_position"].notna()].copy()
+        avg_error = float((present_actual["expected_next_position"] - present_actual["next_position"]).abs().mean()) if not present_actual.empty else float("nan")
+        actual_num1 = compare.loc[compare["next_position"] == 1, "title"].head(1)
+        predicted_num1 = contenders["title"].head(1)
+        top3_titles = set(contenders["title"].head(3).tolist())
+        st.markdown("### Backtest against the actual next week")
+        render_kpis([
+            ("Avg rank error", f"{avg_error:.2f}" if pd.notna(avg_error) else "—"),
+            ("Predicted #1", predicted_num1.iloc[0] if not predicted_num1.empty else "—"),
+            ("Actual #1", actual_num1.iloc[0] if not actual_num1.empty else "—"),
+            ("Actual #1 in top 3 contenders", "Yes" if (not actual_num1.empty and actual_num1.iloc[0] in top3_titles) else "No"),
+        ])
+        compare["rank_error"] = (compare["expected_next_position"] - compare["next_position"]).abs()
+        st.markdown("**Backtest detail**")
+        _display_df(
+            _format_probability_columns(compare.sort_values(["projected_rank", "position"])),
+            ["projected_rank", "title", "artist", "position", "expected_next_position", "next_position", "rank_error", "dropout_risk", "dropped_out_next_week"],
+        )
+
+    if show_similar and not similar.empty:
+        st.markdown("### Similar-case samples")
+        options_df = forecast.sort_values("position").copy()
+        options_df["label"] = options_df["title"].astype(str) + " — " + options_df["artist"].astype(str)
+        sample_source = st.selectbox("Choose current song", options_df["label"].tolist(), key="forecast_lab_similar_song")
+        sample_title = sample_source.split(" — ", 1)[0]
+        sample = similar.loc[similar["source_title"] == sample_title].copy()
+        _display_df(
+            sample,
+            ["source_current_position", "source_title", "chart_date", "title", "artist", "position", "move", "weeks_on_chart", "next_position", "dropped_out_next_week", "similarity_score"],
+        )
+
+
 def _render_overview(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     weekly = pkg["weekly"]
     chart = pkg["chart"]
@@ -2374,6 +2675,17 @@ def render_analytics_tab() -> None:
             st.altair_chart = original_altair_chart
 
 
+def render_forecast_lab_tab() -> None:
+    st.subheader("Forecast Lab")
+    st.caption("Forward-looking chart estimates based on historical neighbors. This lives outside Analytics so the heavier forecast work only runs when you open this section.")
+    base = load_analytics_base()
+    if base.empty:
+        st.info("No chart data is available in the database yet.")
+        return
+    top_n = int(st.slider("Top N rows", 5, 100, 25, 5, key="forecast_lab_top_n"))
+    _render_forecast_lab({"chart": base}, top_n)
+
+
 def render_search_tab() -> None:
     st.subheader("Full-text search")
     query = st.text_input(
@@ -2555,6 +2867,7 @@ def main() -> None:
             "Artist history",
             "Quick tables",
             "Analytics",
+            "Forecast Lab",
             "Admin",
         ],
         key="main_section_selector",
@@ -2589,6 +2902,8 @@ def main() -> None:
         render_special_tables_tab()
     elif main_section == "Analytics":
         render_analytics_tab()
+    elif main_section == "Forecast Lab":
+        render_forecast_lab_tab()
     else:
         render_admin_tab()
 
