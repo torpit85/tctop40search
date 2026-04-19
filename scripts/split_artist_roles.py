@@ -294,6 +294,323 @@ def rebuild_canonical_from_song_title_latest_artist(conn: sqlite3.Connection) ->
     )
 
 
+
+def _entry_keys_from_row(row: sqlite3.Row) -> tuple[str, str, str, str, str]:
+    """Return bucket/title/artist/group keys for an entry row."""
+    norm_title = normalize_spaces(row["normalized_song_title"] or "")
+    norm_full = normalize_spaces(row["normalized_full_artist"] or "")
+    norm_lead = normalize_spaces(row["normalized_lead_artist"] or "")
+    norm_featured = normalize_spaces(row["normalized_featured_artist"] or "")
+    bucket_key = resolve_song_bucket_key(norm_title)
+    artist_key = norm_lead if not norm_featured else f"{norm_lead} feat {norm_featured}"
+    group_key = f"{bucket_key}||{norm_lead}||{norm_featured}"
+    alias_display_key = f"{norm_title}||{norm_full}"
+    return bucket_key, artist_key, group_key, alias_display_key, norm_full
+
+
+def _next_canonical_song_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(canonical_song_id), 0) + 1 FROM canonical_song").fetchone()
+    return int(row[0] or 1)
+
+
+def assign_missing_canonical_ids(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Assign canonical IDs only to entries that do not already have one.
+
+    Existing canonical_song_id values are preserved so manual song merges are not undone.
+    New rows first try song_alias exact matching, then canonical_group_key exact matching,
+    then same-title-bucket artist-family matching. Only unmatched songs get new IDs.
+    """
+    alias_lookup: dict[str, int] = {}
+    if "song_alias" in {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
+        for alias_display_key, canonical_song_id in conn.execute(
+            """
+            SELECT alias_display_key, canonical_song_id
+            FROM song_alias
+            WHERE COALESCE(alias_display_key, '') <> ''
+              AND canonical_song_id IS NOT NULL
+            ORDER BY alias_id
+            """
+        ):
+            alias_lookup.setdefault(normalize_spaces(alias_display_key), int(canonical_song_id))
+
+    group_lookup: dict[str, tuple[int, str, str]] = {}
+    for row in conn.execute(
+        """
+        SELECT canonical_song_id, canonical_title_key, canonical_artist_key, canonical_group_key
+        FROM canonical_song
+        WHERE COALESCE(canonical_group_key, '') <> ''
+        ORDER BY canonical_song_id
+        """
+    ):
+        group_key = normalize_spaces(row["canonical_group_key"])
+        group_lookup.setdefault(group_key, (int(row["canonical_song_id"]), row["canonical_artist_key"] or "", group_key))
+
+    bucket_clusters: dict[str, list[dict[str, object]]] = {}
+    existing_rows = conn.execute(
+        """
+        SELECT
+            e.canonical_song_id,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            e.normalized_lead_artist,
+            e.normalized_featured_artist,
+            e.canonical_title_key,
+            e.canonical_artist_key,
+            e.canonical_group_key,
+            MAX(cw.chart_date) AS last_chart_date
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.canonical_song_id IS NOT NULL
+          AND COALESCE(e.normalized_song_title, '') <> ''
+        GROUP BY
+            e.canonical_song_id,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            e.normalized_lead_artist,
+            e.normalized_featured_artist,
+            e.canonical_title_key,
+            e.canonical_artist_key,
+            e.canonical_group_key
+        ORDER BY last_chart_date DESC
+        """
+    ).fetchall()
+
+    for row in existing_rows:
+        bucket_key = resolve_song_bucket_key(row["normalized_song_title"])
+        if not bucket_key:
+            continue
+        lead_key = normalize_spaces(row["normalized_lead_artist"] or "")
+        featured_key = normalize_spaces(row["normalized_featured_artist"] or "")
+        artist_key = lead_key if not featured_key else f"{lead_key} feat {featured_key}"
+        group_key = normalize_spaces(row["canonical_group_key"] or f"{bucket_key}||{lead_key}||{featured_key}")
+        bucket_clusters.setdefault(bucket_key, []).append({
+            "canonical_song_id": int(row["canonical_song_id"]),
+            "lead_key": lead_key,
+            "featured_key": featured_key,
+            "artist_key": artist_key,
+            "group_key": group_key,
+        })
+
+    missing_rows = conn.execute(
+        """
+        SELECT
+            entry_id,
+            song_title_display,
+            full_artist_display,
+            lead_artist_display,
+            featured_artist_display,
+            normalized_song_title,
+            normalized_full_artist,
+            normalized_lead_artist,
+            normalized_featured_artist
+        FROM entry
+        WHERE canonical_song_id IS NULL
+          AND COALESCE(normalized_song_title, '') <> ''
+        ORDER BY entry_id
+        """
+    ).fetchall()
+
+    created = 0
+    assigned = 0
+    next_id = _next_canonical_song_id(conn)
+
+    for row in missing_rows:
+        bucket_key, artist_key, group_key, alias_display_key, _norm_full = _entry_keys_from_row(row)
+        if not bucket_key:
+            continue
+
+        canonical_song_id: int | None = None
+        target_group_key = group_key
+        target_artist_key = artist_key
+
+        if alias_display_key in alias_lookup:
+            canonical_song_id = alias_lookup[alias_display_key]
+        elif group_key in group_lookup:
+            canonical_song_id, target_artist_key, target_group_key = group_lookup[group_key]
+        else:
+            for cluster in bucket_clusters.get(bucket_key, []):
+                if artist_families_related(
+                    normalize_spaces(row["normalized_lead_artist"] or ""),
+                    normalize_spaces(row["normalized_featured_artist"] or ""),
+                    str(cluster["lead_key"]),
+                    str(cluster["featured_key"]),
+                ):
+                    canonical_song_id = int(cluster["canonical_song_id"])
+                    target_group_key = str(cluster["group_key"])
+                    target_artist_key = str(cluster["artist_key"])
+                    break
+
+        if canonical_song_id is None:
+            canonical_song_id = next_id
+            next_id += 1
+            created += 1
+            bucket_clusters.setdefault(bucket_key, []).append({
+                "canonical_song_id": canonical_song_id,
+                "lead_key": normalize_spaces(row["normalized_lead_artist"] or ""),
+                "featured_key": normalize_spaces(row["normalized_featured_artist"] or ""),
+                "artist_key": artist_key,
+                "group_key": group_key,
+            })
+            group_lookup[group_key] = (canonical_song_id, artist_key, group_key)
+
+        conn.execute(
+            """
+            UPDATE entry
+            SET canonical_song_id = ?,
+                canonical_title_key = ?,
+                canonical_artist_key = ?,
+                canonical_group_key = ?
+            WHERE entry_id = ?
+            """,
+            (canonical_song_id, bucket_key, target_artist_key, target_group_key, row["entry_id"]),
+        )
+        alias_lookup.setdefault(alias_display_key, canonical_song_id)
+        assigned += 1
+
+    return assigned, created
+
+
+def refresh_canonical_song_table_preserving_ids(conn: sqlite3.Connection) -> None:
+    """Refresh canonical_song and song_alias rollups without changing entry canonical IDs."""
+    conn.execute("DELETE FROM canonical_song")
+    conn.execute("DELETE FROM song_alias")
+
+    conn.execute(
+        """
+        INSERT INTO canonical_song (
+            canonical_song_id,
+            canonical_title,
+            canonical_artist,
+            canonical_title_key,
+            canonical_artist_key,
+            canonical_group_key,
+            entry_count,
+            alias_count,
+            first_chart_date,
+            last_chart_date,
+            canonical_full_artist,
+            canonical_lead_artist,
+            canonical_featured_artist
+        )
+        WITH latest_per_id AS (
+            SELECT
+                e.canonical_song_id,
+                e.entry_id,
+                e.song_title_display,
+                e.full_artist_display,
+                e.lead_artist_display,
+                e.featured_artist_display,
+                e.canonical_title_key,
+                e.canonical_artist_key,
+                e.canonical_group_key,
+                ROW_NUMBER() OVER (
+                    PARTITION BY e.canonical_song_id
+                    ORDER BY cw.chart_date DESC, e.entry_id DESC
+                ) AS rn
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id IS NOT NULL
+        )
+        SELECT
+            e.canonical_song_id,
+            MAX(CASE WHEN lpi.rn = 1 THEN lpi.song_title_display END) AS canonical_title,
+            MAX(CASE WHEN lpi.rn = 1 THEN lpi.full_artist_display END) AS canonical_artist,
+            COALESCE(MAX(CASE WHEN lpi.rn = 1 THEN lpi.canonical_title_key END), MAX(e.canonical_title_key), '') AS canonical_title_key,
+            COALESCE(MAX(CASE WHEN lpi.rn = 1 THEN lpi.canonical_artist_key END), MAX(e.canonical_artist_key), '') AS canonical_artist_key,
+            COALESCE(MAX(CASE WHEN lpi.rn = 1 THEN lpi.canonical_group_key END), MAX(e.canonical_group_key), '') AS canonical_group_key,
+            COUNT(*) AS entry_count,
+            COUNT(DISTINCT e.normalized_song_title || '||' || COALESCE(e.normalized_full_artist, '')) AS alias_count,
+            MIN(cw.chart_date) AS first_chart_date,
+            MAX(cw.chart_date) AS last_chart_date,
+            MAX(CASE WHEN lpi.rn = 1 THEN lpi.full_artist_display END) AS canonical_full_artist,
+            MAX(CASE WHEN lpi.rn = 1 THEN lpi.lead_artist_display END) AS canonical_lead_artist,
+            MAX(CASE WHEN lpi.rn = 1 THEN lpi.featured_artist_display END) AS canonical_featured_artist
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        JOIN latest_per_id lpi
+          ON lpi.canonical_song_id = e.canonical_song_id
+        WHERE e.canonical_song_id IS NOT NULL
+        GROUP BY e.canonical_song_id
+        ORDER BY e.canonical_song_id
+        """
+    )
+
+    conn.execute(
+        """
+        INSERT INTO song_alias (
+            alias_song_title,
+            alias_artist,
+            alias_title_key,
+            alias_artist_key,
+            alias_group_key,
+            alias_display_key,
+            canonical_song_id,
+            entry_count,
+            week_count,
+            first_chart_date,
+            last_chart_date
+        )
+        WITH alias_rows AS (
+            SELECT
+                e.song_title_display,
+                e.full_artist_display,
+                e.normalized_song_title,
+                e.normalized_full_artist,
+                e.canonical_group_key,
+                e.normalized_song_title || '||' || e.normalized_full_artist AS alias_display_key,
+                e.canonical_song_id,
+                e.chart_week_id,
+                cw.chart_date,
+                e.entry_id
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id IS NOT NULL
+              AND e.normalized_song_title IS NOT NULL
+              AND e.normalized_song_title <> ''
+              AND e.normalized_full_artist IS NOT NULL
+              AND e.normalized_full_artist <> ''
+        ),
+        latest_alias AS (
+            SELECT
+                alias_display_key,
+                song_title_display,
+                full_artist_display,
+                canonical_group_key,
+                canonical_song_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY alias_display_key, canonical_song_id
+                    ORDER BY chart_date DESC, entry_id DESC
+                ) AS rn
+            FROM alias_rows
+        )
+        SELECT
+            MAX(CASE WHEN la.rn = 1 THEN la.song_title_display END) AS alias_song_title,
+            MAX(CASE WHEN la.rn = 1 THEN la.full_artist_display END) AS alias_artist,
+            ar.normalized_song_title AS alias_title_key,
+            ar.normalized_full_artist AS alias_artist_key,
+            MAX(CASE WHEN la.rn = 1 THEN la.canonical_group_key END) AS alias_group_key,
+            ar.alias_display_key,
+            ar.canonical_song_id,
+            COUNT(*) AS entry_count,
+            COUNT(DISTINCT ar.chart_week_id) AS week_count,
+            MIN(ar.chart_date) AS first_chart_date,
+            MAX(ar.chart_date) AS last_chart_date
+        FROM alias_rows ar
+        JOIN latest_alias la
+          ON la.alias_display_key = ar.alias_display_key
+         AND la.canonical_song_id = ar.canonical_song_id
+        GROUP BY
+            ar.alias_display_key,
+            ar.normalized_song_title,
+            ar.normalized_full_artist,
+            ar.canonical_song_id
+        ORDER BY
+            MAX(CASE WHEN la.rn = 1 THEN la.full_artist_display END),
+            MAX(CASE WHEN la.rn = 1 THEN la.song_title_display END)
+        """
+    )
+
+
 def rebuild_canonical_song_table(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM canonical_song")
     conn.execute("DELETE FROM song_alias")
@@ -513,18 +830,22 @@ def print_preview(conn: sqlite3.Connection, limit: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Split full artist credits into lead/featured roles, prefer the most recent "
-            "lead/featured display strings when rebuilding canonical songs, and optionally "
-            "rebuild canonical identity using song title + the most recent lead/featured pairing."
+            "Split full artist credits into lead/featured roles and safely assign canonical IDs "
+            "to new/unmatched entries without undoing manual canonical-song merges."
         )
     )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Path to SQLite database")
     parser.add_argument("--dry-run", action="store_true", help="Preview splits without writing changes")
     parser.add_argument("--preview-limit", type=int, default=25, help="How many rows to show in dry-run preview")
     parser.add_argument(
-        "--no-rebuild-canonical",
+        "--roles-only",
         action="store_true",
-        help="Only populate lead/featured artist columns; do not rebuild canonical song identity",
+        help="Only populate lead/featured artist columns; do not assign missing canonical IDs or refresh rollups",
+    )
+    parser.add_argument(
+        "--force-rebuild-canonical",
+        action="store_true",
+        help="DANGER: rebuild all canonical IDs from scratch using song title + artist-family logic. This can undo manual merges.",
     )
     args = parser.parse_args()
 
@@ -551,15 +872,31 @@ def main() -> None:
 
         with conn:
             updated = populate_artist_role_columns(conn)
-            if not args.no_rebuild_canonical:
+            assigned = 0
+            created = 0
+            if args.roles_only:
+                pass
+            elif args.force_rebuild_canonical:
                 rebuild_canonical_from_song_title_latest_artist(conn)
                 rebuild_canonical_song_table(conn)
                 rederive_markers(conn)
+            else:
+                assigned, created = assign_missing_canonical_ids(conn)
+                refresh_canonical_song_table_preserving_ids(conn)
+                rederive_markers(conn)
 
         print(f"Updated entry rows: {updated}")
-        if args.no_rebuild_canonical:
+        if args.roles_only:
             print("Canonical song tables were left unchanged.")
+        elif args.force_rebuild_canonical:
+            print("Canonical song identity was rebuilt from scratch.")
+            canonical_songs = conn.execute("SELECT COUNT(*) FROM canonical_song").fetchone()[0]
+            aliases = conn.execute("SELECT COUNT(*) FROM song_alias").fetchone()[0]
+            print(f"Canonical songs: {canonical_songs}")
+            print(f"Song aliases: {aliases}")
         else:
+            print(f"Missing canonical IDs assigned: {assigned}")
+            print(f"New canonical songs created: {created}")
             canonical_songs = conn.execute("SELECT COUNT(*) FROM canonical_song").fetchone()[0]
             aliases = conn.execute("SELECT COUNT(*) FROM song_alias").fetchone()[0]
             print(f"Canonical songs: {canonical_songs}")
