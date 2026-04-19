@@ -1344,6 +1344,7 @@ def _render_longevity(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         history = chart.loc[chart["song_key"] == key, ["chart_date", "position", "last_week_position", "move", "weeks_on_chart", "derived_marker"]].copy().sort_values("chart_date")
         if not history.empty:
             st.line_chart((-history.set_index("chart_date")[["position"]]).rename(columns={"position": "inverted_position"}), width="stretch")
+            st.markdown("**Song week-by-week history**")
             _display_df(history, ["chart_date", "position", "last_week_position", "move", "weeks_on_chart", "derived_marker"])
 
 
@@ -1409,6 +1410,7 @@ def _render_artists(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         ])
         artist_song_keys = pkg["artist_credits"].loc[pkg["artist_credits"]["artist_key"] == key, "song_key"].unique().tolist()
         artist_songs = songs.loc[songs["song_key"].isin(artist_song_keys)].sort_values(["peak_position", "total_chart_weeks", "title"], ascending=[True, False, True])
+        st.markdown("**Artist song summary**")
         _display_df(artist_songs.head(top_n), ["title", "peak_position", "total_chart_weeks", "top10_weeks", "num1_weeks", "reentry_count"])
         presence = artist_presence.loc[artist_presence["artist_key"] == key].sort_values("chart_date")
         if not presence.empty:
@@ -1455,8 +1457,10 @@ def _render_years_eras(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         st.markdown("**Freshest / oldest years**")
         col_a, col_b = st.columns(2)
         with col_a:
+            st.markdown("**Freshest years**")
             _display_df(years.sort_values(["avg_chart_age", "year"], ascending=[True, False]).head(top_n), ["year", "avg_chart_age", "avg_top10_age", "debuts", "avg_turnover"])
         with col_b:
+            st.markdown("**Oldest years**")
             _display_df(years.sort_values(["avg_chart_age", "year"], ascending=[False, False]).head(top_n), ["year", "avg_chart_age", "avg_top10_age", "debuts", "avg_turnover"])
 
 
@@ -1468,6 +1472,11 @@ def _render_records_outliers(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     if songs.empty or artists.empty or weekly.empty:
         st.info("No records data available for the selected filters.")
         return
+
+    def _analytics_table(title: str, df: pd.DataFrame, columns: list[str] | None = None) -> None:
+        st.markdown(f"**{title}**")
+        _display_df(df, columns)
+
     valid_moves = chart.loc[chart["move"].notna()].copy()
     render_kpis([
         ("All-time biggest climb", f"{int(valid_moves['move'].max()):+d}" if not valid_moves.empty else "—"),
@@ -1486,36 +1495,38 @@ def _render_records_outliers(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     with c2:
         st.markdown("**Artist depth scatter**")
         st.scatter_chart(artists[["distinct_songs", "total_chart_weeks"]].dropna(), x="distinct_songs", y="total_chart_weeks", width="stretch")
-    st.markdown("**Song records**")
+
+    st.markdown("### Song records")
     r1, r2, r3 = st.columns(3)
     with r1:
-        _display_df(songs.sort_values(["total_chart_weeks", "peak_position"], ascending=[False, True]).head(top_n), ["title", "artist", "total_chart_weeks", "peak_position", "debut_position"])
-        _display_df(songs.sort_values(["top10_weeks", "peak_position"], ascending=[False, True]).head(top_n), ["title", "artist", "top10_weeks", "peak_position", "total_chart_weeks"])
+        _analytics_table("Longest chart runs", songs.sort_values(["total_chart_weeks", "peak_position"], ascending=[False, True]).head(top_n), ["title", "artist", "total_chart_weeks", "peak_position", "debut_position"])
+        _analytics_table("Most Top 10 weeks", songs.sort_values(["top10_weeks", "peak_position"], ascending=[False, True]).head(top_n), ["title", "artist", "top10_weeks", "peak_position", "total_chart_weeks"])
     with r2:
-        _display_df(songs.sort_values(["num1_weeks", "longest_consecutive_num1_run"], ascending=[False, False]).head(top_n), ["title", "artist", "num1_weeks", "longest_consecutive_num1_run"])
-        _display_df(songs.sort_values(["debut_position", "peak_position"], ascending=[True, True]).head(top_n), ["title", "artist", "debut_position", "peak_position", "total_chart_weeks"])
+        _analytics_table("Most #1 weeks", songs.sort_values(["num1_weeks", "longest_consecutive_num1_run"], ascending=[False, False]).head(top_n), ["title", "artist", "num1_weeks", "longest_consecutive_num1_run"])
+        _analytics_table("Highest debuts", songs.sort_values(["debut_position", "peak_position"], ascending=[True, True]).head(top_n), ["title", "artist", "debut_position", "peak_position", "total_chart_weeks"])
     with r3:
-        _display_df(songs.sort_values(["biggest_climb", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "biggest_climb", "peak_position", "total_chart_weeks"])
-        _display_df(songs.sort_values(["reentry_count", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "reentry_count", "total_chart_weeks"])
-    st.markdown("**Artist records**")
+        _analytics_table("Biggest climbers", songs.sort_values(["biggest_climb", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "biggest_climb", "peak_position", "total_chart_weeks"])
+        _analytics_table("Most re-entries", songs.sort_values(["reentry_count", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "reentry_count", "total_chart_weeks"])
+
+    st.markdown("### Artist records")
     a1, a2 = st.columns(2)
     with a1:
-        _display_df(artists.sort_values(["total_chart_weeks", "distinct_songs"], ascending=[False, False]).head(top_n), ["artist", "total_chart_weeks", "distinct_songs", "top10_hits", "num1_hits"])
-        _display_df(artists.sort_values(["top10_hits", "num1_hits"], ascending=[False, False]).head(top_n), ["artist", "top10_hits", "num1_hits", "distinct_songs"])
+        _analytics_table("Most artist chart weeks", artists.sort_values(["total_chart_weeks", "distinct_songs"], ascending=[False, False]).head(top_n), ["artist", "total_chart_weeks", "distinct_songs", "top10_hits", "num1_hits"])
+        _analytics_table("Artists with most Top 10 hits", artists.sort_values(["top10_hits", "num1_hits"], ascending=[False, False]).head(top_n), ["artist", "top10_hits", "num1_hits", "distinct_songs"])
     with a2:
-        _display_df(artists.sort_values(["distinct_songs", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["artist", "distinct_songs", "total_chart_weeks", "best_peak"])
-        _display_df(artists.sort_values(["max_simultaneous_entries", "week_of_max_simultaneous_entries"], ascending=[False, False]).head(top_n), ["artist", "max_simultaneous_entries", "week_of_max_simultaneous_entries"])
-    st.markdown("**Weekly records**")
+        _analytics_table("Artists with most distinct songs", artists.sort_values(["distinct_songs", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["artist", "distinct_songs", "total_chart_weeks", "best_peak"])
+        _analytics_table("Most simultaneous entries", artists.sort_values(["max_simultaneous_entries", "week_of_max_simultaneous_entries"], ascending=[False, False]).head(top_n), ["artist", "max_simultaneous_entries", "week_of_max_simultaneous_entries"])
+
+    st.markdown("### Weekly records")
     w1, w2 = st.columns(2)
     with w1:
-        _display_df(weekly.sort_values(["debuts", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "debuts", "reentries", "dropouts", "turnover_total"])
-        _display_df(weekly.sort_values(["top10_churn", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "top10_churn", "avg_abs_move", "turnover_total"])
-        _display_df(weekly.sort_values(["avg_chart_age", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "avg_chart_age", "avg_top10_age"])
+        _analytics_table("Most debuts in one week", weekly.sort_values(["debuts", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "debuts", "reentries", "dropouts", "turnover_total"])
+        _analytics_table("Highest Top 10 churn", weekly.sort_values(["top10_churn", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "top10_churn", "avg_abs_move", "turnover_total"])
+        _analytics_table("Oldest chart weeks", weekly.sort_values(["avg_chart_age", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "avg_chart_age", "avg_top10_age"])
     with w2:
-        _display_df(weekly.sort_values(["reentries", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "reentries", "debuts", "turnover_total"])
-        _display_df(weekly.sort_values(["avg_abs_move", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "avg_abs_move", "debuts", "reentries", "dropouts"])
-        _display_df(weekly.sort_values(["avg_chart_age", "chart_date"], ascending=[True, False]).head(top_n), ["chart_date", "avg_chart_age", "avg_top10_age"])
-
+        _analytics_table("Most re-entries in one week", weekly.sort_values(["reentries", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "reentries", "debuts", "turnover_total"])
+        _analytics_table("Most movement-heavy weeks", weekly.sort_values(["avg_abs_move", "chart_date"], ascending=[False, False]).head(top_n), ["chart_date", "avg_abs_move", "debuts", "reentries", "dropouts"])
+        _analytics_table("Freshest chart weeks", weekly.sort_values(["avg_chart_age", "chart_date"], ascending=[True, False]).head(top_n), ["chart_date", "avg_chart_age", "avg_top10_age"])
 
 
 
@@ -2314,25 +2325,53 @@ def render_analytics_tab() -> None:
     end_date = controls[1].date_input("End date", value=max_date, min_value=min_date, max_value=max_date, key="analytics_end")
     include_reentries = controls[2].checkbox("Include re-entries", value=True, key="analytics_include_reentries")
     min_weeks = int(controls[3].number_input("Min weeks on chart", min_value=1, max_value=500, value=1, step=1, key="analytics_min_weeks"))
-    section_cols = st.columns([2, 1])
+    section_cols = st.columns([2, 1, 1])
     section = section_cols[0].selectbox("Analytics section", ANALYTICS_SECTIONS, key="analytics_section")
     top_n = int(section_cols[1].slider("Top N rows", 5, 100, 25, 5, key="analytics_top_n"))
+    chart_key = "analytics_show_charts_" + re.sub(r"[^a-z0-9]+", "_", section.lower()).strip("_")
+    show_charts = section_cols[2].checkbox("Load charts", value=False, key=chart_key)
     if start_date > end_date:
         st.error("Start date must be on or before end date.")
         return
     pkg = _apply_analytics_filters(build_analytics_package(), start_date, end_date, include_reentries, min_weeks)
-    if section == "Overview":
-        _render_overview(pkg, top_n)
-    elif section == "Movement":
-        _render_movement(pkg, top_n)
-    elif section == "Longevity":
-        _render_longevity(pkg, top_n)
-    elif section == "Artists":
-        _render_artists(pkg, top_n)
-    elif section == "Years & Eras":
-        _render_years_eras(pkg, top_n)
-    elif section == "Records & Outliers":
-        _render_records_outliers(pkg, top_n)
+
+    def _render_selected_section() -> None:
+        if section == "Overview":
+            _render_overview(pkg, top_n)
+        elif section == "Movement":
+            _render_movement(pkg, top_n)
+        elif section == "Longevity":
+            _render_longevity(pkg, top_n)
+        elif section == "Artists":
+            _render_artists(pkg, top_n)
+        elif section == "Years & Eras":
+            _render_years_eras(pkg, top_n)
+        elif section == "Records & Outliers":
+            _render_records_outliers(pkg, top_n)
+
+    if show_charts:
+        _render_selected_section()
+    else:
+        st.caption("Charts are hidden for this Analytics section. Turn on 'Load charts' to render the visualizations.")
+        original_line_chart = st.line_chart
+        original_bar_chart = st.bar_chart
+        original_scatter_chart = st.scatter_chart
+        original_altair_chart = st.altair_chart
+
+        def _skip_chart(*args, **kwargs):
+            return None
+
+        try:
+            st.line_chart = _skip_chart
+            st.bar_chart = _skip_chart
+            st.scatter_chart = _skip_chart
+            st.altair_chart = _skip_chart
+            _render_selected_section()
+        finally:
+            st.line_chart = original_line_chart
+            st.bar_chart = original_bar_chart
+            st.scatter_chart = original_scatter_chart
+            st.altair_chart = original_altair_chart
 
 
 def render_search_tab() -> None:
