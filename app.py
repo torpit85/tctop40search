@@ -36,6 +36,9 @@ ARTIST_KEY_ALIASES = {
     "jake+papa": "jake&papa",
     "jake/papa": "jake&papa",
     "jake; papa": "jake&papa",
+    "epic rap battles": "epic rap battles of history",
+    "epic battles of history": "epic rap battles of history",
+    "erb": "epic rap battles of history",
 }
 
 PREFERRED_ARTIST_DISPLAY = {
@@ -434,25 +437,35 @@ def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]
     return df, meta
 
 
+
 @st.cache_data(show_spinner=False)
 def canonical_song_matches(term: str, limit: int = 100) -> pd.DataFrame:
     conn = get_connection()
     like = f"%{term.strip().lower()}%"
     sql = """
         SELECT
-            canonical_song_id,
-            canonical_title,
-            COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist,
-            COALESCE(canonical_lead_artist, canonical_artist) AS canonical_lead_artist,
-            COALESCE(canonical_featured_artist, '') AS canonical_featured_artist,
-            entry_count AS chart_weeks,
-            first_chart_date AS first_date,
-            last_chart_date AS last_date
-        FROM canonical_song
-        WHERE LOWER(canonical_title) LIKE ?
-           OR LOWER(COALESCE(canonical_full_artist, canonical_artist)) LIKE ?
-           OR LOWER(COALESCE(canonical_lead_artist, canonical_artist)) LIKE ?
-           OR LOWER(canonical_title || ' ' || COALESCE(canonical_full_artist, canonical_artist)) LIKE ?
+            cs.canonical_song_id,
+            cs.canonical_title,
+            COALESCE(cs.canonical_full_artist, cs.canonical_artist) AS canonical_artist,
+            COALESCE(cs.canonical_lead_artist, cs.canonical_artist) AS canonical_lead_artist,
+            COALESCE(cs.canonical_featured_artist, '') AS canonical_featured_artist,
+            COUNT(DISTINCT e.entry_id) AS chart_weeks,
+            MIN(cw.chart_date) AS first_date,
+            MAX(cw.chart_date) AS last_date
+        FROM canonical_song cs
+        LEFT JOIN entry e ON e.canonical_song_id = cs.canonical_song_id
+        LEFT JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE LOWER(cs.canonical_title) LIKE ?
+           OR LOWER(COALESCE(cs.canonical_full_artist, cs.canonical_artist)) LIKE ?
+           OR LOWER(COALESCE(cs.canonical_lead_artist, cs.canonical_artist)) LIKE ?
+           OR LOWER(cs.canonical_title || ' ' || COALESCE(cs.canonical_full_artist, cs.canonical_artist)) LIKE ?
+        GROUP BY
+            cs.canonical_song_id,
+            cs.canonical_title,
+            cs.canonical_artist,
+            cs.canonical_full_artist,
+            cs.canonical_lead_artist,
+            cs.canonical_featured_artist
         ORDER BY last_date DESC, chart_weeks DESC, canonical_title, canonical_artist
         LIMIT ?
     """
@@ -497,13 +510,14 @@ def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[s
             COALESCE(cs.canonical_full_artist, cs.canonical_artist) AS artist,
             COALESCE(cs.canonical_lead_artist, cs.canonical_artist) AS lead_artist,
             COALESCE(cs.canonical_featured_artist, '') AS featured_artist,
-            cs.entry_count AS chart_weeks,
-            cs.first_chart_date AS first_date,
-            cs.last_chart_date AS last_date,
+            COUNT(DISTINCT e.entry_id) AS chart_weeks,
+            MIN(cw.chart_date) AS first_date,
+            MAX(cw.chart_date) AS last_date,
             MIN(e.position) AS peak,
             COUNT(DISTINCT sa.alias_display_key) AS alias_count
         FROM canonical_song cs
         LEFT JOIN entry e ON e.canonical_song_id = cs.canonical_song_id
+        LEFT JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
         LEFT JOIN song_alias sa ON sa.canonical_song_id = cs.canonical_song_id
         WHERE cs.canonical_song_id = ?
         GROUP BY
@@ -512,10 +526,7 @@ def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[s
             cs.canonical_artist,
             cs.canonical_full_artist,
             cs.canonical_lead_artist,
-            cs.canonical_featured_artist,
-            cs.entry_count,
-            cs.first_chart_date,
-            cs.last_chart_date
+            cs.canonical_featured_artist
         """,
         (canonical_song_id,),
     ).fetchone()
@@ -561,7 +572,6 @@ def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[s
     )
     return history, dict(stats_row), aliases
 
-
 @st.cache_data(show_spinner=False)
 def artist_matches(term: str, role_mode: str, limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
@@ -590,7 +600,7 @@ def artist_matches(term: str, role_mode: str, limit: int = 100) -> pd.DataFrame:
     out = (
         credits.groupby(["artist_key"], dropna=True)
         .agg(
-            chart_weeks=("entry_id", "count"),
+            chart_weeks=("entry_id", "nunique"),
             first_date=("chart_date", "min"),
             last_date=("chart_date", "max"),
             peak=("position", "min"),
@@ -633,7 +643,7 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
 
     stats = {
         "artist": display_artist,
-        "chart_weeks": int(len(credits)),
+        "chart_weeks": int(credits["entry_id"].nunique()),
         "distinct_songs": int(credits["song_key"].nunique()),
         "peak": int(credits["position"].min()),
         "first_date": pd.to_datetime(credits["chart_date"]).min().strftime("%Y-%m-%d"),
@@ -1966,6 +1976,7 @@ def _reset_app_caches() -> None:
         pass
 
 
+
 @st.cache_data(show_spinner=False)
 def admin_song_options() -> pd.DataFrame:
     conn = get_connection()
@@ -1974,18 +1985,24 @@ def admin_song_options() -> pd.DataFrame:
     return pd.read_sql_query(
         """
         SELECT
-            canonical_song_id,
-            canonical_title,
-            COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist,
-            entry_count AS chart_weeks,
-            first_chart_date,
-            last_chart_date
-        FROM canonical_song
-        ORDER BY LOWER(canonical_title), LOWER(COALESCE(canonical_full_artist, canonical_artist)), canonical_song_id
+            cs.canonical_song_id,
+            cs.canonical_title,
+            COALESCE(cs.canonical_full_artist, cs.canonical_artist) AS canonical_artist,
+            COUNT(DISTINCT e.entry_id) AS chart_weeks,
+            MIN(cw.chart_date) AS first_chart_date,
+            MAX(cw.chart_date) AS last_chart_date
+        FROM canonical_song cs
+        LEFT JOIN entry e ON e.canonical_song_id = cs.canonical_song_id
+        LEFT JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        GROUP BY
+            cs.canonical_song_id,
+            cs.canonical_title,
+            cs.canonical_artist,
+            cs.canonical_full_artist
+        ORDER BY LOWER(cs.canonical_title), LOWER(COALESCE(cs.canonical_full_artist, cs.canonical_artist)), cs.canonical_song_id
         """,
         conn,
     )
-
 
 @st.cache_data(show_spinner=False)
 def admin_song_aliases(canonical_song_id: int) -> pd.DataFrame:
@@ -2009,6 +2026,543 @@ def admin_song_aliases(canonical_song_id: int) -> pd.DataFrame:
         params=(canonical_song_id,),
     )
 
+
+
+@st.cache_data(show_spinner=False)
+def admin_song_artist_credit_defaults(canonical_song_id: int) -> dict[str, str]:
+    conn = get_connection()
+    out = {
+        "canonical_title": "",
+        "canonical_full_artist": "",
+        "canonical_lead_artist": "",
+        "canonical_featured_artist": "",
+        "entry_full_artist": "",
+        "entry_lead_artist": "",
+        "entry_featured_artist": "",
+    }
+    if not _admin_table_exists(conn, "canonical_song"):
+        return out
+    row = conn.execute(
+        """
+        SELECT
+            canonical_title,
+            COALESCE(canonical_full_artist, canonical_artist, '') AS canonical_full_artist,
+            COALESCE(canonical_lead_artist, canonical_artist, '') AS canonical_lead_artist,
+            COALESCE(canonical_featured_artist, '') AS canonical_featured_artist
+        FROM canonical_song
+        WHERE canonical_song_id = ?
+        """,
+        (canonical_song_id,),
+    ).fetchone()
+    if row is not None:
+        out.update({k: "" if row[k] is None else str(row[k]) for k in row.keys()})
+
+    if _admin_table_exists(conn, "entry"):
+        entry_rows = pd.read_sql_query(
+            """
+            SELECT
+                COALESCE(full_artist_display, '') AS full_artist,
+                COALESCE(lead_artist_display, artist_display, '') AS lead_artist,
+                COALESCE(featured_artist_display, featured_display, '') AS featured_artist
+            FROM entry
+            WHERE canonical_song_id = ?
+            """,
+            conn,
+            params=(canonical_song_id,),
+        )
+        for src_col, dest_key in [
+            ("full_artist", "entry_full_artist"),
+            ("lead_artist", "entry_lead_artist"),
+            ("featured_artist", "entry_featured_artist"),
+        ]:
+            vals = entry_rows[src_col].dropna().astype(str).str.strip() if not entry_rows.empty else pd.Series(dtype=str)
+            vals = vals[vals != ""]
+            if not vals.empty:
+                out[dest_key] = vals.mode().iloc[0]
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def admin_song_artist_credit_summary(canonical_song_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    if not _admin_table_exists(conn, "entry"):
+        return pd.DataFrame(columns=["full_artist", "lead_artist", "featured_artist", "entry_count", "first_date", "last_date"])
+    return pd.read_sql_query(
+        """
+        SELECT
+            COALESCE(e.full_artist_display, '') AS full_artist,
+            COALESCE(e.lead_artist_display, e.artist_display, '') AS lead_artist,
+            COALESCE(e.featured_artist_display, e.featured_display, '') AS featured_artist,
+            COUNT(*) AS entry_count,
+            MIN(cw.chart_date) AS first_date,
+            MAX(cw.chart_date) AS last_date
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.canonical_song_id = ?
+        GROUP BY full_artist, lead_artist, featured_artist
+        ORDER BY entry_count DESC, last_date DESC, full_artist, lead_artist, featured_artist
+        """,
+        conn,
+        params=(canonical_song_id,),
+    )
+
+
+
+
+@st.cache_data(show_spinner=False)
+def admin_song_title_summary(canonical_song_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    if not _admin_table_exists(conn, "entry"):
+        return pd.DataFrame(columns=["song_title", "entry_count", "first_date", "last_date"])
+    return pd.read_sql_query(
+        """
+        SELECT
+            COALESCE(e.song_title_display, '') AS song_title,
+            COUNT(*) AS entry_count,
+            MIN(cw.chart_date) AS first_date,
+            MAX(cw.chart_date) AS last_date
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.canonical_song_id = ?
+        GROUP BY song_title
+        ORDER BY entry_count DESC, last_date DESC, song_title
+        """,
+        conn,
+        params=(canonical_song_id,),
+    )
+
+
+def _clean_song_title_text(value: object) -> str:
+    text = "" if value is None else str(value)
+    text = _fold_quotes(text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _refresh_entry_fts_rows_for_title_artist(
+    cur: sqlite3.Cursor,
+    rows: list[sqlite3.Row],
+    new_title: str,
+    new_full_artist: str,
+) -> None:
+    # entry_fts is a contentless FTS5 table in this app. A normal DELETE is not allowed,
+    # so remove old tokens via the special 'delete' command and then insert fresh tokens.
+    try:
+        for row in rows:
+            cur.execute(
+                """
+                INSERT INTO entry_fts(entry_fts, rowid, song_title_display, full_artist_display, normalized_display, raw_slug, source_file)
+                VALUES('delete', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row["entry_id"]),
+                    row["old_song_title_display"] or "",
+                    row["old_full_artist_display"] or "",
+                    row["old_normalized_display"] or "",
+                    row["raw_slug"] or "",
+                    row["source_file"] or "",
+                ),
+            )
+            new_normalized_display = normalize_search_text(
+                f"{new_title or ''} {new_full_artist or ''} {row['raw_slug'] or ''}"
+            )
+            cur.execute(
+                """
+                INSERT INTO entry_fts(rowid, song_title_display, full_artist_display, normalized_display, raw_slug, source_file)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row["entry_id"]),
+                    new_title,
+                    new_full_artist,
+                    new_normalized_display,
+                    row["raw_slug"] or "",
+                    row["source_file"] or "",
+                ),
+            )
+    except Exception:
+        # Search indexing should never make the primary DB cleanup fail.
+        pass
+
+
+def admin_update_song_title_everywhere(
+    canonical_song_id: int,
+    new_title: str,
+    update_alias_titles: bool = False,
+) -> tuple[bool, str]:
+    new_title = _clean_song_title_text(new_title)
+    if not new_title:
+        return False, "New song title cannot be blank."
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+
+    new_title_key = normalize_search_text(new_title)
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        src = cur.execute(
+            """
+            SELECT
+                canonical_song_id,
+                canonical_title,
+                COALESCE(canonical_full_artist, canonical_artist, '') AS canonical_artist,
+                COALESCE(canonical_artist_key, '') AS canonical_artist_key
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (canonical_song_id,),
+        ).fetchone()
+        if src is None:
+            return False, "Selected canonical song was not found."
+
+        old_title = (src["canonical_title"] or "").strip()
+        canonical_artist = (src["canonical_artist"] or "").strip()
+        canonical_artist_key = normalize_search_text(src["canonical_artist_key"] or canonical_artist)
+        old_title_key = normalize_search_text(old_title)
+        if old_title_key == new_title_key:
+            return False, "The new title matches the current canonical title."
+
+        new_group_key = f"{new_title_key}||{canonical_artist_key}"
+        collision = cur.execute(
+            """
+            SELECT canonical_song_id
+            FROM canonical_song
+            WHERE canonical_group_key = ?
+              AND canonical_song_id <> ?
+            LIMIT 1
+            """,
+            (new_group_key, canonical_song_id),
+        ).fetchone()
+        if collision is not None:
+            return False, "Another canonical song already uses this title + artist key. Merge those songs first, or choose a different title."
+
+        entry_rows = cur.execute(
+            """
+            SELECT
+                e.entry_id,
+                e.song_title_display AS old_song_title_display,
+                e.full_artist_display AS old_full_artist_display,
+                e.normalized_display AS old_normalized_display,
+                e.raw_slug,
+                cw.source_file
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id = ?
+            ORDER BY cw.chart_date, e.position, e.entry_id
+            """,
+            (canonical_song_id,),
+        ).fetchall()
+        if not entry_rows:
+            return False, "No entry rows are attached to this canonical song."
+
+        cur.execute("BEGIN")
+        cur.execute(
+            """
+            UPDATE canonical_song
+            SET canonical_title = ?,
+                canonical_title_key = ?,
+                canonical_group_key = ?
+            WHERE canonical_song_id = ?
+            """,
+            (new_title, new_title_key, new_group_key, canonical_song_id),
+        )
+        cur.execute(
+            """
+            UPDATE entry
+            SET song_title_display = ?,
+                normalized_song_title = ?,
+                canonical_title_key = ?,
+                canonical_group_key = ?,
+                normalized_display = LOWER(TRIM(? || ' ' || COALESCE(full_artist_display, '') || ' ' || COALESCE(raw_slug, '')))
+            WHERE canonical_song_id = ?
+            """,
+            (new_title, new_title_key, new_title_key, new_group_key, new_title, canonical_song_id),
+        )
+
+        try:
+            _insert_song_alias_row(cur, canonical_song_id, old_title, canonical_artist)
+        except Exception:
+            pass
+
+        if update_alias_titles and _admin_table_exists(conn, "song_alias"):
+            alias_rows = cur.execute(
+                "SELECT alias_id, alias_artist FROM song_alias WHERE canonical_song_id = ?",
+                (canonical_song_id,),
+            ).fetchall()
+            seen_alias_keys: set[str] = set()
+            for alias in alias_rows:
+                alias_artist = alias["alias_artist"] or canonical_artist
+                alias_title_key = new_title_key
+                alias_artist_key = normalize_search_text(alias_artist)
+                alias_group_key = f"{alias_title_key}||{alias_artist_key}"
+                alias_display_key = normalize_search_text(f"{new_title}||{alias_artist}")
+                if alias_display_key in seen_alias_keys:
+                    cur.execute("DELETE FROM song_alias WHERE alias_id = ?", (int(alias["alias_id"]),))
+                    continue
+                seen_alias_keys.add(alias_display_key)
+                try:
+                    cur.execute(
+                        """
+                        UPDATE song_alias
+                        SET alias_song_title = ?,
+                            alias_title_key = ?,
+                            alias_group_key = ?,
+                            alias_display_key = ?
+                        WHERE alias_id = ?
+                        """,
+                        (new_title, alias_title_key, alias_group_key, alias_display_key, int(alias["alias_id"])),
+                    )
+                except sqlite3.IntegrityError:
+                    cur.execute("DELETE FROM song_alias WHERE alias_id = ?", (int(alias["alias_id"]),))
+
+        _refresh_entry_fts_rows_for_title_artist(cur, entry_rows, new_title, canonical_artist)
+        _refresh_canonical_song_rollup(cur, canonical_song_id)
+        conn.commit()
+        _reset_app_caches()
+        return True, f'Updated title from "{old_title}" to "{new_title}" across {len(entry_rows)} chart entr{"y" if len(entry_rows) == 1 else "ies"}.'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Song title update failed: {exc}"
+    finally:
+        conn.close()
+
+
+def _clean_artist_credit_text(value: object) -> str:
+    text = "" if value is None else str(value)
+    text = _fold_quotes(text).strip()
+    text = re.sub(r"\s*;\s*", "; ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" ;")
+
+
+def _build_full_artist_credit(lead_artist: str, featured_artist: str, full_artist: str = "") -> str:
+    lead_artist = _clean_artist_credit_text(lead_artist)
+    featured_artist = _clean_artist_credit_text(featured_artist)
+    full_artist = _clean_artist_credit_text(full_artist)
+    if full_artist:
+        return full_artist
+    parts = [p for p in [lead_artist, featured_artist] if p]
+    return "; ".join(parts)
+
+
+def _refresh_entry_fts_rows(cur: sqlite3.Cursor, rows: list[sqlite3.Row], full_artist: str) -> None:
+    # entry_fts is a contentless FTS5 table in this app. A normal DELETE is not allowed,
+    # so remove old tokens via the special 'delete' command and then insert fresh tokens.
+    try:
+        for row in rows:
+            cur.execute(
+                """
+                INSERT INTO entry_fts(entry_fts, rowid, song_title_display, full_artist_display, normalized_display, raw_slug, source_file)
+                VALUES('delete', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row["entry_id"]),
+                    row["song_title_display"] or "",
+                    row["old_full_artist_display"] or "",
+                    row["old_normalized_display"] or "",
+                    row["raw_slug"] or "",
+                    row["source_file"] or "",
+                ),
+            )
+            new_normalized_display = normalize_search_text(
+                f"{row['song_title_display'] or ''} {full_artist} {row['raw_slug'] or ''}"
+            )
+            cur.execute(
+                """
+                INSERT INTO entry_fts(rowid, song_title_display, full_artist_display, normalized_display, raw_slug, source_file)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row["entry_id"]),
+                    row["song_title_display"] or "",
+                    full_artist,
+                    new_normalized_display,
+                    row["raw_slug"] or "",
+                    row["source_file"] or "",
+                ),
+            )
+    except Exception:
+        # Search indexing should never make the primary DB cleanup fail.
+        pass
+
+
+def admin_update_song_artist_credits(
+    canonical_song_id: int,
+    lead_artist: str,
+    featured_artist: str,
+    full_artist: str,
+    update_alias_artists: bool = True,
+) -> tuple[bool, str]:
+    lead_artist = _clean_artist_credit_text(lead_artist)
+    featured_artist = _clean_artist_credit_text(featured_artist)
+    full_artist = _build_full_artist_credit(lead_artist, featured_artist, full_artist)
+    if not lead_artist:
+        return False, "Lead artist cannot be blank."
+    if not full_artist:
+        return False, "Full artist credit cannot be blank."
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+
+    normalized_lead = normalize_search_text(lead_artist)
+    normalized_featured = normalize_search_text(featured_artist)
+    normalized_full = normalize_search_text(full_artist)
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        src = cur.execute(
+            """
+            SELECT canonical_song_id, canonical_title, canonical_title_key
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (canonical_song_id,),
+        ).fetchone()
+        if src is None:
+            return False, "Selected canonical song was not found."
+
+        entry_rows = cur.execute(
+            """
+            SELECT
+                e.entry_id,
+                e.song_title_display,
+                e.full_artist_display AS old_full_artist_display,
+                e.normalized_display AS old_normalized_display,
+                e.raw_slug,
+                cw.source_file
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id = ?
+            ORDER BY cw.chart_date, e.position, e.entry_id
+            """,
+            (canonical_song_id,),
+        ).fetchall()
+        if not entry_rows:
+            return False, "No entry rows are attached to this canonical song."
+
+        title_key = src["canonical_title_key"] or normalize_search_text(src["canonical_title"] or "")
+        new_group_key = f"{title_key}||{normalized_full}"
+        collision = cur.execute(
+            """
+            SELECT canonical_song_id
+            FROM canonical_song
+            WHERE canonical_group_key = ?
+              AND canonical_song_id <> ?
+            LIMIT 1
+            """,
+            (new_group_key, canonical_song_id),
+        ).fetchone()
+        if collision is not None:
+            return False, "Another canonical song already uses this title + full artist key. Merge those songs first, or choose a different full artist credit."
+
+        cur.execute("BEGIN")
+        cur.execute(
+            """
+            UPDATE canonical_song
+            SET canonical_artist = ?,
+                canonical_full_artist = ?,
+                canonical_lead_artist = ?,
+                canonical_featured_artist = ?,
+                canonical_artist_key = ?,
+                canonical_group_key = ?
+            WHERE canonical_song_id = ?
+            """,
+            (
+                full_artist,
+                full_artist,
+                lead_artist,
+                featured_artist,
+                normalized_full,
+                new_group_key,
+                canonical_song_id,
+            ),
+        )
+
+        cur.execute(
+            """
+            UPDATE entry
+            SET artist_display = ?,
+                featured_display = ?,
+                full_artist_display = ?,
+                lead_artist_display = ?,
+                featured_artist_display = ?,
+                normalized_artist = ?,
+                normalized_featured = ?,
+                normalized_full_artist = ?,
+                normalized_lead_artist = ?,
+                normalized_featured_artist = ?,
+                canonical_artist_key = ?,
+                canonical_group_key = ?,
+                normalized_display = LOWER(TRIM(COALESCE(song_title_display, '') || ' ' || ? || ' ' || COALESCE(raw_slug, '')))
+            WHERE canonical_song_id = ?
+            """,
+            (
+                lead_artist,
+                featured_artist,
+                full_artist,
+                lead_artist,
+                featured_artist,
+                normalized_lead,
+                normalized_featured,
+                normalized_full,
+                normalized_lead,
+                normalized_featured,
+                normalized_full,
+                new_group_key,
+                full_artist,
+                canonical_song_id,
+            ),
+        )
+
+        if update_alias_artists and _admin_table_exists(conn, "song_alias"):
+            alias_rows = cur.execute(
+                "SELECT alias_id, alias_song_title FROM song_alias WHERE canonical_song_id = ?",
+                (canonical_song_id,),
+            ).fetchall()
+            seen_alias_keys: set[str] = set()
+            for alias in alias_rows:
+                alias_title = alias["alias_song_title"] or src["canonical_title"] or ""
+                alias_title_key = normalize_search_text(alias_title)
+                alias_artist_key = normalized_full
+                alias_group_key = f"{alias_title_key}||{alias_artist_key}"
+                alias_display_key = normalize_search_text(f"{alias_title}||{full_artist}")
+                if alias_display_key in seen_alias_keys:
+                    cur.execute("DELETE FROM song_alias WHERE alias_id = ?", (int(alias["alias_id"]),))
+                    continue
+                seen_alias_keys.add(alias_display_key)
+                try:
+                    cur.execute(
+                        """
+                        UPDATE song_alias
+                        SET alias_artist = ?,
+                            alias_artist_key = ?,
+                            alias_group_key = ?,
+                            alias_display_key = ?
+                        WHERE alias_id = ?
+                        """,
+                        (full_artist, alias_artist_key, alias_group_key, alias_display_key, int(alias["alias_id"])),
+                    )
+                except sqlite3.IntegrityError:
+                    cur.execute("DELETE FROM song_alias WHERE alias_id = ?", (int(alias["alias_id"]),))
+
+        try:
+            _insert_song_alias_row(cur, canonical_song_id, src["canonical_title"] or "", full_artist)
+        except Exception:
+            pass
+
+        _refresh_entry_fts_rows(cur, entry_rows, full_artist)
+        _refresh_canonical_song_rollup(cur, canonical_song_id)
+        conn.commit()
+        _reset_app_caches()
+        return True, f'Updated artist credits for "{src["canonical_title"]}" across {len(entry_rows)} chart entr{"y" if len(entry_rows) == 1 else "ies"}.'
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Artist credit update failed: {exc}"
+    finally:
+        conn.close()
 
 def _insert_song_alias_row(cur: sqlite3.Cursor, canonical_song_id: int, old_title: str, old_artist: str) -> None:
     cols = _admin_table_columns("song_alias")
@@ -2726,6 +3280,78 @@ def render_admin_tab() -> None:
                     st.error(msg)
             st.markdown("**Alias variants for this canonical song**")
             _display_df(admin_song_aliases(selected_song_id))
+
+            st.markdown("#### Edit song title for this canonical song")
+            st.caption("Use this when the title itself is wrong or inconsistent. This updates every chart entry attached to the selected canonical song, plus canonical title keys and search tokens, so Canonical Song History, Artist History, Analytics, search, and Admin labels all see the same title.")
+            title_summary = admin_song_title_summary(selected_song_id)
+            if not title_summary.empty:
+                with st.expander("Current title variants attached to this song", expanded=False):
+                    _display_df(title_summary)
+            title_edit_value = st.text_input(
+                "Correct song title display",
+                value=str(selected_row["canonical_title"] or ""),
+                key="admin_song_title_everywhere",
+            )
+            update_alias_titles = st.checkbox(
+                "Also rewrite alias song-title strings for this canonical song",
+                value=False,
+                key="admin_song_title_update_aliases",
+                help="Leave this off if the alias variants are legitimate historical/source-title variants. Turn it on when the aliases themselves are wrong and should all match the corrected title.",
+            )
+            if st.button("Update song title everywhere", key="admin_song_title_update_btn"):
+                ok, msg = admin_update_song_title_everywhere(
+                    selected_song_id,
+                    title_edit_value,
+                    update_alias_titles,
+                )
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            st.markdown("#### Edit artist credits for this canonical song")
+            st.caption("Use this when a song's artist credit is wrong or inconsistent. This updates every chart entry attached to the selected canonical song, plus the canonical-song artist fields, so Artist History, Analytics, search, and Admin labels all see the same credit.")
+            credit_defaults = admin_song_artist_credit_defaults(selected_song_id)
+            credit_summary = admin_song_artist_credit_summary(selected_song_id)
+            if not credit_summary.empty:
+                with st.expander("Current artist-credit variants attached to this song", expanded=False):
+                    _display_df(credit_summary)
+            credit_cols = st.columns([1.2, 1.2, 1.2])
+            edit_lead_artist = credit_cols[0].text_input(
+                "Lead artist display",
+                value=credit_defaults.get("canonical_lead_artist") or credit_defaults.get("entry_lead_artist") or "",
+                key="admin_song_credit_lead",
+            )
+            edit_featured_artist = credit_cols[1].text_input(
+                "Featured artist display",
+                value=credit_defaults.get("canonical_featured_artist") or credit_defaults.get("entry_featured_artist") or "",
+                key="admin_song_credit_featured",
+            )
+            edit_full_artist = credit_cols[2].text_input(
+                "Full artist display",
+                value=credit_defaults.get("canonical_full_artist") or credit_defaults.get("entry_full_artist") or "",
+                key="admin_song_credit_full",
+                help="Leave this matching the exact full credit you want shown. If blank, the app combines Lead + Featured with a semicolon.",
+            )
+            update_alias_artists = st.checkbox(
+                "Also update alias artist strings for this canonical song",
+                value=True,
+                key="admin_song_credit_update_aliases",
+            )
+            if st.button("Update artist credits for this song", key="admin_song_credit_update_btn"):
+                ok, msg = admin_update_song_artist_credits(
+                    selected_song_id,
+                    edit_lead_artist,
+                    edit_featured_artist,
+                    edit_full_artist,
+                    update_alias_artists,
+                )
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
             st.markdown("#### Merge duplicate canonical songs")
             merge_cols = st.columns([1.2, 1.2])
