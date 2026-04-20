@@ -2221,8 +2221,7 @@ def admin_update_song_title_everywhere(
         canonical_artist = (src["canonical_artist"] or "").strip()
         canonical_artist_key = normalize_search_text(src["canonical_artist_key"] or canonical_artist)
         old_title_key = normalize_search_text(old_title)
-        if old_title_key == new_title_key:
-            return False, "The new title matches the current canonical title."
+        title_key_changed = old_title_key != new_title_key
 
         new_group_key = f"{new_title_key}||{canonical_artist_key}"
         collision = cur.execute(
@@ -2281,10 +2280,11 @@ def admin_update_song_title_everywhere(
             (new_title, new_title_key, new_title_key, new_group_key, new_title, canonical_song_id),
         )
 
-        try:
-            _insert_song_alias_row(cur, canonical_song_id, old_title, canonical_artist)
-        except Exception:
-            pass
+        if title_key_changed:
+            try:
+                _insert_song_alias_row(cur, canonical_song_id, old_title, canonical_artist)
+            except Exception:
+                pass
 
         if update_alias_titles and _admin_table_exists(conn, "song_alias"):
             alias_rows = cur.execute(
@@ -2321,7 +2321,10 @@ def admin_update_song_title_everywhere(
         _refresh_canonical_song_rollup(cur, canonical_song_id)
         conn.commit()
         _reset_app_caches()
-        return True, f'Updated title from "{old_title}" to "{new_title}" across {len(entry_rows)} chart entr{"y" if len(entry_rows) == 1 else "ies"}.'
+        if title_key_changed:
+            return True, f'Updated title from "{old_title}" to "{new_title}" across {len(entry_rows)} chart entr{"y" if len(entry_rows) == 1 else "ies"}.'
+        alias_note = " and alias title strings" if update_alias_titles else ""
+        return True, f'Unified the title as "{new_title}" across {len(entry_rows)} chart entr{"y" if len(entry_rows) == 1 else "ies"}{alias_note}.'
     except Exception as exc:
         conn.rollback()
         return False, f"Song title update failed: {exc}"
