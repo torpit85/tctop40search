@@ -2107,8 +2107,6 @@ def admin_song_artist_credit_summary(canonical_song_id: int) -> pd.DataFrame:
     )
 
 
-
-
 @st.cache_data(show_spinner=False)
 def admin_song_title_summary(canonical_song_id: int) -> pd.DataFrame:
     conn = get_connection()
@@ -2719,6 +2717,134 @@ def _refresh_canonical_song_rollup(cur: sqlite3.Cursor, canonical_song_id: int) 
     )
 
 
+def _recalculate_derived_markers_with_cursor(cur: sqlite3.Cursor) -> tuple[int, int, int]:
+    """Rebuild DEBUT / TOP DEBUT / RE-ENTRY flags from current canonical_song_id assignments."""
+    rows = cur.execute(
+        """
+        SELECT
+            e.entry_id,
+            e.chart_week_id,
+            e.position,
+            e.canonical_song_id,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            cw.chart_date
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        ORDER BY cw.chart_date, e.position, e.entry_id
+        """
+    ).fetchall()
+
+    by_week: dict[int, list[sqlite3.Row]] = {}
+    week_order: list[int] = []
+    for row in rows:
+        week_id = int(row["chart_week_id"])
+        if week_id not in by_week:
+            by_week[week_id] = []
+            week_order.append(week_id)
+        by_week[week_id].append(row)
+
+    def _entry_song_key(row: sqlite3.Row) -> str:
+        canonical_song_id = row["canonical_song_id"]
+        if canonical_song_id is not None:
+            return f"cs:{int(canonical_song_id)}"
+        title_key = normalize_search_text(row["normalized_song_title"])
+        artist_key = normalize_search_text(row["normalized_full_artist"])
+        if title_key and artist_key:
+            return f"fallback:{title_key}||{artist_key}"
+        return f"entry:{int(row['entry_id'])}"
+
+    seen_song_keys: set[str] = set()
+    previous_week_song_keys: set[str] = set()
+    updates: list[tuple[int, int, int, object, int]] = []
+    debut_count = 0
+    top_debut_count = 0
+    reentry_count = 0
+
+    for week_id in week_order:
+        week_rows = by_week[week_id]
+        week_updates: list[dict[str, object]] = []
+        current_week_song_keys: set[str] = set()
+
+        for row in week_rows:
+            song_key = _entry_song_key(row)
+            current_week_song_keys.add(song_key)
+            is_debut = song_key not in seen_song_keys
+            is_reentry = (not is_debut) and song_key not in previous_week_song_keys
+            week_updates.append(
+                {
+                    "entry_id": int(row["entry_id"]),
+                    "position": int(row["position"] or 9999),
+                    "is_debut": bool(is_debut),
+                    "is_top_debut": False,
+                    "is_reentry": bool(is_reentry),
+                    "marker": None,
+                }
+            )
+
+        debut_rows = [u for u in week_updates if u["is_debut"]]
+        if debut_rows:
+            top_debut = min(debut_rows, key=lambda u: (int(u["position"]), int(u["entry_id"])))
+            top_debut["is_top_debut"] = True
+
+        for u in week_updates:
+            if u["is_debut"]:
+                debut_count += 1
+                if u["is_top_debut"]:
+                    top_debut_count += 1
+                    u["marker"] = "TOP DEBUT"
+                else:
+                    u["marker"] = "DEBUT"
+            elif u["is_reentry"]:
+                reentry_count += 1
+                u["marker"] = "RE-ENTRY"
+
+            updates.append(
+                (
+                    1 if u["is_debut"] else 0,
+                    1 if u["is_top_debut"] else 0,
+                    1 if u["is_reentry"] else 0,
+                    u["marker"],
+                    int(u["entry_id"]),
+                )
+            )
+
+        seen_song_keys.update(current_week_song_keys)
+        previous_week_song_keys = current_week_song_keys
+
+    cur.executemany(
+        """
+        UPDATE entry
+        SET derived_is_debut = ?,
+            derived_is_top_debut = ?,
+            derived_is_reentry = ?,
+            derived_marker = ?
+        WHERE entry_id = ?
+        """,
+        updates,
+    )
+    return len(updates), debut_count, reentry_count
+
+
+def admin_recalculate_derived_markers() -> tuple[bool, str]:
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        total, debut_count, reentry_count = _recalculate_derived_markers_with_cursor(cur)
+        conn.commit()
+        _reset_app_caches()
+        return True, f"Recalculated derived markers for {total:,} chart entries ({debut_count:,} debuts, {reentry_count:,} re-entries)."
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Derived marker recalculation failed: {exc}"
+    finally:
+        conn.close()
+
+
 def admin_merge_canonical_songs(source_canonical_song_id: int, target_canonical_song_id: int) -> tuple[bool, str]:
     if source_canonical_song_id == target_canonical_song_id:
         return False, "Choose two different canonical songs."
@@ -2795,6 +2921,7 @@ def admin_merge_canonical_songs(source_canonical_song_id: int, target_canonical_
 
         cur.execute("DELETE FROM canonical_song WHERE canonical_song_id = ?", (int(src["canonical_song_id"]),))
         _refresh_canonical_song_rollup(cur, int(tgt["canonical_song_id"]))
+        _recalculate_derived_markers_with_cursor(cur)
 
         conn.commit()
         _reset_app_caches()
@@ -2955,6 +3082,7 @@ def admin_split_canonical_song(source_canonical_song_id: int, entry_ids: list[in
 
         _refresh_canonical_song_rollup(cur, source_canonical_song_id)
         _refresh_canonical_song_rollup(cur, new_canonical_song_id)
+        _recalculate_derived_markers_with_cursor(cur)
 
         conn.commit()
         _reset_app_caches()
@@ -3313,6 +3441,7 @@ def render_admin_tab() -> None:
                 else:
                     st.error(msg)
 
+
             st.markdown("#### Edit artist credits for this canonical song")
             st.caption("Use this when a song's artist credit is wrong or inconsistent. This updates every chart entry attached to the selected canonical song, plus the canonical-song artist fields, so Artist History, Analytics, search, and Admin labels all see the same credit.")
             credit_defaults = admin_song_artist_credit_defaults(selected_song_id)
@@ -3420,6 +3549,16 @@ def render_admin_tab() -> None:
                         st.rerun()
                     else:
                         st.error(msg)
+
+            st.markdown("#### Repair derived debut/re-entry markers")
+            st.caption("Use this after manual song cleanup if DEBUT, TOP DEBUT, or RE-ENTRY labels look stale. Merge and split actions also run this automatically.")
+            if st.button("Recalculate debut/re-entry markers now", key="admin_song_recalc_markers_btn"):
+                ok, msg = admin_recalculate_derived_markers()
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
     elif admin_section == "Artists":
         st.markdown("### Artist alias audit")
