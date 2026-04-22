@@ -4105,7 +4105,12 @@ def render_week_browser_tab() -> None:
         min_date = dt.date.fromisoformat(valid_dates[0])
         max_date = dt.date.fromisoformat(valid_dates[-1])
         date_key = "week_browser_chart_date"
-        if date_key not in st.session_state:
+        nav_target_key = "week_browser_nav_target"
+        if nav_target_key in st.session_state:
+            nav_target = st.session_state.pop(nav_target_key)
+            if nav_target in valid_dates:
+                st.session_state[date_key] = dt.date.fromisoformat(nav_target)
+        elif date_key not in st.session_state:
             st.session_state[date_key] = max_date
 
         selected_date_obj = st.date_input(
@@ -4121,11 +4126,11 @@ def render_week_browser_tab() -> None:
         nav_cols = st.columns([1, 1, 3])
         with nav_cols[0]:
             if st.button("◀ Previous chart week", disabled=selected_idx <= 0, key="week_browser_prev"):
-                st.session_state[date_key] = dt.date.fromisoformat(valid_dates[selected_idx - 1])
+                st.session_state[nav_target_key] = valid_dates[selected_idx - 1]
                 st.rerun()
         with nav_cols[1]:
             if st.button("Next chart week ▶", disabled=selected_idx >= len(valid_dates) - 1, key="week_browser_next"):
-                st.session_state[date_key] = dt.date.fromisoformat(valid_dates[selected_idx + 1])
+                st.session_state[nav_target_key] = valid_dates[selected_idx + 1]
                 st.rerun()
 
         if selected_date:
