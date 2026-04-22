@@ -416,24 +416,70 @@ def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]
     meta.setdefault("notes", "")
 
     sql = ENTRY_STATS_CTE + """
+        ,
+        keyed_entries AS (
+            SELECT
+                entry_id,
+                chart_week_id,
+                chart_date,
+                position,
+                canonical_song_id,
+                CASE
+                    WHEN canonical_song_id IS NOT NULL THEN 'cs:' || canonical_song_id
+                    ELSE 'fb:' || fallback_song_key
+                END AS song_identity
+            FROM entry_keyed
+        ),
+        keyed_entries_to_selected_week AS (
+            SELECT *
+            FROM keyed_entries
+            WHERE chart_date <= ?
+        ),
+        song_peak AS (
+            SELECT
+                song_identity,
+                MIN(position) AS peak_position
+            FROM keyed_entries_to_selected_week
+            GROUP BY song_identity
+        ),
+        peak_first AS (
+            SELECT
+                ke.song_identity,
+                MIN(ke.chart_date) AS week_hit_peak
+            FROM keyed_entries_to_selected_week ke
+            JOIN song_peak sp
+              ON sp.song_identity = ke.song_identity
+             AND sp.peak_position = ke.position
+            GROUP BY ke.song_identity
+        )
         SELECT
             e.position,
             es.last_week_position,
+            CASE
+                WHEN es.last_week_position IS NOT NULL THEN es.last_week_position - e.position
+                ELSE NULL
+            END AS movement,
             es.weeks_on_chart,
             e.song_title_display AS song,
             e.full_artist_display AS artist,
             e.lead_artist_display AS lead_artist,
             e.featured_artist_display AS featured_artist,
             e.derived_marker,
+            sp.peak_position,
+            pf.week_hit_peak,
             e.canonical_song_id,
+            cur_keyed.song_identity,
             e.raw_slug AS slug
         FROM entry e
         JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
         LEFT JOIN entry_stats es ON es.entry_id = e.entry_id
+        LEFT JOIN keyed_entries cur_keyed ON cur_keyed.entry_id = e.entry_id
+        LEFT JOIN song_peak sp ON sp.song_identity = cur_keyed.song_identity
+        LEFT JOIN peak_first pf ON pf.song_identity = cur_keyed.song_identity
         WHERE cw.chart_date = ?
         ORDER BY e.position
         """
-    df = pd.read_sql_query(sql, conn, params=(chart_date,))
+    df = pd.read_sql_query(sql, conn, params=(chart_date, chart_date))
     return df, meta
 
 
@@ -3789,6 +3835,268 @@ def render_search_tab() -> None:
     else:
         st.info("Enter a search query to browse the database.")
 
+def _week_row_label(row: pd.Series | None) -> str:
+    if row is None:
+        return "—"
+    song = str(row.get("song", "") or "").strip()
+    artist = str(row.get("artist", "") or "").strip()
+    if song and artist:
+        return f"{song} — {artist}"
+    return song or artist or "—"
+
+
+def _marker_contains(df: pd.DataFrame, text: str) -> pd.Series:
+    if df.empty or "derived_marker" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["derived_marker"].fillna("").astype(str).str.upper().str.contains(text.upper(), regex=False)
+
+
+def _week_identity_set(df: pd.DataFrame) -> set[str]:
+    if df.empty or "song_identity" not in df.columns:
+        return set()
+    return set(df["song_identity"].dropna().astype(str).tolist())
+
+
+def _format_movement(value: object) -> str:
+    iv = _safe_int(value)
+    if iv is None:
+        return "—"
+    if iv > 0:
+        return f"+{iv}"
+    return str(iv)
+
+
+def _week_browser_summary(df: pd.DataFrame, previous_df: pd.DataFrame | None) -> dict[str, object]:
+    if df.empty:
+        return {
+            "number_one": "—",
+            "top_debut": "—",
+            "biggest_climber": "—",
+            "biggest_faller": "—",
+            "debuts": 0,
+            "reentries": 0,
+            "dropouts": 0,
+        }
+
+    number_one_row = df.sort_values("position").head(1).iloc[0]
+
+    debuts = df.loc[_marker_contains(df, "DEBUT")].sort_values("position")
+    top_debuts = df.loc[_marker_contains(df, "TOP DEBUT")].sort_values("position")
+    top_debut_row = None
+    if not top_debuts.empty:
+        top_debut_row = top_debuts.iloc[0]
+    elif not debuts.empty:
+        top_debut_row = debuts.iloc[0]
+
+    movers = df.loc[df["movement"].notna()].copy() if "movement" in df.columns else pd.DataFrame()
+    climbers = movers.loc[movers["movement"] > 0].sort_values(["movement", "position"], ascending=[False, True]) if not movers.empty else pd.DataFrame()
+    fallers = movers.loc[movers["movement"] < 0].sort_values(["movement", "position"], ascending=[True, True]) if not movers.empty else pd.DataFrame()
+
+    previous_count = 0
+    if previous_df is not None and not previous_df.empty:
+        current_ids = _week_identity_set(df)
+        previous_count = int(~previous_df["song_identity"].astype(str).isin(current_ids).sum()) if False else 0
+        previous_count = int(previous_df.loc[~previous_df["song_identity"].astype(str).isin(current_ids)].shape[0])
+
+    return {
+        "number_one": _week_row_label(number_one_row),
+        "top_debut": _week_row_label(top_debut_row),
+        "biggest_climber": (
+            f"{_week_row_label(climbers.iloc[0])} ({_format_movement(climbers.iloc[0]['movement'])})"
+            if not climbers.empty else "—"
+        ),
+        "biggest_faller": (
+            f"{_week_row_label(fallers.iloc[0])} ({_format_movement(fallers.iloc[0]['movement'])})"
+            if not fallers.empty else "—"
+        ),
+        "debuts": int(_marker_contains(df, "DEBUT").sum()),
+        "reentries": int(_marker_contains(df, "RE-ENTRY").sum()),
+        "dropouts": previous_count,
+    }
+
+
+def _week_browser_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    visible_cols = [
+        "position",
+        "last_week_position",
+        "weeks_on_chart",
+        "movement",
+        "song",
+        "artist",
+        "derived_marker",
+        "peak_position",
+        "week_hit_peak",
+        "canonical_song_id",
+    ]
+    out = df[[c for c in visible_cols if c in df.columns]].copy()
+    if "movement" in out.columns:
+        out["movement"] = out["movement"].apply(_format_movement)
+    rename_map = {
+        "position": "Position",
+        "last_week_position": "Last Week",
+        "movement": "Movement",
+        "weeks_on_chart": "Weeks",
+        "song": "Song",
+        "artist": "Artist",
+        "derived_marker": "Marker",
+        "peak_position": "Peak Position",
+        "week_hit_peak": "Week Hit Peak",
+        "canonical_song_id": "Canonical Song ID",
+    }
+    return out.rename(columns=rename_map)
+
+
+def _week_artist_appearances(df: pd.DataFrame) -> pd.DataFrame:
+    """Count artist appearances on the selected chart week using lead/featured credits when available."""
+    if df.empty:
+        return pd.DataFrame(columns=["Artist", "Appearances"])
+
+    rows: list[dict[str, object]] = []
+    for row in df.to_dict("records"):
+        entry_key = row.get("song_identity") or row.get("canonical_song_id") or row.get("song")
+        pairs = []
+        pairs.extend(_split_credit_people(None, row.get("lead_artist")))
+        pairs.extend(_split_credit_people(None, row.get("featured_artist")))
+        if not pairs:
+            pairs.extend(_split_credit_people(None, row.get("artist")))
+
+        seen_in_entry: set[str] = set()
+        for artist_key, artist in pairs:
+            resolved = resolve_artist_key_alias(artist_key)
+            if resolved is None or (isinstance(resolved, float) and pd.isna(resolved)):
+                continue
+            resolved_key = normalize_search_text(resolved)
+            if not resolved_key or resolved_key in seen_in_entry:
+                continue
+            seen_in_entry.add(resolved_key)
+            rows.append({
+                "artist_key": resolved_key,
+                "artist": preferred_artist_display(resolved_key, artist),
+                "entry_key": entry_key,
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["Artist", "Appearances"])
+
+    artists = pd.DataFrame(rows)
+    out = (
+        artists.groupby("artist_key", dropna=True)
+        .agg(
+            Artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+            Appearances=("entry_key", "nunique"),
+        )
+        .reset_index(drop=True)
+        .sort_values(["Appearances", "Artist"], ascending=[False, True])
+        .head(5)
+    )
+    return out
+
+
+def _render_week_summary_expander(summary: dict[str, object]) -> None:
+    summary_rows = pd.DataFrame([
+        {"Metric": "#1 song", "Value": summary["number_one"]},
+        {"Metric": "Top debut", "Value": summary["top_debut"]},
+        {"Metric": "Dropouts", "Value": summary["dropouts"]},
+        {"Metric": "Debuts", "Value": summary["debuts"]},
+        {"Metric": "Re-entries", "Value": summary["reentries"]},
+        {"Metric": "Biggest climber", "Value": summary["biggest_climber"]},
+        {"Metric": "Biggest faller", "Value": summary["biggest_faller"]},
+    ])
+    # Keep the compact summary Arrow-friendly: this column mixes text labels
+    # and numeric counts, so render all values as strings.
+    summary_rows["Value"] = summary_rows["Value"].map(lambda v: "—" if pd.isna(v) else str(v))
+    with st.expander("Quick week summary"):
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stExpander"] div[data-testid="stDataFrame"] {
+                font-size: 0.85rem;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        _display_df(summary_rows)
+
+
+def _render_week_detail_tables(df: pd.DataFrame, previous_df: pd.DataFrame | None, selected_date: str) -> None:
+    if df.empty:
+        st.info("No chart rows are available for this week.")
+        return
+
+    current_ids = _week_identity_set(df)
+
+    if previous_df is not None and not previous_df.empty and current_ids:
+        dropouts = previous_df.loc[~previous_df["song_identity"].astype(str).isin(current_ids)].copy()
+    else:
+        dropouts = pd.DataFrame()
+
+    debuts_reentries = df.loc[_marker_contains(df, "DEBUT") | _marker_contains(df, "RE-ENTRY")].copy()
+    movers = df.loc[df["movement"].notna()].copy() if "movement" in df.columns else pd.DataFrame()
+    gains = (
+        movers.loc[movers["movement"] > 0]
+        .sort_values(["movement", "position"], ascending=[False, True])
+        .head(5)
+        if not movers.empty else pd.DataFrame()
+    )
+    falls = (
+        movers.loc[movers["movement"] < 0]
+        .sort_values(["movement", "position"], ascending=[True, True])
+        .head(5)
+        if not movers.empty else pd.DataFrame()
+    )
+
+    new_peaks = df.loc[
+        (pd.to_numeric(df.get("position"), errors="coerce") == pd.to_numeric(df.get("peak_position"), errors="coerce"))
+        & (df.get("week_hit_peak", pd.Series(index=df.index, dtype=object)).astype(str) == selected_date)
+    ].copy()
+    artist_appearances = _week_artist_appearances(df)
+
+    st.markdown("**Dropouts from previous chart**")
+    if dropouts.empty:
+        st.caption("No dropouts from the previous chart week.")
+    else:
+        dropouts_display = dropouts[["position", "song", "artist", "weeks_on_chart", "peak_position", "week_hit_peak"]].rename(columns={
+            "position": "Previous Position",
+            "song": "Song",
+            "artist": "Artist",
+            "weeks_on_chart": "Weeks",
+            "peak_position": "Peak Position",
+            "week_hit_peak": "Week Hit Peak",
+        })
+        _display_df(dropouts_display)
+
+    st.markdown("**Debuts and re-entries**")
+    if debuts_reentries.empty:
+        st.caption("No debuts or re-entries this week.")
+    else:
+        _display_df(_week_browser_display_table(debuts_reentries))
+
+    st.markdown("**Top 5 gains**")
+    if gains.empty:
+        st.caption("No upward movement this week.")
+    else:
+        _display_df(_week_browser_display_table(gains))
+
+    st.markdown("**Top 5 falls**")
+    if falls.empty:
+        st.caption("No downward movement this week.")
+    else:
+        _display_df(_week_browser_display_table(falls))
+
+    st.markdown("**Songs reaching new peaks**")
+    if new_peaks.empty:
+        st.caption("No songs reached their all-time peak for the first time this week.")
+    else:
+        _display_df(_week_browser_display_table(new_peaks))
+
+    st.markdown("**Top 5 most artist appearances**")
+    if artist_appearances.empty:
+        st.caption("No artist appearance rows available.")
+    else:
+        _display_df(artist_appearances)
+
+
 def render_week_browser_tab() -> None:
     st.subheader("Browse a chart week")
     dates = load_chart_dates()
@@ -3796,17 +4104,36 @@ def render_week_browser_tab() -> None:
         valid_dates = sorted(dates)
         min_date = dt.date.fromisoformat(valid_dates[0])
         max_date = dt.date.fromisoformat(valid_dates[-1])
+        date_key = "week_browser_chart_date"
+        if date_key not in st.session_state:
+            st.session_state[date_key] = max_date
+
         selected_date_obj = st.date_input(
             "Chart date",
-            value=max_date,
             min_value=min_date,
             max_value=max_date,
             format="YYYY-MM-DD",
+            key=date_key,
         )
         selected_date, snapped = nearest_chart_date(selected_date_obj.isoformat(), valid_dates)
+
+        selected_idx = valid_dates.index(selected_date) if selected_date in valid_dates else len(valid_dates) - 1
+        nav_cols = st.columns([1, 1, 3])
+        with nav_cols[0]:
+            if st.button("◀ Previous chart week", disabled=selected_idx <= 0, key="week_browser_prev"):
+                st.session_state[date_key] = dt.date.fromisoformat(valid_dates[selected_idx - 1])
+                st.rerun()
+        with nav_cols[1]:
+            if st.button("Next chart week ▶", disabled=selected_idx >= len(valid_dates) - 1, key="week_browser_next"):
+                st.session_state[date_key] = dt.date.fromisoformat(valid_dates[selected_idx + 1])
+                st.rerun()
+
         if selected_date:
             if snapped:
                 st.info(f"No chart exists for {selected_date_obj.isoformat()}. Showing nearest prior chart week: {selected_date}.")
+            previous_date = valid_dates[selected_idx - 1] if selected_idx > 0 else None
+            previous_df = load_chart(previous_date)[0] if previous_date else pd.DataFrame()
+
             df, meta = load_chart(selected_date)
             if meta:
                 k1, k2, k3 = st.columns(3)
@@ -3816,7 +4143,14 @@ def render_week_browser_tab() -> None:
                 st.caption(f"Source file: {meta['source_file']}")
                 if meta.get("notes"):
                     st.warning(meta["notes"])
-            _display_df(df)
+
+            summary = _week_browser_summary(df, previous_df)
+            _render_week_summary_expander(summary)
+
+            _display_df(_week_browser_display_table(df))
+
+            with st.expander("Week details"):
+                _render_week_detail_tables(df, previous_df, selected_date)
     else:
         st.info("No chart weeks are available in the database.")
 
