@@ -1351,6 +1351,81 @@ def _apply_analytics_filters(pkg: dict[str, pd.DataFrame], start_date: dt.date, 
     }
 
 
+@st.cache_data(show_spinner=False)
+def load_analytics_date_bounds() -> tuple[dt.date | None, dt.date | None]:
+    conn = get_connection()
+    row = conn.execute("SELECT MIN(chart_date) AS min_date, MAX(chart_date) AS max_date FROM chart_week").fetchone()
+    if row is None or not row[0] or not row[1]:
+        return None, None
+    return dt.date.fromisoformat(str(row[0])), dt.date.fromisoformat(str(row[1]))
+
+
+@st.cache_data(show_spinner=False)
+def _analytics_filtered_chart(start_date: dt.date, end_date: dt.date, include_reentries: bool) -> pd.DataFrame:
+    chart = load_analytics_base().copy()
+    if chart.empty:
+        return chart
+    mask = (chart["chart_date"].dt.date >= start_date) & (chart["chart_date"].dt.date <= end_date)
+    chart = chart.loc[mask].copy()
+    if not include_reentries:
+        chart = chart.loc[~chart["is_reentry"]].copy()
+    return chart
+
+
+@st.cache_data(show_spinner=False)
+def _analytics_pkg_for_section(section: str, start_date: dt.date, end_date: dt.date, include_reentries: bool, min_weeks_on_chart: int) -> dict[str, pd.DataFrame]:
+    chart = _analytics_filtered_chart(start_date, end_date, include_reentries)
+    empty = pd.DataFrame()
+    pkg: dict[str, pd.DataFrame] = {
+        "chart": chart,
+        "weekly": empty,
+        "songs": empty,
+        "artist_credits": empty,
+        "artist_presence": empty,
+        "artists": empty,
+        "years": empty,
+    }
+    if chart.empty:
+        return pkg
+
+    needs_weekly = section in {"Overview", "Movement", "Years & Eras", "Records & Outliers"}
+    needs_songs = section in {"Longevity", "Artists", "Years & Eras", "Records & Outliers"}
+    needs_artist_stack = section in {"Artists", "Records & Outliers"}
+    needs_years = section == "Years & Eras"
+
+    weekly = build_weekly_summary(chart) if needs_weekly else empty
+    pkg["weekly"] = weekly
+
+    songs = build_song_summary(chart) if needs_songs else empty
+    if needs_songs and not songs.empty:
+        songs = songs.loc[songs["total_chart_weeks"] >= min_weeks_on_chart].copy()
+    pkg["songs"] = songs
+
+    if needs_artist_stack:
+        artist_credits = build_artist_credit_rows(chart)
+        if not songs.empty:
+            valid_song_keys = set(songs["song_key"].tolist())
+            artist_credits = artist_credits.loc[artist_credits["song_key"].isin(valid_song_keys)].copy()
+        artist_presence = build_artist_weekly_presence(artist_credits)
+        artists = build_artist_summary(artist_credits, songs, artist_presence) if not artist_credits.empty else empty
+        pkg["artist_credits"] = artist_credits
+        pkg["artist_presence"] = artist_presence
+        pkg["artists"] = artists
+
+    if needs_years:
+        if weekly.empty:
+            weekly = build_weekly_summary(chart)
+            pkg["weekly"] = weekly
+        if songs.empty:
+            songs = build_song_summary(chart)
+            if not songs.empty:
+                songs = songs.loc[songs["total_chart_weeks"] >= min_weeks_on_chart].copy()
+            pkg["songs"] = songs
+        pkg["years"] = build_yearly_summary(chart, weekly, songs)
+
+    return pkg
+
+
 def _display_df(df: pd.DataFrame, columns: list[str] | None = None, hide_index: bool = True):
     if columns is not None and not df.empty:
         cols = [c for c in columns if c in df.columns]
@@ -3745,26 +3820,34 @@ def render_admin_tab() -> None:
 
 def render_analytics_tab() -> None:
     st.subheader("Analytics")
-    base = load_analytics_base()
-    if base.empty:
+    min_date, max_date = load_analytics_date_bounds()
+    if min_date is None or max_date is None:
         st.info("No analytics data is available in the database yet.")
         return
-    min_date = base["chart_date"].min().date()
-    max_date = base["chart_date"].max().date()
+
     controls = st.columns([1.4, 1.4, 1.0, 1.0])
     start_date = controls[0].date_input("Start date", value=min_date, min_value=min_date, max_value=max_date, key="analytics_start")
     end_date = controls[1].date_input("End date", value=max_date, min_value=min_date, max_value=max_date, key="analytics_end")
     include_reentries = controls[2].checkbox("Include re-entries", value=True, key="analytics_include_reentries")
     min_weeks = int(controls[3].number_input("Min weeks on chart", min_value=1, max_value=500, value=1, step=1, key="analytics_min_weeks"))
-    section_cols = st.columns([2, 1, 1])
+
+    section_cols = st.columns([1.8, 1.0, 1.0, 1.1])
     section = section_cols[0].selectbox("Analytics section", ANALYTICS_SECTIONS, key="analytics_section")
     top_n = int(section_cols[1].slider("Top N rows", 5, 100, 25, 5, key="analytics_top_n"))
     chart_key = "analytics_show_charts_" + re.sub(r"[^a-z0-9]+", "_", section.lower()).strip("_")
     show_charts = section_cols[2].checkbox("Load charts", value=False, key=chart_key)
+    load_section_key = "analytics_load_section_" + re.sub(r"[^a-z0-9]+", "_", section.lower()).strip("_")
+    load_section = section_cols[3].checkbox("Load section", value=False, key=load_section_key)
+
     if start_date > end_date:
         st.error("Start date must be on or before end date.")
         return
-    pkg = _apply_analytics_filters(build_analytics_package(), start_date, end_date, include_reentries, min_weeks)
+
+    if not load_section:
+        st.caption("Analytics section data is paused. Turn on 'Load section' when you want to render the selected Analytics view.")
+        return
+
+    pkg = _analytics_pkg_for_section(section, start_date, end_date, include_reentries, min_weeks)
 
     def _render_selected_section() -> None:
         if section == "Overview":
@@ -4227,39 +4310,365 @@ def render_artist_history_tab() -> None:
     else:
         st.info("Type part of an artist name to load an artist history.")
 
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_num1_gains(limit: int = 100) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame(columns=["chart_date", "title", "artist", "last_week_position", "gain_to_num1", "weeks_on_chart"])
+    out = chart.loc[
+        chart["position"].eq(1)
+        & chart["last_week_position"].notna()
+        & (chart["last_week_position"] > 1)
+        & ~chart["is_debut"]
+        & ~chart["is_reentry"]
+    , ["chart_date", "title", "artist", "last_week_position", "weeks_on_chart"]].copy()
+    if out.empty:
+        return out
+    out["gain_to_num1"] = pd.to_numeric(out["last_week_position"], errors="coerce") - 1
+    out = out.sort_values(["gain_to_num1", "chart_date", "title"], ascending=[False, False, True]).head(limit)
+    return out.rename(columns={
+        "chart_date": "Chart date",
+        "title": "Song",
+        "artist": "Artist",
+        "last_week_position": "Last week",
+        "gain_to_num1": "Gain to #1",
+        "weeks_on_chart": "Weeks",
+    })
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_num1_falls(limit: int = 100) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame(columns=["chart_date", "title", "artist", "position", "fall_from_num1", "weeks_on_chart"])
+    out = chart.loc[
+        chart["last_week_position"].eq(1)
+        & chart["position"].notna()
+        & (chart["position"] > 1)
+        & ~chart["is_debut"]
+        & ~chart["is_reentry"]
+    , ["chart_date", "title", "artist", "position", "weeks_on_chart"]].copy()
+    if out.empty:
+        return out
+    out["fall_from_num1"] = pd.to_numeric(out["position"], errors="coerce") - 1
+    out = out.sort_values(["fall_from_num1", "chart_date", "title"], ascending=[False, False, True]).head(limit)
+    return out.rename(columns={
+        "chart_date": "Chart date",
+        "title": "Song",
+        "artist": "Artist",
+        "position": "This week",
+        "fall_from_num1": "Fall from #1",
+        "weeks_on_chart": "Weeks",
+    })
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_from_position_to_num1(start_position: int, limit: int = 100) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame(columns=["chart_date", "title", "artist", "weeks_on_chart"])
+    out = chart.loc[
+        chart["position"].eq(1)
+        & chart["last_week_position"].eq(start_position)
+        & ~chart["is_debut"]
+        & ~chart["is_reentry"]
+    , ["chart_date", "title", "artist", "weeks_on_chart"]].copy()
+    out = out.sort_values(["chart_date", "title"], ascending=[False, True]).head(limit)
+    return out.rename(columns={
+        "chart_date": "Chart date",
+        "title": "Song",
+        "artist": "Artist",
+        "weeks_on_chart": "Weeks",
+    })
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_debut_position_to_num1(start_position: int, limit: int = 100) -> pd.DataFrame:
+    songs = build_song_summary(load_analytics_base())
+    if songs.empty:
+        return pd.DataFrame(columns=["Debut date", "Song", "Artist", "Peak date", "#1 weeks", "Chart weeks"])
+    out = songs.loc[
+        pd.to_numeric(songs.get("debut_position"), errors="coerce").eq(start_position)
+        & pd.to_numeric(songs.get("peak_position"), errors="coerce").eq(1)
+    , ["first_chart_date", "title", "artist", "peak_date", "num1_weeks", "total_chart_weeks"]].copy()
+    if out.empty:
+        return pd.DataFrame(columns=["Debut date", "Song", "Artist", "Peak date", "#1 weeks", "Chart weeks"])
+    out = out.sort_values(["first_chart_date", "peak_date", "title"], ascending=[False, False, True]).head(limit)
+    return out.rename(columns={
+        "first_chart_date": "Debut date",
+        "title": "Song",
+        "artist": "Artist",
+        "peak_date": "Peak date",
+        "num1_weeks": "#1 weeks",
+        "total_chart_weeks": "Chart weeks",
+    })
+
+
+def _consecutive_run_len(dates: list[pd.Timestamp], ordered_dates: list[pd.Timestamp]) -> int:
+    if not dates:
+        return 0
+    idx_map = {d: i for i, d in enumerate(ordered_dates)}
+    idxs = sorted(idx_map[d] for d in dates if d in idx_map)
+    if not idxs:
+        return 0
+    best = cur = 1
+    for prev, cur_idx in zip(idxs, idxs[1:]):
+        if cur_idx == prev + 1:
+            cur += 1
+        else:
+            best = max(best, cur)
+            cur = 1
+    return max(best, cur)
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_num1_runs_by_year() -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame(columns=["Year", "Song", "Artist", "Consecutive weeks at #1", "Reign dates"])
+    num1 = chart.loc[chart["position"].eq(1)].copy()
+    if num1.empty:
+        return pd.DataFrame(columns=["Year", "Song", "Artist", "Consecutive weeks at #1", "Reign dates"])
+
+    rows: list[dict[str, object]] = []
+    for year, year_rows in num1.groupby("year", sort=True):
+        year_dates = sorted(chart.loc[chart["year"] == year, "chart_date"].dropna().unique())
+        idx_map = {d: i for i, d in enumerate(year_dates)}
+        best_len = 0
+        best_song = None
+        best_artist = None
+        best_start = None
+        best_end = None
+
+        for _, sg in year_rows.groupby("song_key", sort=False):
+            sg = sg.sort_values(["chart_date", "entry_id"]).copy()
+            dates = [d for d in sg["chart_date"].tolist() if d in idx_map]
+            if not dates:
+                continue
+            run_start = dates[0]
+            run_prev = dates[0]
+            cur_len = 1
+            cur_best_len = 1
+            cur_best_start = dates[0]
+            cur_best_end = dates[0]
+            for d in dates[1:]:
+                if idx_map[d] == idx_map[run_prev] + 1:
+                    cur_len += 1
+                else:
+                    if cur_len > cur_best_len:
+                        cur_best_len = cur_len
+                        cur_best_start = run_start
+                        cur_best_end = run_prev
+                    run_start = d
+                    cur_len = 1
+                run_prev = d
+            if cur_len > cur_best_len:
+                cur_best_len = cur_len
+                cur_best_start = run_start
+                cur_best_end = run_prev
+
+            challenger_start = cur_best_start
+            if (cur_best_len > best_len) or (cur_best_len == best_len and cur_best_len > 0 and (best_start is None or challenger_start < best_start)):
+                best_len = cur_best_len
+                best_song = sg["title"].iloc[0]
+                best_artist = sg["artist"].iloc[0]
+                best_start = cur_best_start
+                best_end = cur_best_end
+
+        if best_len > 0:
+            reign_dates = str(pd.to_datetime(best_start).date())
+            if best_end is not None and best_end != best_start:
+                reign_dates = f"{pd.to_datetime(best_start).date()} – {pd.to_datetime(best_end).date()}"
+            rows.append({
+                "Year": int(year),
+                "Song": best_song,
+                "Artist": best_artist,
+                "Consecutive weeks at #1": int(best_len),
+                "Reign dates": reign_dates,
+            })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Year", "Consecutive weeks at #1", "Song"], ascending=[False, False, True])
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_artist_exclusive_top25(limit: int = 100) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame(columns=["Chart date", "Artist", "Exclusive tier", "Songs"])
+    top5 = chart.loc[chart["position"].between(1, 5)].copy()
+    if top5.empty:
+        return pd.DataFrame(columns=["Chart date", "Artist", "Exclusive tier", "Songs"])
+
+    rows: list[dict[str, object]] = []
+    for chart_date, g in top5.groupby("chart_date", sort=True):
+        g = g.copy()
+        pos_to_keys: dict[int, set[str]] = {}
+        pos_to_title: dict[int, str] = {}
+        for _, row in g.iterrows():
+            pos = _safe_int(row.get("position"))
+            if pos is None or pos < 1 or pos > 5:
+                continue
+            pairs = _split_credit_people(row.get("normalized_lead_artist"), row.get("lead_artist"))
+            pairs.extend(_split_credit_people(row.get("normalized_featured_artist"), row.get("featured_artist")))
+            entry_keys = {normalize_search_text(k) for k, _ in pairs if k}
+            pos_to_keys[pos] = entry_keys
+            pos_to_title[pos] = str(row.get("title", "") or "")
+
+        exclusive_tier = None
+        exclusive_artists: set[str] = set()
+        for tier in (5, 4, 3, 2):
+            required_positions = list(range(1, tier + 1))
+            if sorted(pos for pos in required_positions if pos in pos_to_keys) != required_positions:
+                continue
+            common_keys: set[str] | None = None
+            valid = True
+            for pos in required_positions:
+                entry_keys = pos_to_keys.get(pos, set())
+                if not entry_keys:
+                    valid = False
+                    break
+                common_keys = entry_keys if common_keys is None else (common_keys & entry_keys)
+                if not common_keys:
+                    valid = False
+                    break
+            if valid and common_keys:
+                exclusive_tier = tier
+                exclusive_artists = common_keys
+                break
+
+        if exclusive_tier is None or not exclusive_artists:
+            continue
+
+        songs = [f"#{pos} {pos_to_title.get(pos, '')}" for pos in range(1, exclusive_tier + 1)]
+        for artist_key in sorted(exclusive_artists):
+            rows.append({
+                "Chart date": str(pd.to_datetime(chart_date).date()),
+                "Artist": preferred_artist_display(artist_key, artist_key),
+                "Exclusive tier": f"Top {exclusive_tier}",
+                "Songs": " | ".join(songs),
+            })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    tier_order = {"Top 5": 5, "Top 4": 4, "Top 3": 3, "Top 2": 2}
+    out["__tier_order"] = out["Exclusive tier"].map(tier_order).fillna(0)
+    out = out.sort_values(["__tier_order", "Chart date", "Artist"], ascending=[False, False, True]).drop(columns=["__tier_order"])
+    return out.head(limit)
+
 def render_special_tables_tab() -> None:
     st.subheader("Quick tables")
-    table_kind = st.selectbox(
-        "View",
+    subsection = st.selectbox(
+        "Section",
         [
-            "#1 hits",
-            "Top 10 hits",
-            "Top debuts",
-            "Top 5 debuts",
-            "Debut weeks",
-            "Re-entries",
-            "Biggest climbers",
-            "Artists with most Top 10 weeks",
-            "Artists with most appearances on a single chart",
+            "Hits & milestones",
+            "Movement",
+            "Artists",
+            "Debuts / Re-entries",
+            "Chart feats",
         ],
+        key="quick_tables_section",
     )
 
-    if table_kind == "#1 hits":
-        conn = get_connection()
-        year_rows = conn.execute(
-            "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
-        ).fetchall()
-        year_options = ["All years"] + [row[0] for row in year_rows if row[0]]
-        selected_year = st.selectbox("Year", year_options, key="special_num1_year")
+    if subsection == "Hits & milestones":
+        table_kind = st.selectbox(
+            "View",
+            ["#1 hits", "Top 10 hits"],
+            key="quick_hits_view",
+        )
+        if table_kind == "#1 hits":
+            conn = get_connection()
+            year_rows = conn.execute(
+                "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
+            ).fetchall()
+            year_options = ["All years"] + [row[0] for row in year_rows if row[0]]
+            selected_year = st.selectbox("Year", year_options, key="special_num1_year")
+            table = load_special_entries(table_kind, 1000000)
+            if selected_year != "All years" and not table.empty and "chart_date" in table.columns:
+                table = table.loc[table["chart_date"].astype(str).str.startswith(selected_year)].copy()
+            st.markdown("**#1 Hits**")
+            _display_df(table)
+        else:
+            limit = st.slider("Rows", 10, 500, 100, 10, key="quick_hits_limit")
+            st.markdown("**Top 10 Hits**")
+            _display_df(load_special_entries(table_kind, limit))
 
-        table = load_special_entries(table_kind, 1000000)
-        if selected_year != "All years" and not table.empty and "chart_date" in table.columns:
-            table = table.loc[table["chart_date"].astype(str).str.startswith(selected_year)].copy()
-        _display_df(table)
+    elif subsection == "Movement":
+        table_kind = st.selectbox(
+            "View",
+            ["Biggest climbers"],
+            key="quick_movement_view",
+        )
+        limit = st.slider("Rows", 10, 500, 100, 10, key="quick_movement_limit")
+        st.markdown("**Biggest Climbers**")
+        _display_df(load_special_entries(table_kind, limit))
+
+    elif subsection == "Artists":
+        table_kind = st.selectbox(
+            "View",
+            [
+                "Artists with most Top 10 weeks",
+                "Artists with most appearances on a single chart",
+            ],
+            key="quick_artists_view",
+        )
+        limit = st.slider("Rows", 10, 500, 100, 10, key="quick_artists_limit")
+        st.markdown(f"**{table_kind}**")
+        _display_df(load_special_entries(table_kind, limit))
+
+    elif subsection == "Debuts / Re-entries":
+        table_kind = st.selectbox(
+            "View",
+            ["Top debuts", "Top 5 debuts", "Debut weeks", "Re-entries"],
+            key="quick_debuts_view",
+        )
+        limit = st.slider("Rows", 10, 500, 100, 10, key="quick_debuts_limit")
+        st.markdown(f"**{table_kind}**")
+        _display_df(load_special_entries(table_kind, limit))
+
     else:
-        limit = st.slider("Rows", 10, 500, 100, 10, key="special_limit")
-        table = load_special_entries(table_kind, limit)
-        _display_df(table)
+        feat_view = st.selectbox(
+            "View",
+            [
+                "Biggest gains to #1",
+                "Biggest falls from #1",
+                "Songs gaining from a selected position to #1",
+                "Most consecutive weeks at #1 by year",
+                "Songs debuting at X position that eventually reached #1",
+                "Artist-exclusive Top 2–5",
+            ],
+            key="quick_feats_view",
+        )
+        if feat_view != "Most consecutive weeks at #1 by year":
+            limit = st.slider("Rows", 10, 500, 100, 10, key="quick_feats_limit")
+        else:
+            limit = 1000000
+        if feat_view == "Biggest gains to #1":
+            st.markdown("**Biggest gains to #1**")
+            _display_df(build_quick_num1_gains(limit))
+        elif feat_view == "Biggest falls from #1":
+            st.markdown("**Biggest falls from #1**")
+            _display_df(build_quick_num1_falls(limit))
+        elif feat_view == "Songs gaining from a selected position to #1":
+            start_position = st.slider("Starting position", 2, 40, 2, 1, key="quick_to_num1_start")
+            st.markdown(f"**Songs gaining from #{start_position} to #1**")
+            _display_df(build_quick_from_position_to_num1(start_position, limit))
+        elif feat_view == "Most consecutive weeks at #1 by year":
+            st.markdown("**Most consecutive weeks at #1 by year**")
+            _display_df(build_quick_num1_runs_by_year())
+        elif feat_view == "Songs debuting at X position that eventually reached #1":
+            debut_position = st.slider("Debut position", 1, 40, 1, 1, key="quick_debut_to_num1_start")
+            st.markdown(f"**Songs debuting at #{debut_position} that eventually reached #1**")
+            _display_df(build_quick_debut_position_to_num1(debut_position, limit))
+        else:
+            st.markdown("**Artist-exclusive Top 2–5**")
+            st.caption("Top 2 means an artist appears on both #1 and #2; Top 3 means #1–#3 only; Top 4 means #1–#4 only; Top 5 means #1–#5. Lead and featured/GUEST appearances count.")
+            _display_df(build_quick_artist_exclusive_top25(limit))
 
 def main() -> None:
     st.title("Torrey's Corner Top 40 Search Engine")
