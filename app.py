@@ -4405,6 +4405,69 @@ def build_quick_debut_position_to_num1(start_position: int, limit: int = 100) ->
         "total_chart_weeks": "Chart weeks",
     })
 
+@st.cache_data(show_spinner=False)
+def build_quick_top10_hits(selected_years: tuple[int, ...] | tuple() = (), limit: int = 1000000) -> pd.DataFrame:
+    songs = build_song_summary(load_analytics_base())
+    if songs.empty:
+        return pd.DataFrame(columns=["First Top 10 Week", "Song", "Artist", "Weeks in Top 10", "Peak"])
+
+    songs = songs.loc[pd.to_numeric(songs.get("top10_weeks"), errors="coerce").fillna(0) > 0].copy()
+    if songs.empty:
+        return pd.DataFrame(columns=["First Top 10 Week", "Song", "Artist", "Weeks in Top 10", "Peak"])
+
+    chart = load_analytics_base()
+    top10_rows = chart.loc[chart["position"].le(10), ["song_key", "chart_date"]].copy()
+    if top10_rows.empty:
+        return pd.DataFrame(columns=["First Top 10 Week", "Song", "Artist", "Weeks in Top 10", "Peak"])
+
+    first_top10 = (
+        top10_rows.groupby("song_key", dropna=False)["chart_date"]
+        .min()
+        .reset_index()
+        .rename(columns={"chart_date": "first_top10_week"})
+    )
+    top10_by_year = (
+        top10_rows.assign(top10_year=pd.to_datetime(top10_rows["chart_date"]).dt.year)
+        .groupby(["song_key", "top10_year"], dropna=False)
+        .size()
+        .reset_index(name="top10_weeks_in_selected_years")
+    )
+
+    out = songs.merge(first_top10, on="song_key", how="left")
+    if selected_years:
+        yrs = sorted({int(y) for y in selected_years})
+        eligible_keys = set(top10_by_year.loc[top10_by_year["top10_year"].isin(yrs), "song_key"].tolist())
+        out = out.loc[out["song_key"].isin(eligible_keys)].copy()
+        if out.empty:
+            return pd.DataFrame(columns=["First Top 10 Week", "Song", "Artist", "Weeks in Top 10 in Selected Year(s)", "Weeks in Top 10", "Peak"])
+        yr_counts = (
+            top10_by_year.loc[top10_by_year["top10_year"].isin(yrs)]
+            .groupby("song_key", dropna=False)["top10_weeks_in_selected_years"]
+            .sum()
+            .reset_index()
+        )
+        out = out.merge(yr_counts, on="song_key", how="left")
+        out = out.sort_values(["first_top10_week", "title", "artist"], ascending=[False, True, True]).head(limit)
+        out = out.rename(columns={
+            "first_top10_week": "First Top 10 Week",
+            "title": "Song",
+            "artist": "Artist",
+            "top10_weeks_in_selected_years": "Weeks in Top 10 in Selected Year(s)",
+            "top10_weeks": "Weeks in Top 10",
+            "peak_position": "Peak",
+        })
+        return out[["First Top 10 Week", "Song", "Artist", "Weeks in Top 10 in Selected Year(s)", "Weeks in Top 10", "Peak"]]
+
+    out = out.sort_values(["first_top10_week", "title", "artist"], ascending=[False, True, True]).head(limit)
+    out = out.rename(columns={
+        "first_top10_week": "First Top 10 Week",
+        "title": "Song",
+        "artist": "Artist",
+        "top10_weeks": "Weeks in Top 10",
+        "peak_position": "Peak",
+    })
+    return out[["First Top 10 Week", "Song", "Artist", "Weeks in Top 10", "Peak"]]
+
 
 def _consecutive_run_len(dates: list[pd.Timestamp], ordered_dates: list[pd.Timestamp]) -> int:
     if not dates:
@@ -4594,9 +4657,28 @@ def render_special_tables_tab() -> None:
             st.markdown("**#1 Hits**")
             _display_df(table)
         else:
-            limit = st.slider("Rows", 10, 500, 100, 10, key="quick_hits_limit")
+            conn = get_connection()
+            year_rows = conn.execute(
+                "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
+            ).fetchall()
+            year_options = [int(row[0]) for row in year_rows if row[0]]
+            include_all = st.checkbox("Show all-time list", value=True, key="quick_top10_all")
+            selected_years: list[int] = []
+            if not include_all:
+                selected_years = st.multiselect(
+                    "Year(s)",
+                    year_options,
+                    default=year_options[:1] if year_options else [],
+                    key="quick_top10_years",
+                )
+            limit = st.slider("Rows", 10, 5000, 500, 10, key="quick_hits_limit")
             st.markdown("**Top 10 Hits**")
-            _display_df(load_special_entries(table_kind, limit))
+            table = build_quick_top10_hits(tuple(selected_years), limit)
+            _display_df(table)
+            if include_all:
+                st.caption("All-time list shows each song once, using its first-ever Top 10 week.")
+            else:
+                st.caption("Selected year(s) list includes songs with any Top 10 weeks in those years, while keeping each song's true first-ever Top 10 week.")
 
     elif subsection == "Movement":
         table_kind = st.selectbox(
