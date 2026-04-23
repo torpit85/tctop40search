@@ -4661,24 +4661,19 @@ def render_special_tables_tab() -> None:
             year_rows = conn.execute(
                 "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
             ).fetchall()
-            year_options = [int(row[0]) for row in year_rows if row[0]]
-            include_all = st.checkbox("Show all-time list", value=True, key="quick_top10_all")
-            selected_years: list[int] = []
-            if not include_all:
-                selected_years = st.multiselect(
-                    "Year(s)",
-                    year_options,
-                    default=year_options[:1] if year_options else [],
-                    key="quick_top10_years",
-                )
+            year_options = ["All years"] + [row[0] for row in year_rows if row[0]]
+            selected_year = st.selectbox("Year", year_options, key="quick_top10_year")
+            selected_years: tuple[int, ...] = ()
+            if selected_year != "All years":
+                selected_years = (int(selected_year),)
             limit = st.slider("Rows", 10, 5000, 500, 10, key="quick_hits_limit")
             st.markdown("**Top 10 Hits**")
-            table = build_quick_top10_hits(tuple(selected_years), limit)
+            table = build_quick_top10_hits(selected_years, limit)
             _display_df(table)
-            if include_all:
+            if selected_year == "All years":
                 st.caption("All-time list shows each song once, using its first-ever Top 10 week.")
             else:
-                st.caption("Selected year(s) list includes songs with any Top 10 weeks in those years, while keeping each song's true first-ever Top 10 week.")
+                st.caption("Selected year list includes songs with any Top 10 weeks in that year, while keeping each song's true first-ever Top 10 week.")
 
     elif subsection == "Movement":
         table_kind = st.selectbox(
