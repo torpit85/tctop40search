@@ -779,29 +779,6 @@ def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
         )
         return out
 
-    if kind == "Artists with most appearances on a single chart":
-        chart = load_analytics_base()
-        credits = build_artist_credit_rows(chart)
-        if credits.empty:
-            return pd.DataFrame(columns=["lead_artist", "appearances_on_chart", "chart_date"])
-        lead = credits.loc[credits["artist_role_mode"] == "Lead"].copy()
-        if lead.empty:
-            return pd.DataFrame(columns=["lead_artist", "appearances_on_chart", "chart_date"])
-        grouped = (
-            lead.groupby(["chart_date", "artist_key"], dropna=True)
-            .agg(
-                lead_artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
-                appearances_on_chart=("song_key", "nunique"),
-            )
-            .reset_index()
-        )
-        grouped["lead_artist"] = grouped.apply(lambda r: preferred_artist_display(r["artist_key"], r["lead_artist"]), axis=1)
-        grouped = (
-            grouped.sort_values(["appearances_on_chart", "chart_date", "lead_artist"], ascending=[False, False, True])
-            .head(limit)
-        )
-        return grouped[["lead_artist", "appearances_on_chart", "chart_date"]]
-
     conditions = {
         "#1 hits": "e.position = 1",
         "Top 10 hits": "e.position <= 10",
@@ -4558,6 +4535,193 @@ def build_quick_num1_runs_by_year() -> pd.DataFrame:
     return out.sort_values(["Year", "Consecutive weeks at #1", "Song"], ascending=[False, False, True])
 
 
+
+def _quick_number_one_artist_credits() -> pd.DataFrame:
+    """Artist-credit rows for #1 entries, including lead and featured artists."""
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+
+    date_order = (
+        chart[["chart_date", "year"]]
+        .drop_duplicates()
+        .sort_values(["year", "chart_date"])
+        .copy()
+    )
+    date_order["chart_week_number"] = date_order.groupby("year").cumcount() + 1
+
+    num1 = chart.loc[chart["position"].eq(1)].copy()
+    if num1.empty:
+        return pd.DataFrame()
+
+    num1 = num1.merge(date_order[["chart_date", "chart_week_number"]], on="chart_date", how="left")
+    credits = build_artist_credit_rows(num1)
+    if credits.empty:
+        return pd.DataFrame()
+
+    credits["year"] = pd.to_numeric(credits["year"], errors="coerce").astype("Int64")
+    credits["chart_week_number"] = pd.to_numeric(credits["chart_week_number"], errors="coerce").astype("Int64")
+    credits = credits.loc[credits["artist_key"].notna() & credits["year"].notna()].copy()
+    return credits
+
+
+def _quick_join_unique(values: pd.Series) -> str:
+    vals = [str(v).strip() for v in values.dropna().tolist() if str(v).strip()]
+    return " | ".join(dict.fromkeys(vals))
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_artist_num1_year_streaks(song_mode: str = "All #1 songs") -> pd.DataFrame:
+    """
+    Artists credited on #1 songs in two or more consecutive calendar years.
+
+    song_mode options:
+    - "Same song only": keep streaks where at least one #1 song appears in multiple years of the streak.
+    - "Different songs only": keep only streaks where every #1 song appears in exactly one year of the streak.
+    - anything else: keep all consecutive-year artist #1 streaks.
+    """
+    credits = _quick_number_one_artist_credits()
+    empty_cols = ["Rank", "Artist", "Start Year", "End Year", "Years", "Year Streak", "#1 Weeks During Streak", "#1 Songs"]
+    if credits.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    yearly = (
+        credits.groupby(["artist_key", "artist", "year"], dropna=True)
+        .agg(
+            number_one_weeks=("chart_date", "nunique"),
+            number_one_songs=("title", _quick_join_unique),
+            number_one_song_keys=("song_key", _quick_join_unique),
+            first_number_one_date=("chart_date", "min"),
+        )
+        .reset_index()
+        .sort_values(["artist_key", "year", "first_number_one_date"])
+    )
+
+    rows: list[dict[str, object]] = []
+    for (artist_key, artist), g in yearly.groupby(["artist_key", "artist"], dropna=True, sort=False):
+        g = g.sort_values("year").reset_index(drop=True)
+        run: list[pd.Series] = [g.iloc[0]]
+
+        for i in range(1, len(g)):
+            prev_year = int(run[-1]["year"])
+            cur_year = int(g.iloc[i]["year"])
+            if cur_year == prev_year + 1:
+                run.append(g.iloc[i])
+            else:
+                if len(run) >= 2 and _quick_artist_num1_year_run_matches_mode(run, song_mode):
+                    rows.append(_quick_artist_num1_year_streak_row(str(artist), run))
+                run = [g.iloc[i]]
+
+        if len(run) >= 2 and _quick_artist_num1_year_run_matches_mode(run, song_mode):
+            rows.append(_quick_artist_num1_year_streak_row(str(artist), run))
+
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["Years", "Start Year", "Artist"], ascending=[False, True, True]).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
+def _quick_song_keys_for_year_row(row: pd.Series) -> list[str]:
+    raw = str(row.get("number_one_song_keys", "") or "")
+    return [part.strip() for part in raw.split(" | ") if part.strip()]
+
+
+def _quick_artist_num1_year_run_song_counts(run_rows: list[pd.Series]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in run_rows:
+        # Count whether a song appears in a year, not how many #1 weeks it had within that year.
+        for song_key in set(_quick_song_keys_for_year_row(row)):
+            counts[song_key] = counts.get(song_key, 0) + 1
+    return counts
+
+
+def _quick_artist_num1_year_run_matches_mode(run_rows: list[pd.Series], song_mode: str) -> bool:
+    song_counts = _quick_artist_num1_year_run_song_counts(run_rows)
+    if not song_counts:
+        return False
+    if song_mode == "Same song only":
+        return any(count > 1 for count in song_counts.values())
+    if song_mode == "Different songs only":
+        return all(count == 1 for count in song_counts.values())
+    return True
+
+
+def _quick_artist_num1_year_streak_row(artist: str, run_rows: list[pd.Series]) -> dict[str, object]:
+    years = [int(r["year"]) for r in run_rows]
+    song_bits = [f"{int(r['year'])}: {r['number_one_songs']}" for r in run_rows]
+    return {
+        "Artist": artist,
+        "Start Year": min(years),
+        "End Year": max(years),
+        "Years": len(years),
+        "Year Streak": f"{min(years)}–{max(years)}",
+        "#1 Weeks During Streak": int(sum(int(r["number_one_weeks"]) for r in run_rows)),
+        "#1 Songs": "; ".join(song_bits),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def build_quick_artist_num1_same_chart_week_streaks() -> pd.DataFrame:
+    """Artists credited on #1 songs in the same sequential chart week across consecutive years."""
+    credits = _quick_number_one_artist_credits()
+    empty_cols = ["Rank", "Artist", "Chart Week #", "Start Year", "End Year", "Years", "Year Streak", "#1 Songs"]
+    if credits.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    weekly = (
+        credits.groupby(["artist_key", "artist", "year", "chart_week_number"], dropna=True)
+        .agg(
+            number_one_songs=("title", _quick_join_unique),
+            first_number_one_date=("chart_date", "min"),
+        )
+        .reset_index()
+        .sort_values(["artist_key", "chart_week_number", "year", "first_number_one_date"])
+    )
+
+    rows: list[dict[str, object]] = []
+    for (artist_key, artist, chart_week_number), g in weekly.groupby(["artist_key", "artist", "chart_week_number"], dropna=True, sort=False):
+        g = g.sort_values("year").reset_index(drop=True)
+        run: list[pd.Series] = [g.iloc[0]]
+
+        for i in range(1, len(g)):
+            prev_year = int(run[-1]["year"])
+            cur_year = int(g.iloc[i]["year"])
+            if cur_year == prev_year + 1:
+                run.append(g.iloc[i])
+            else:
+                if len(run) >= 2:
+                    rows.append(_quick_artist_num1_same_week_row(str(artist), int(chart_week_number), run))
+                run = [g.iloc[i]]
+
+        if len(run) >= 2:
+            rows.append(_quick_artist_num1_same_week_row(str(artist), int(chart_week_number), run))
+
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["Years", "Start Year", "Chart Week #", "Artist"], ascending=[False, True, True, True]).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
+def _quick_artist_num1_same_week_row(artist: str, chart_week_number: int, run_rows: list[pd.Series]) -> dict[str, object]:
+    years = [int(r["year"]) for r in run_rows]
+    song_bits = [f"{int(r['year'])}: {r['number_one_songs']}" for r in run_rows]
+    return {
+        "Artist": artist,
+        "Chart Week #": int(chart_week_number),
+        "Start Year": min(years),
+        "End Year": max(years),
+        "Years": len(years),
+        "Year Streak": f"{min(years)}–{max(years)}",
+        "#1 Songs": "; ".join(song_bits),
+    }
+
+
 @st.cache_data(show_spinner=False)
 def build_quick_artist_exclusive_top25(limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
@@ -4690,13 +4854,33 @@ def render_special_tables_tab() -> None:
             "View",
             [
                 "Artists with most Top 10 weeks",
-                "Artists with most appearances on a single chart",
+                "Artists reaching #1 in the same chart week in consecutive years",
+                "Artists with #1 hits in consecutive years",
             ],
             key="quick_artists_view",
         )
-        limit = st.slider("Rows", 10, 500, 100, 10, key="quick_artists_limit")
-        st.markdown(f"**{table_kind}**")
-        _display_df(load_special_entries(table_kind, limit))
+
+        if table_kind == "Artists with most Top 10 weeks":
+            limit = st.slider("Rows", 10, 500, 100, 10, key="quick_artists_limit")
+            st.markdown("**Artists with most Top 10 weeks**")
+            _display_df(load_special_entries(table_kind, limit))
+        elif table_kind == "Artists reaching #1 in the same chart week in consecutive years":
+            st.markdown("**Artists reaching #1 in the same chart week in consecutive years**")
+            st.caption("Uses the sequential chart-week number within each calendar year, so Chart Week #1 is the first chart published that year, Chart Week #2 is the second, and so on. Lead and featured artists both count.")
+            _display_df(build_quick_artist_num1_same_chart_week_streaks())
+        else:
+            st.markdown("**Artists with #1 hits in consecutive years**")
+            song_mode = st.radio(
+                "Song filter",
+                ["Same song only", "Different songs only"],
+                horizontal=True,
+                key="quick_artist_num1_year_song_filter",
+            )
+            if song_mode == "Same song only":
+                st.caption("Shows artist streaks where at least one credited #1 song reached #1 in multiple years of the streak. Lead and featured artists both count.")
+            else:
+                st.caption("Shows only artist streaks where every credited #1 song appears in exactly one year of the streak. If a song repeats across years, that streak is omitted. Lead and featured artists both count.")
+            _display_df(build_quick_artist_num1_year_streaks(song_mode))
 
     elif subsection == "Debuts / Re-entries":
         table_kind = st.selectbox(
