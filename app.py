@@ -1449,6 +1449,145 @@ def _forecast_direction(move: object) -> str:
     return "Hold"
 
 
+def _clip_probability(value: object) -> float:
+    try:
+        val = float(value)
+    except Exception:
+        return 0.0
+    if pd.isna(val):
+        return 0.0
+    return max(0.0, min(1.0, val))
+
+
+def _reign_inertia_bonus(current_weeks_at_1: object) -> float:
+    """Small next-week #1 hold boost. Long #1 reigns are rare, so this stays capped."""
+    weeks = _safe_int(current_weeks_at_1) or 0
+    if weeks <= 0:
+        return 0.0
+    if weeks == 1:
+        return 0.03
+    if weeks == 2:
+        return 0.07
+    if weeks == 3:
+        return 0.12
+    if weeks == 4:
+        return 0.18
+    return 0.22
+
+
+def _long_reign_rarity_penalty(current_weeks_at_1: object, long_reigns_started_this_year: int = 0) -> float:
+    """Penalty for treating 5+ week #1 reigns as normal outcomes."""
+    weeks = _safe_int(current_weeks_at_1) or 0
+    if weeks >= 5:
+        base = 0.0
+    elif weeks == 4:
+        base = 0.02
+    elif weeks == 3:
+        base = 0.06
+    elif weeks == 2:
+        base = 0.12
+    elif weeks == 1:
+        base = 0.18
+    else:
+        base = 0.0
+
+    # The DB check showed 5+ week #1 reigns are rare. If a year already has one,
+    # require a little more proof before forecasting another early-stage dynasty.
+    if long_reigns_started_this_year >= 1 and 0 < weeks < 3:
+        base += 0.05
+    return base
+
+
+def _long_reign_probability(current_weeks_at_1: object, next_week_num1_probability: object, long_reigns_started_this_year: int = 0) -> float:
+    """Approximate chance that the current #1 reaches 5+ consecutive weeks."""
+    weeks = _safe_int(current_weeks_at_1) or 0
+    if weeks <= 0:
+        return 0.0
+    if weeks >= 5:
+        return 1.0
+    hold = _clip_probability(next_week_num1_probability)
+    needed_holds = max(1, 5 - weeks)
+    raw = hold ** needed_holds
+    raw += _reign_inertia_bonus(weeks) * 0.35
+    raw -= _long_reign_rarity_penalty(weeks, long_reigns_started_this_year)
+    return _clip_probability(raw)
+
+
+def _long_reign_watch_label(current_weeks_at_1: object, long_reign_probability: object) -> str:
+    weeks = _safe_int(current_weeks_at_1) or 0
+    prob = _clip_probability(long_reign_probability)
+    if weeks >= 5:
+        return "Confirmed long reign"
+    if weeks == 4:
+        return "Strong watch"
+    if weeks == 3:
+        return "Active watch"
+    if weeks == 2 or prob >= 0.20:
+        return "Possible"
+    if weeks == 1:
+        return "Early / unlikely"
+    return "No"
+
+
+def _add_num1_reign_features(df_chart: pd.DataFrame) -> pd.DataFrame:
+    """Add current consecutive #1 streak length to each row, using available chart weeks."""
+    if df_chart.empty:
+        return df_chart
+    out = df_chart.copy()
+    out["current_num1_streak"] = 0
+    out["num1_run_start_date"] = pd.NaT
+
+    needed_cols = {"chart_date", "position", "song_key"}
+    if not needed_cols.issubset(out.columns):
+        return out
+
+    num1 = out.loc[out["position"].eq(1), ["chart_date", "song_key"]].copy().sort_values("chart_date")
+    if num1.empty:
+        return out
+
+    streak_rows: list[dict[str, object]] = []
+    prev_song = None
+    streak = 0
+    run_start = None
+    for rec in num1.to_dict("records"):
+        song_key = rec["song_key"]
+        chart_dt = rec["chart_date"]
+        if song_key == prev_song:
+            streak += 1
+        else:
+            streak = 1
+            run_start = chart_dt
+        streak_rows.append({
+            "chart_date": chart_dt,
+            "song_key": song_key,
+            "current_num1_streak": int(streak),
+            "num1_run_start_date": run_start,
+        })
+        prev_song = song_key
+
+    streak_df = pd.DataFrame(streak_rows)
+    out = out.drop(columns=["current_num1_streak", "num1_run_start_date"], errors="ignore")
+    out = out.merge(streak_df, on=["chart_date", "song_key"], how="left")
+    out["current_num1_streak"] = pd.to_numeric(out["current_num1_streak"], errors="coerce").fillna(0).astype(int)
+    return out
+
+
+def _count_prior_long_reigns_started_this_year(df_chart: pd.DataFrame, chart_date: pd.Timestamp) -> int:
+    """Count #1 runs that already reached 5+ weeks and started earlier in the same year."""
+    if df_chart.empty or "current_num1_streak" not in df_chart.columns:
+        return 0
+    chart_date = pd.to_datetime(chart_date)
+    year = chart_date.year
+    num1 = df_chart.loc[(df_chart["position"] == 1) & (df_chart["chart_date"] < chart_date)].copy()
+    if num1.empty or "num1_run_start_date" not in num1.columns:
+        return 0
+    reached = num1.loc[pd.to_numeric(num1["current_num1_streak"], errors="coerce").fillna(0) >= 5].copy()
+    if reached.empty:
+        return 0
+    starts = pd.to_datetime(reached["num1_run_start_date"], errors="coerce").dropna().drop_duplicates()
+    return int(((starts.dt.year == year) & (starts < chart_date)).sum())
+
+
 @st.cache_data(show_spinner=False)
 def build_forecast_neighbor_table(df_chart: pd.DataFrame) -> pd.DataFrame:
     """Prepare historical rows that have a known next-week outcome."""
@@ -1465,6 +1604,9 @@ def build_forecast_neighbor_table(df_chart: pd.DataFrame) -> pd.DataFrame:
     hist["next_move"] = hist["position"] - hist["next_position"]
     hist["forecast_tier"] = hist["position"].apply(_forecast_tier)
     hist["forecast_direction"] = hist["move"].apply(_forecast_direction)
+    if "current_num1_streak" not in hist.columns:
+        hist["current_num1_streak"] = 0
+    hist["current_num1_streak"] = pd.to_numeric(hist["current_num1_streak"], errors="coerce").fillna(0).astype(int)
     return hist
 
 
@@ -1479,12 +1621,17 @@ def _similar_cases_for_row(history: pd.DataFrame, row: pd.Series, max_neighbors:
     direction = _forecast_direction(row.get("move"))
     is_debut = bool(row.get("is_debut", False))
     is_reentry = bool(row.get("is_reentry", False))
+    current_num1_streak = float(row.get("current_num1_streak", 0) or 0)
 
     scored = history.copy()
+    scored_streak = pd.to_numeric(scored.get("current_num1_streak", 0), errors="coerce").fillna(0)
+    num1_streak_distance = (scored_streak - current_num1_streak).abs().clip(upper=6)
+    num1_streak_weight = 1.4 if pos == 1 else 0.0
     scored["similarity_score"] = (
         (scored["position"] - pos).abs() * 1.15
         + (scored["weeks_on_chart"].fillna(1) - weeks).abs().clip(upper=20) * 0.28
         + (scored["move_filled"].fillna(0) - move_val).abs().clip(upper=25) * 0.55
+        + (num1_streak_distance * num1_streak_weight)
         + (scored["forecast_tier"].ne(tier).astype(int) * 3.5)
         + (scored["forecast_direction"].ne(direction).astype(int) * 2.0)
         + (scored["is_debut"].ne(is_debut).astype(int) * 5.0)
@@ -1497,10 +1644,13 @@ def _forecast_for_chart_date(df_chart: pd.DataFrame, chart_date: pd.Timestamp, m
     if df_chart.empty:
         return pd.DataFrame(), pd.DataFrame()
     chart_date = pd.to_datetime(chart_date)
+    df_chart = _add_num1_reign_features(df_chart)
     current = df_chart.loc[df_chart["chart_date"] == chart_date].copy().sort_values("position")
     history = build_forecast_neighbor_table(df_chart.loc[df_chart["chart_date"] < chart_date].copy())
     if current.empty or history.empty:
         return pd.DataFrame(), pd.DataFrame()
+
+    long_reigns_started_this_year = _count_prior_long_reigns_started_this_year(df_chart, chart_date)
 
     rows: list[dict[str, object]] = []
     similar_rows: list[pd.DataFrame] = []
@@ -1529,12 +1679,21 @@ def _forecast_for_chart_date(df_chart: pd.DataFrame, chart_date: pd.Timestamp, m
             p_top5 = float((present["next_position"] <= 5).mean())
             p_num1 = float((present["next_position"] == 1).mean())
 
+        current_num1_streak = _safe_int(row.get("current_num1_streak")) or 0
+        reign_bonus = _reign_inertia_bonus(current_num1_streak)
+        rarity_penalty = _long_reign_rarity_penalty(current_num1_streak, long_reigns_started_this_year)
+        num1_hold_score = _clip_probability(p_num1 + reign_bonus - (rarity_penalty * 0.35))
+        long_reign_prob = _long_reign_probability(current_num1_streak, p_num1, long_reigns_started_this_year)
+        long_reign_watch = _long_reign_watch_label(current_num1_streak, long_reign_prob)
+
         momentum_score = (
             max(0.0, 41.0 - float(row["position"]))
             + max(0.0, float(row["move"] if pd.notna(row.get("move")) else 0.0)) * 1.7
             + p_top10 * 18.0
             + p_top5 * 12.0
             + p_num1 * 20.0
+            + reign_bonus * 40.0
+            - rarity_penalty * 12.0
             - p_dropout * 26.0
             - min(float(row.get("weeks_on_chart", 1) or 1), 40.0) * 0.18
         )
@@ -1547,6 +1706,7 @@ def _forecast_for_chart_date(df_chart: pd.DataFrame, chart_date: pd.Timestamp, m
             "last_week_position": row.get("last_week_position"),
             "move": row.get("move"),
             "weeks_on_chart": row.get("weeks_on_chart"),
+            "current_num1_streak": current_num1_streak,
             "derived_marker": row.get("derived_marker", ""),
             "similar_cases": int(len(cases)),
             "stay_probability": p_stay,
@@ -1558,6 +1718,12 @@ def _forecast_for_chart_date(df_chart: pd.DataFrame, chart_date: pd.Timestamp, m
             "top10_probability": p_top10,
             "top5_probability": p_top5,
             "num1_probability": p_num1,
+            "num1_hold_score": num1_hold_score,
+            "long_reign_probability": long_reign_prob,
+            "long_reign_watch": long_reign_watch,
+            "reign_inertia_bonus": reign_bonus,
+            "long_reign_rarity_penalty": rarity_penalty,
+            "long_reigns_started_this_year": long_reigns_started_this_year,
             "expected_next_position": exp_next_position,
             "median_next_position": median_next_position,
             "expected_next_move": avg_next_move,
@@ -1578,7 +1744,8 @@ def _forecast_for_chart_date(df_chart: pd.DataFrame, chart_date: pd.Timestamp, m
     forecast["projected_rank"] = forecast.index + 1
     forecast["forecast_note"] = ""
     forecast.loc[forecast["dropout_risk"] >= 0.55, "forecast_note"] = "High dropout risk"
-    forecast.loc[(forecast["num1_probability"] >= 0.08) | (forecast["projected_rank"] <= 3), "forecast_note"] = "#1 contender"
+    forecast.loc[(forecast["num1_hold_score"] >= 0.08) | (forecast["projected_rank"] <= 3), "forecast_note"] = "#1 contender"
+    forecast.loc[forecast["long_reign_watch"].isin(["Active watch", "Strong watch", "Confirmed long reign"]), "forecast_note"] = forecast["long_reign_watch"]
     forecast.loc[(forecast["top10_probability"] >= 0.45) & (forecast["position"] > 10), "forecast_note"] = "Top 10 watch"
     forecast.loc[(forecast["top10_probability"] < 0.45) & (forecast["position"] <= 10), "forecast_note"] = "Top 10 danger"
     return forecast.sort_values("projected_rank"), similar
@@ -1589,10 +1756,11 @@ def _format_probability_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in [
         "stay_probability", "dropout_risk", "up_probability", "down_probability", "hold_probability",
         "top20_probability", "top10_probability", "top5_probability", "num1_probability",
+        "num1_hold_score", "long_reign_probability",
     ]:
         if col in out.columns:
             out[col] = (pd.to_numeric(out[col], errors="coerce") * 100).round(1).astype(str) + "%"
-    for col in ["expected_next_position", "median_next_position", "expected_next_move", "momentum_score", "rank_error"]:
+    for col in ["expected_next_position", "median_next_position", "expected_next_move", "momentum_score", "rank_error", "reign_inertia_bonus", "long_reign_rarity_penalty"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
     return out
@@ -1631,13 +1799,17 @@ def _render_forecast_lab(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     current_rows = chart.loc[chart["chart_date"] == selected_date]
     avg_dropout = forecast["dropout_risk"].mean()
     expected_unknown_slots = int(round(forecast["dropout_risk"].sum()))
-    top_contender = forecast.sort_values(["num1_probability", "expected_next_position"], ascending=[False, True]).head(1)
+    top_contender = forecast.sort_values(["num1_hold_score", "num1_probability", "expected_next_position"], ascending=[False, False, True]).head(1)
+    long_watch = forecast.loc[forecast["long_reign_watch"].ne("No")].sort_values(
+        ["long_reign_probability", "current_num1_streak"], ascending=[False, False]
+    ).head(1)
     render_kpis([
         ("Forecast week", selected_date.strftime("%Y-%m-%d")),
         ("Songs evaluated", int(len(current_rows))),
         ("Expected unknown slots", expected_unknown_slots),
         ("Avg dropout risk", f"{avg_dropout * 100:.1f}%"),
         ("Top #1 contender", top_contender["title"].iloc[0] if not top_contender.empty else "—"),
+        ("Long-reign watch", long_watch["long_reign_watch"].iloc[0] if not long_watch.empty else "No"),
     ])
 
     st.markdown("**Projected current-song order for next week**")
@@ -1645,8 +1817,8 @@ def _render_forecast_lab(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     _display_df(
         _format_probability_columns(projection),
         [
-            "projected_rank", "title", "artist", "position", "last_week_position", "move", "weeks_on_chart",
-            "expected_next_position", "dropout_risk", "up_probability", "top10_probability", "num1_probability", "forecast_note", "similar_cases",
+            "projected_rank", "title", "artist", "position", "last_week_position", "move", "weeks_on_chart", "current_num1_streak",
+            "expected_next_position", "dropout_risk", "up_probability", "top10_probability", "num1_probability", "num1_hold_score", "long_reign_probability", "long_reign_watch", "forecast_note", "similar_cases",
         ],
     )
     st.caption(f"Expected unknown debut/re-entry/dropout replacement slots next week: about {expected_unknown_slots}. Those titles are intentionally not guessed.")
@@ -1654,10 +1826,19 @@ def _render_forecast_lab(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**#1 contenders**")
-        contenders = forecast.sort_values(["num1_probability", "top5_probability", "expected_next_position"], ascending=[False, False, True]).head(top_n)
+        contenders = forecast.sort_values(["num1_hold_score", "num1_probability", "top5_probability", "expected_next_position"], ascending=[False, False, False, True]).head(top_n)
         _display_df(
             _format_probability_columns(contenders),
-            ["title", "artist", "position", "expected_next_position", "num1_probability", "top5_probability", "momentum_score", "similar_cases"],
+            ["title", "artist", "position", "current_num1_streak", "expected_next_position", "num1_probability", "num1_hold_score", "long_reign_probability", "long_reign_watch", "top5_probability", "momentum_score", "similar_cases"],
+        )
+        st.markdown("**Long-reign watch**")
+        reign_watch = forecast.loc[forecast["current_num1_streak"] > 0].sort_values(
+            ["long_reign_probability", "current_num1_streak", "num1_hold_score"],
+            ascending=[False, False, False],
+        ).head(top_n)
+        _display_df(
+            _format_probability_columns(reign_watch),
+            ["title", "artist", "position", "current_num1_streak", "num1_probability", "num1_hold_score", "long_reign_probability", "long_reign_watch", "long_reigns_started_this_year"],
         )
         st.markdown("**Top 10 watch**")
         top10_watch = forecast.loc[(forecast["position"] > 10) | (forecast["top10_probability"] < 0.75)].sort_values("top10_probability", ascending=False).head(top_n)
