@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import sqlite3
 import re
+import math
 from pathlib import Path
 from typing import Iterable
 
@@ -4052,6 +4053,264 @@ def render_analytics_tab() -> None:
             st.altair_chart = original_altair_chart
 
 
+
+def _weekly_top_artist_scores_from_chart(df_chart: pd.DataFrame, credit_mode: str) -> pd.DataFrame:
+    """Build a normalized weekly artist leaderboard from chart rows already in memory."""
+    if df_chart.empty:
+        return pd.DataFrame()
+
+    credits = build_artist_credit_rows(df_chart)
+    if credits.empty:
+        return pd.DataFrame()
+
+    credits = credits.copy()
+    credits["position"] = pd.to_numeric(credits["position"], errors="coerce")
+    credits = credits.loc[credits["position"].between(1, 40, inclusive="both")].copy()
+    if credits.empty:
+        return pd.DataFrame()
+
+    if credit_mode == "Lead artists only":
+        credits = credits.loc[credits["artist_role_mode"] == "Lead"].copy()
+        credits["credit_multiplier"] = 1.0
+    else:
+        credits["credit_multiplier"] = credits["artist_role_mode"].map({"Lead": 1.0, "Featured": 0.5}).fillna(0.0)
+        credits = credits.loc[credits["credit_multiplier"] > 0].copy()
+
+    if credits.empty:
+        return pd.DataFrame()
+
+    credits["base_points"] = (42 - credits["position"]).map(lambda v: math.log(float(v)) if pd.notna(v) and float(v) > 0 else 0.0)
+    credits["weighted_points"] = credits["base_points"] * credits["credit_multiplier"]
+    credits["lead_song_key"] = credits["song_key"].where(credits["artist_role_mode"].eq("Lead"))
+    credits["featured_song_key"] = credits["song_key"].where(credits["artist_role_mode"].eq("Featured"))
+    credits["top10_song_key"] = credits["song_key"].where(credits["position"].le(10))
+    credits["num1_song_key"] = credits["song_key"].where(credits["position"].eq(1))
+
+    top_rows = (
+        credits.sort_values(["artist_key", "position", "weighted_points", "title"], ascending=[True, True, False, True])
+        .drop_duplicates("artist_key")
+        [["artist_key", "title", "artist", "position"]]
+        .rename(columns={"title": "top_song", "position": "top_position", "artist": "display_artist"})
+    )
+
+    grouped = credits.groupby("artist_key", dropna=True).agg(
+        raw_score=("weighted_points", "sum"),
+        songs=("song_key", "nunique"),
+        lead_songs=("lead_song_key", "nunique"),
+        featured_songs=("featured_song_key", "nunique"),
+        top_10_songs=("top10_song_key", "nunique"),
+        num1_songs=("num1_song_key", "nunique"),
+        best_position=("position", "min"),
+    ).reset_index()
+
+    out = grouped.merge(top_rows, on="artist_key", how="left")
+    out["artist"] = out.apply(lambda r: preferred_artist_display(r["artist_key"], r.get("display_artist", "")), axis=1)
+    max_raw = float(out["raw_score"].max()) if not out.empty else 0.0
+    out["score"] = (out["raw_score"] / max_raw * 100.0) if max_raw > 0 else 0.0
+    out = out.sort_values(
+        ["score", "best_position", "lead_songs", "songs", "artist"],
+        ascending=[False, True, False, False, True],
+    ).reset_index(drop=True)
+    out["rank"] = out.index + 1
+    out["score"] = out["score"].round(1)
+    out["raw_score"] = out["raw_score"].round(3)
+    return out[[
+        "rank", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs",
+        "top_song", "top_position", "top_10_songs", "num1_songs", "artist_key", "best_position",
+    ]]
+
+
+@st.cache_data(show_spinner=False)
+def build_weekly_top_artist_scores(chart_date: str, credit_mode: str) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+    selected = pd.to_datetime(chart_date)
+    week = chart.loc[chart["chart_date"].eq(selected)].copy()
+    return _weekly_top_artist_scores_from_chart(week, credit_mode)
+
+
+@st.cache_data(show_spinner=False)
+def build_weekly_top_artist_history(credit_mode: str) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+    rows: list[pd.DataFrame] = []
+    for chart_date, week in chart.groupby("chart_date", sort=True):
+        scores = _weekly_top_artist_scores_from_chart(week, credit_mode)
+        if scores.empty:
+            continue
+        scores = scores.copy()
+        scores.insert(0, "chart_date", chart_date)
+        rows.append(scores)
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
+
+
+def _weekly_artist_num1_streaks(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame()
+    winners = history.loc[history["rank"].eq(1)].copy().sort_values("chart_date")
+    if winners.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, object]] = []
+    cur_key = None
+    cur_artist = ""
+    start_date = None
+    end_date = None
+    weeks = 0
+    songs: set[str] = set()
+
+    for rec in winners.to_dict("records"):
+        artist_key = rec.get("artist_key")
+        if artist_key == cur_key:
+            weeks += 1
+            end_date = rec.get("chart_date")
+        else:
+            if cur_key is not None:
+                rows.append({
+                    "artist": cur_artist,
+                    "weeks": weeks,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "songs_during_streak": "; ".join(sorted(s for s in songs if s)),
+                })
+            cur_key = artist_key
+            cur_artist = rec.get("artist", "")
+            start_date = rec.get("chart_date")
+            end_date = rec.get("chart_date")
+            weeks = 1
+            songs = set()
+        top_song = str(rec.get("top_song", "") or "")
+        if top_song:
+            songs.add(top_song)
+
+    if cur_key is not None:
+        rows.append({
+            "artist": cur_artist,
+            "weeks": weeks,
+            "start_date": start_date,
+            "end_date": end_date,
+            "songs_during_streak": "; ".join(sorted(s for s in songs if s)),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["weeks", "end_date", "artist"], ascending=[False, False, True]).reset_index(drop=True)
+
+
+def render_weekly_top_artists_tab() -> None:
+    st.subheader("Weekly Top Artists")
+    st.caption(
+        "Artist scores use ln(42 − chart position), then normalize each chart week so that the #1 artist receives 100 points. "
+        "In weighted mode, lead artists receive full credit and featured artists receive half credit."
+    )
+
+    chart_dates = load_chart_dates()
+    if not chart_dates:
+        st.info("No chart weeks are available yet.")
+        return
+
+    sorted_dates = sorted(chart_dates)
+    controls = st.columns([1.4, 1.4, 1.0])
+    selected_date = controls[0].selectbox(
+        "Chart week",
+        sorted_dates,
+        index=len(sorted_dates) - 1,
+        key="weekly_top_artists_chart_date",
+    )
+    credit_mode = controls[1].radio(
+        "Credit mode",
+        ["Lead + featured artists, weighted", "Lead artists only"],
+        horizontal=False,
+        key="weekly_top_artists_credit_mode",
+    )
+    top_n = int(controls[2].slider("Top N rows", 5, 100, 25, 5, key="weekly_top_artists_top_n"))
+
+    weekly_scores = build_weekly_top_artist_scores(selected_date, credit_mode)
+    if weekly_scores.empty:
+        st.info("No artist-credit rows were available for that chart week.")
+        return
+
+    top_artist = weekly_scores.iloc[0]
+    runner_up = weekly_scores.iloc[1] if len(weekly_scores) > 1 else None
+    render_kpis([
+        ("Chart week", selected_date),
+        ("#1 artist", top_artist["artist"]),
+        ("#1 score", f'{float(top_artist["score"]):.1f}'),
+        ("Runner-up", runner_up["artist"] if runner_up is not None else "—"),
+        ("Artists ranked", len(weekly_scores)),
+    ])
+
+    tab_week, tab_num1s, tab_leaders, tab_streaks, tab_biggest = st.tabs([
+        "Weekly chart",
+        "Artist #1 weeks",
+        "Most artist #1s",
+        "Longest #1 streaks",
+        "Biggest artist weeks",
+    ])
+
+    display_cols = ["rank", "artist", "score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"]
+    with tab_week:
+        st.markdown("**Weekly artist chart**")
+        _display_df(weekly_scores.head(top_n), display_cols)
+        with st.expander("Show raw score details", expanded=False):
+            _display_df(weekly_scores.head(top_n), display_cols[:3] + ["raw_score"] + display_cols[3:])
+
+    history = build_weekly_top_artist_history(credit_mode)
+    if history.empty:
+        return
+
+    winners = history.loc[history["rank"].eq(1)].copy().sort_values("chart_date", ascending=False)
+    if not winners.empty:
+        winners["year"] = pd.to_datetime(winners["chart_date"]).dt.year
+
+    with tab_num1s:
+        st.markdown("**Weekly #1 artists**")
+        if winners.empty:
+            st.info("No weekly #1 artist rows are available yet.")
+        else:
+            year_options = ["All"] + [str(y) for y in sorted(winners["year"].dropna().astype(int).unique(), reverse=True)]
+            selected_year = st.selectbox(
+                "Year",
+                year_options,
+                key="weekly_top_artists_num1_year",
+            )
+            display_winners = winners.copy()
+            if selected_year != "All":
+                display_winners = display_winners.loc[display_winners["year"].eq(int(selected_year))].copy()
+            st.caption(f"Showing {len(display_winners):,} weekly #1 artist row(s). This view ignores the Top N rows slider.")
+            _display_df(display_winners, ["chart_date", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
+
+    with tab_leaders:
+        st.markdown("**Most weeks at #1 on the weekly artist chart**")
+        leaders = (
+            winners.groupby(["artist_key", "artist"], dropna=True)
+            .agg(
+                artist_num1_weeks=("chart_date", "count"),
+                first_num1_week=("chart_date", "min"),
+                last_num1_week=("chart_date", "max"),
+                best_raw_score=("raw_score", "max"),
+                max_songs=("songs", "max"),
+            )
+            .reset_index()
+            .sort_values(["artist_num1_weeks", "last_num1_week", "artist"], ascending=[False, False, True])
+        )
+        _display_df(leaders.head(top_n), ["artist", "artist_num1_weeks", "first_num1_week", "last_num1_week", "best_raw_score", "max_songs"])
+
+    with tab_streaks:
+        st.markdown("**Longest consecutive runs as the weekly #1 artist**")
+        streaks = _weekly_artist_num1_streaks(history)
+        _display_df(streaks.head(top_n), ["artist", "weeks", "start_date", "end_date", "songs_during_streak"])
+
+    with tab_biggest:
+        st.markdown("**Biggest raw artist weeks**")
+        biggest = history.sort_values(["raw_score", "score", "songs", "chart_date"], ascending=[False, False, False, False]).copy()
+        _display_df(biggest.head(top_n), ["chart_date", "rank", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
+
+
 def render_forecast_lab_tab() -> None:
     st.subheader("Forecast Lab")
     st.caption("Forward-looking chart estimates based on historical neighbors. This lives outside Analytics so the heavier forecast work only runs when you open this section.")
@@ -5150,6 +5409,7 @@ def main() -> None:
             "Artist history",
             "Quick tables",
             "Analytics",
+            "Weekly Top Artists",
             "Forecast Lab",
             "Admin",
         ],
@@ -5185,6 +5445,8 @@ def main() -> None:
         render_special_tables_tab()
     elif main_section == "Analytics":
         render_analytics_tab()
+    elif main_section == "Weekly Top Artists":
+        render_weekly_top_artists_tab()
     elif main_section == "Forecast Lab":
         render_forecast_lab_tab()
     else:
