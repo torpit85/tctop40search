@@ -843,6 +843,12 @@ def _fmt_rank(value: object) -> str:
     return f"#{iv}" if iv is not None else "—"
 
 
+def _escape_streamlit_caption_text(value: object) -> str:
+    """Escape markdown/KaTeX trigger characters in short Streamlit captions."""
+    text = "" if value is None else str(value)
+    return text.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
+
+
 @st.cache_data(show_spinner=False)
 def load_analytics_base() -> pd.DataFrame:
     conn = get_connection()
@@ -4421,10 +4427,13 @@ def render_song_history_tab() -> None:
                 c2.metric("Chart weeks", int(stats["chart_weeks"]))
                 c3.metric("First week", stats["first_date"])
                 c4.metric("Last week", stats["last_date"])
+                full_credit = _escape_streamlit_caption_text(stats['artist'])
+                lead_credit = _escape_streamlit_caption_text(stats['lead_artist'])
+                featured_credit = _escape_streamlit_caption_text(stats['featured_artist'] or '—')
                 st.caption(
-                    f"Canonical full credit: {stats['artist']} | "
-                    f"Lead: {stats['lead_artist']} | "
-                    f"Featured: {stats['featured_artist'] or '—'} | "
+                    f"Canonical full credit: {full_credit} | "
+                    f"Lead: {lead_credit} | "
+                    f"Featured: {featured_credit} | "
                     f"Alias variants: {int(stats['alias_count'])}"
                 )
                 chart_df = history.set_index("chart_date")["position"].sort_index()
