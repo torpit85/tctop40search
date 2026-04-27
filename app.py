@@ -10,6 +10,12 @@ from typing import Iterable
 import pandas as pd
 import streamlit as st
 
+# Keep Streamlit Community Cloud from retaining too many large pandas objects.
+# The app can always recompute these from SQLite, so bounded caches are safer than
+# unlimited in-memory caches for long-running/mobile sessions.
+CACHE_TTL_SECONDS = 60 * 60
+CACHE_MAX_ENTRIES = 24
+
 def _fold_quotes(text: str) -> str:
     text = (text or "")
     return (
@@ -48,7 +54,7 @@ PREFERRED_ARTIST_DISPLAY = {
 }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_artist_key_override_map() -> dict[str, str]:
     if not Path(DB_PATH).exists():
         return {}
@@ -65,7 +71,7 @@ def load_artist_key_override_map() -> dict[str, str]:
         conn.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_artist_display_override_map() -> dict[str, str]:
     if not Path(DB_PATH).exists():
         return {}
@@ -277,7 +283,7 @@ entry_stats AS (
 """
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_chart_dates() -> list[str]:
     conn = get_connection()
     rows = conn.execute(
@@ -298,7 +304,7 @@ def nearest_chart_date(selected_date: str, available_dates: list[str]) -> tuple[
     return ordered[0], True
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_overview() -> dict[str, object]:
     conn = get_connection()
     min_date, max_date, weeks = conn.execute(
@@ -332,7 +338,7 @@ def load_overview() -> dict[str, object]:
     }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def marker_counts() -> dict[str, int]:
     conn = get_connection()
     row = conn.execute(
@@ -351,7 +357,7 @@ def marker_counts() -> dict[str, int]:
     }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
     conn = get_connection()
     where_sql = "WHERE entry_fts MATCH ?"
@@ -391,7 +397,7 @@ def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]:
     conn = get_connection()
 
@@ -485,7 +491,7 @@ def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def canonical_song_matches(term: str, limit: int = 100) -> pd.DataFrame:
     conn = get_connection()
     like = f"%{term.strip().lower()}%"
@@ -546,7 +552,7 @@ def canonical_song_matches(term: str, limit: int = 100) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[str, object] | None, pd.DataFrame]:
     conn = get_connection()
     stats_row = conn.execute(
@@ -619,7 +625,7 @@ def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[s
     )
     return history, dict(stats_row), aliases
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def artist_matches(term: str, role_mode: str, limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
@@ -664,7 +670,7 @@ def artist_matches(term: str, role_mode: str, limit: int = 100) -> pd.DataFrame:
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame, dict[str, object] | None, pd.DataFrame]:
     chart = load_analytics_base()
     if chart.empty:
@@ -725,7 +731,7 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
     conn = get_connection()
 
@@ -850,7 +856,7 @@ def _escape_streamlit_caption_text(value: object) -> str:
     return text.replace("\\", "\\\\").replace("$", "\\$").replace("`", "\\`")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_analytics_base() -> pd.DataFrame:
     conn = get_connection()
     sql = ENTRY_STATS_CTE + """
@@ -975,7 +981,7 @@ def _split_credit_people(norm_value: object, display_value: object) -> list[tupl
     return pairs
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_artist_credit_rows(df_chart: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty:
         return pd.DataFrame()
@@ -1018,7 +1024,7 @@ def build_artist_credit_rows(df_chart: pd.DataFrame) -> pd.DataFrame:
     return credits
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_weekly_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty:
         return pd.DataFrame()
@@ -1089,7 +1095,7 @@ def _longest_presence_run(chart_dates: pd.Series, ordered_dates: list[pd.Timesta
     return max(best, cur)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_song_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty:
         return pd.DataFrame()
@@ -1139,7 +1145,7 @@ def build_song_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_artist_weekly_presence(df_artist_credits: pd.DataFrame) -> pd.DataFrame:
     if df_artist_credits.empty:
         return pd.DataFrame()
@@ -1163,7 +1169,7 @@ def build_artist_weekly_presence(df_artist_credits: pd.DataFrame) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame, df_artist_presence: pd.DataFrame) -> pd.DataFrame:
     if df_artist_credits.empty:
         return pd.DataFrame()
@@ -1240,7 +1246,7 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
         (pd.to_datetime(out["last_chart_date"]) - pd.to_datetime(out["first_chart_date"])) / pd.Timedelta(days=7)
     ).fillna(0).round().astype(int) + 1
     return out
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_yearly_summary(df_chart: pd.DataFrame, df_weekly: pd.DataFrame, df_song: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty or df_weekly.empty:
         return pd.DataFrame()
@@ -1286,7 +1292,7 @@ def build_yearly_summary(df_chart: pd.DataFrame, df_weekly: pd.DataFrame, df_son
     return out.sort_values("year")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_analytics_package() -> dict[str, pd.DataFrame]:
     chart = load_analytics_base()
     weekly = build_weekly_summary(chart)
@@ -1335,7 +1341,7 @@ def _apply_analytics_filters(pkg: dict[str, pd.DataFrame], start_date: dt.date, 
     }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_analytics_date_bounds() -> tuple[dt.date | None, dt.date | None]:
     conn = get_connection()
     row = conn.execute("SELECT MIN(chart_date) AS min_date, MAX(chart_date) AS max_date FROM chart_week").fetchone()
@@ -1344,7 +1350,7 @@ def load_analytics_date_bounds() -> tuple[dt.date | None, dt.date | None]:
     return dt.date.fromisoformat(str(row[0])), dt.date.fromisoformat(str(row[1]))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def _analytics_filtered_chart(start_date: dt.date, end_date: dt.date, include_reentries: bool) -> pd.DataFrame:
     chart = load_analytics_base().copy()
     if chart.empty:
@@ -1356,7 +1362,7 @@ def _analytics_filtered_chart(start_date: dt.date, end_date: dt.date, include_re
     return chart
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def _analytics_pkg_for_section(section: str, start_date: dt.date, end_date: dt.date, include_reentries: bool, min_weeks_on_chart: int) -> dict[str, pd.DataFrame]:
     chart = _analytics_filtered_chart(start_date, end_date, include_reentries)
     empty = pd.DataFrame()
@@ -1595,7 +1601,7 @@ def _count_prior_long_reigns_started_this_year(df_chart: pd.DataFrame, chart_dat
     return int(((starts.dt.year == year) & (starts < chart_date)).sum())
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_forecast_neighbor_table(df_chart: pd.DataFrame) -> pd.DataFrame:
     """Prepare historical rows that have a known next-week outcome."""
     if df_chart.empty:
@@ -2245,7 +2251,7 @@ def _admin_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def _admin_table_columns(table_name: str) -> list[str]:
     conn = get_connection()
     if not _admin_table_exists(conn, table_name):
@@ -2263,7 +2269,7 @@ def _reset_app_caches() -> None:
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_song_options() -> pd.DataFrame:
     conn = get_connection()
     if not _admin_table_exists(conn, "canonical_song"):
@@ -2290,7 +2296,7 @@ def admin_song_options() -> pd.DataFrame:
         conn,
     )
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_song_aliases(canonical_song_id: int) -> pd.DataFrame:
     conn = get_connection()
     if not _admin_table_exists(conn, "song_alias"):
@@ -2314,7 +2320,7 @@ def admin_song_aliases(canonical_song_id: int) -> pd.DataFrame:
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_song_artist_credit_defaults(canonical_song_id: int) -> dict[str, str]:
     conn = get_connection()
     out = {
@@ -2368,7 +2374,7 @@ def admin_song_artist_credit_defaults(canonical_song_id: int) -> dict[str, str]:
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_song_artist_credit_summary(canonical_song_id: int) -> pd.DataFrame:
     conn = get_connection()
     if not _admin_table_exists(conn, "entry"):
@@ -2393,7 +2399,7 @@ def admin_song_artist_credit_summary(canonical_song_id: int) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_song_title_summary(canonical_song_id: int) -> pd.DataFrame:
     conn = get_connection()
     if not _admin_table_exists(conn, "entry"):
@@ -3221,7 +3227,7 @@ def admin_merge_canonical_songs(source_canonical_song_id: int, target_canonical_
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_entries_for_canonical_song(canonical_song_id: int) -> pd.DataFrame:
     conn = get_connection()
     if not _admin_table_exists(conn, "entry"):
@@ -3467,7 +3473,7 @@ def admin_delete_artist_key_override(source_artist_key: str) -> tuple[bool, str]
         conn.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_artist_key_override_rows() -> pd.DataFrame:
     if not Path(DB_PATH).exists():
         return pd.DataFrame(columns=["source_artist_key", "target_artist_key", "preferred_display", "updated_at"])
@@ -3484,7 +3490,7 @@ def admin_artist_key_override_rows() -> pd.DataFrame:
         conn.close()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_artist_alias_audit() -> pd.DataFrame:
     chart = load_analytics_base()
     credits = build_artist_credit_rows(chart)
@@ -3514,7 +3520,7 @@ def admin_artist_alias_audit() -> pd.DataFrame:
     return out.sort_values(["raw_artist_variants", "lead_weeks", "display_artist"], ascending=[False, False, True])
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_artist_variants_for_key(artist_key: str) -> pd.DataFrame:
     chart = load_analytics_base()
     credits = build_artist_credit_rows(chart)
@@ -3537,7 +3543,7 @@ def admin_artist_variants_for_key(artist_key: str) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_db_stats() -> dict[str, object]:
     conn = get_connection()
 
@@ -3561,7 +3567,7 @@ def admin_db_stats() -> dict[str, object]:
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_known_anomalies() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -3576,7 +3582,7 @@ def admin_known_anomalies() -> pd.DataFrame:
         ]
     )
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def admin_data_quality_checks() -> dict[str, pd.DataFrame]:
     conn = get_connection()
     checks: dict[str, pd.DataFrame] = {}
@@ -4120,7 +4126,7 @@ def _weekly_top_artist_scores_from_chart(df_chart: pd.DataFrame, credit_mode: st
     ]]
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_weekly_top_artist_scores(chart_date: str, credit_mode: str) -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
@@ -4130,7 +4136,7 @@ def build_weekly_top_artist_scores(chart_date: str, credit_mode: str) -> pd.Data
     return _weekly_top_artist_scores_from_chart(week, credit_mode)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_weekly_top_artist_history(credit_mode: str) -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
@@ -4229,6 +4235,18 @@ def render_weekly_top_artists_tab() -> None:
     )
     top_n = int(controls[2].slider("Top N rows", 5, 100, 25, 5, key="weekly_top_artists_top_n"))
 
+    view = st.selectbox(
+        "Weekly Top Artists view",
+        [
+            "Weekly chart",
+            "Artist #1 weeks",
+            "Most artist #1s",
+            "Longest #1 streaks",
+            "Biggest artist weeks",
+        ],
+        key="weekly_top_artists_view",
+    )
+
     weekly_scores = build_weekly_top_artist_scores(selected_date, credit_mode)
     if weekly_scores.empty:
         st.info("No artist-credit rows were available for that chart week.")
@@ -4244,30 +4262,28 @@ def render_weekly_top_artists_tab() -> None:
         ("Artists ranked", len(weekly_scores)),
     ])
 
-    tab_week, tab_num1s, tab_leaders, tab_streaks, tab_biggest = st.tabs([
-        "Weekly chart",
-        "Artist #1 weeks",
-        "Most artist #1s",
-        "Longest #1 streaks",
-        "Biggest artist weeks",
-    ])
-
     display_cols = ["rank", "artist", "score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"]
-    with tab_week:
+
+    if view == "Weekly chart":
         st.markdown("**Weekly artist chart**")
         _display_df(weekly_scores.head(top_n), display_cols)
         with st.expander("Show raw score details", expanded=False):
             _display_df(weekly_scores.head(top_n), display_cols[:3] + ["raw_score"] + display_cols[3:])
+        return
 
+    # The all-time artist-history table is the heaviest part of this section, so
+    # build it only for views that actually need it. This avoids the old st.tabs
+    # behavior where every tab's content could execute during a rerun.
     history = build_weekly_top_artist_history(credit_mode)
     if history.empty:
+        st.info("No weekly artist history rows are available yet.")
         return
 
     winners = history.loc[history["rank"].eq(1)].copy().sort_values("chart_date", ascending=False)
     if not winners.empty:
         winners["year"] = pd.to_datetime(winners["chart_date"]).dt.year
 
-    with tab_num1s:
+    if view == "Artist #1 weeks":
         st.markdown("**Weekly #1 artists**")
         if winners.empty:
             st.info("No weekly #1 artist rows are available yet.")
@@ -4283,9 +4299,13 @@ def render_weekly_top_artists_tab() -> None:
                 display_winners = display_winners.loc[display_winners["year"].eq(int(selected_year))].copy()
             st.caption(f"Showing {len(display_winners):,} weekly #1 artist row(s). This view ignores the Top N rows slider.")
             _display_df(display_winners, ["chart_date", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
+        return
 
-    with tab_leaders:
+    if view == "Most artist #1s":
         st.markdown("**Most weeks at #1 on the weekly artist chart**")
+        if winners.empty:
+            st.info("No weekly #1 artist rows are available yet.")
+            return
         leaders = (
             winners.groupby(["artist_key", "artist"], dropna=True)
             .agg(
@@ -4299,17 +4319,17 @@ def render_weekly_top_artists_tab() -> None:
             .sort_values(["artist_num1_weeks", "last_num1_week", "artist"], ascending=[False, False, True])
         )
         _display_df(leaders.head(top_n), ["artist", "artist_num1_weeks", "first_num1_week", "last_num1_week", "best_raw_score", "max_songs"])
+        return
 
-    with tab_streaks:
+    if view == "Longest #1 streaks":
         st.markdown("**Longest consecutive runs as the weekly #1 artist**")
         streaks = _weekly_artist_num1_streaks(history)
         _display_df(streaks.head(top_n), ["artist", "weeks", "start_date", "end_date", "songs_during_streak"])
+        return
 
-    with tab_biggest:
-        st.markdown("**Biggest raw artist weeks**")
-        biggest = history.sort_values(["raw_score", "score", "songs", "chart_date"], ascending=[False, False, False, False]).copy()
-        _display_df(biggest.head(top_n), ["chart_date", "rank", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
-
+    st.markdown("**Biggest raw artist weeks**")
+    biggest = history.sort_values(["raw_score", "score", "songs", "chart_date"], ascending=[False, False, False, False]).copy()
+    _display_df(biggest.head(top_n), ["chart_date", "rank", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
 
 def render_forecast_lab_tab() -> None:
     st.subheader("Forecast Lab")
@@ -4738,7 +4758,7 @@ def render_artist_history_tab() -> None:
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_num1_gains(limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
@@ -4764,7 +4784,7 @@ def build_quick_num1_gains(limit: int = 100) -> pd.DataFrame:
     })
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_num1_falls(limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
@@ -4790,7 +4810,7 @@ def build_quick_num1_falls(limit: int = 100) -> pd.DataFrame:
     })
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_from_position_to_num1(start_position: int, limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
@@ -4810,7 +4830,7 @@ def build_quick_from_position_to_num1(start_position: int, limit: int = 100) -> 
     })
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_debut_position_to_num1(start_position: int, limit: int = 100) -> pd.DataFrame:
     songs = build_song_summary(load_analytics_base())
     if songs.empty:
@@ -4831,7 +4851,7 @@ def build_quick_debut_position_to_num1(start_position: int, limit: int = 100) ->
         "total_chart_weeks": "Chart weeks",
     })
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_top10_hits(selected_years: tuple[int, ...] | tuple() = (), limit: int = 1000000) -> pd.DataFrame:
     songs = build_song_summary(load_analytics_base())
     if songs.empty:
@@ -4912,7 +4932,7 @@ def _consecutive_run_len(dates: list[pd.Timestamp], ordered_dates: list[pd.Times
     return max(best, cur)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_num1_runs_by_year() -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
@@ -5019,7 +5039,7 @@ def _quick_join_unique(values: pd.Series) -> str:
     return " | ".join(dict.fromkeys(vals))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_artist_num1_year_streaks(song_mode: str = "All #1 songs") -> pd.DataFrame:
     """
     Artists credited on #1 songs in two or more consecutive calendar years.
@@ -5112,7 +5132,7 @@ def _quick_artist_num1_year_streak_row(artist: str, run_rows: list[pd.Series]) -
     }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_artist_num1_same_chart_week_streaks() -> pd.DataFrame:
     """Artists credited on #1 songs in the same sequential chart week across consecutive years."""
     credits = _quick_number_one_artist_credits()
@@ -5171,7 +5191,7 @@ def _quick_artist_num1_same_week_row(artist: str, chart_week_number: int, run_ro
     }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_artist_exclusive_top25(limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
     if chart.empty:
