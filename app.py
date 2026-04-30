@@ -5191,6 +5191,135 @@ def _quick_artist_num1_same_week_row(artist: str, chart_week_number: int, run_ro
     }
 
 
+def _quick_mode_value(values: pd.Series) -> str:
+    vals = [str(v).strip() for v in values.dropna().tolist() if str(v).strip()]
+    if not vals:
+        return ""
+    return pd.Series(vals).mode().iloc[0]
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_quick_artist_num1_droughts(
+    credit_mode: str = "Lead + featured artists",
+    song_mode: str = "Different songs only",
+    min_drought_weeks: int = 52,
+    limit: int = 100,
+) -> pd.DataFrame:
+    """Longest gaps between #1 appearances by artist-credit row."""
+    empty_cols = [
+        "Rank",
+        "Artist",
+        "Drought weeks",
+        "Approx. years",
+        "From #1 song",
+        "From week",
+        "To #1 song",
+        "To week",
+        "Credit type",
+    ]
+    credits = _quick_number_one_artist_credits()
+    if credits.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    if credit_mode == "Lead artists only":
+        credits = credits.loc[credits["artist_role_mode"].eq("Lead")].copy()
+    if credits.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    credits = credits.loc[credits["artist_key"].notna() & credits["chart_date"].notna() & credits["song_key"].notna()].copy()
+    if credits.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    credits["chart_date"] = pd.to_datetime(credits["chart_date"])
+    all_chart_dates = sorted(load_analytics_base()["chart_date"].dropna().unique())
+    date_index = {d: i for i, d in enumerate(all_chart_dates)}
+    credits["chart_index"] = credits["chart_date"].map(date_index)
+    credits = credits.loc[credits["chart_index"].notna()].copy()
+    if credits.empty:
+        return pd.DataFrame(columns=empty_cols)
+    credits["chart_index"] = credits["chart_index"].astype(int)
+
+    appearances = (
+        credits.groupby(["artist_key", "chart_date", "chart_index", "song_key"], dropna=True)
+        .agg(
+            Artist=("artist", _quick_mode_value),
+            Song=("title", _quick_mode_value),
+            Roles=("artist_role_mode", _quick_join_unique),
+        )
+        .reset_index()
+        .sort_values(["artist_key", "chart_index", "Song"])
+    )
+
+    rows: list[dict[str, object]] = []
+    for artist_key, g in appearances.groupby("artist_key", dropna=True, sort=False):
+        g = g.sort_values(["chart_index", "Song"]).reset_index(drop=True)
+        if g.empty:
+            continue
+
+        first = g.iloc[0].to_dict()
+        cur_run = {
+            "artist": preferred_artist_display(artist_key, first.get("Artist", "")),
+            "song_key": first.get("song_key"),
+            "song": first.get("Song", ""),
+            "start_date": first.get("chart_date"),
+            "end_date": first.get("chart_date"),
+            "start_index": int(first.get("chart_index")),
+            "end_index": int(first.get("chart_index")),
+            "start_roles": first.get("Roles", ""),
+            "end_roles": first.get("Roles", ""),
+        }
+        runs: list[dict[str, object]] = []
+
+        for i in range(1, len(g)):
+            rec = g.iloc[i].to_dict()
+            rec_idx = int(rec.get("chart_index"))
+            rec_song_key = rec.get("song_key")
+            # Consecutive weeks at #1 by the same song/artist are one reign.
+            if rec_song_key == cur_run["song_key"] and rec_idx == cur_run["end_index"] + 1:
+                cur_run["end_date"] = rec.get("chart_date")
+                cur_run["end_index"] = rec_idx
+                cur_run["end_roles"] = rec.get("Roles", cur_run["end_roles"])
+            else:
+                runs.append(cur_run)
+                cur_run = {
+                    "artist": preferred_artist_display(artist_key, rec.get("Artist", "")),
+                    "song_key": rec_song_key,
+                    "song": rec.get("Song", ""),
+                    "start_date": rec.get("chart_date"),
+                    "end_date": rec.get("chart_date"),
+                    "start_index": rec_idx,
+                    "end_index": rec_idx,
+                    "start_roles": rec.get("Roles", ""),
+                    "end_roles": rec.get("Roles", ""),
+                }
+        runs.append(cur_run)
+
+        for prev_run, next_run in zip(runs, runs[1:]):
+            if song_mode == "Different songs only" and prev_run["song_key"] == next_run["song_key"]:
+                continue
+            drought_weeks = int(next_run["start_index"] - prev_run["end_index"])
+            if drought_weeks < int(min_drought_weeks):
+                continue
+            rows.append({
+                "Artist": prev_run["artist"],
+                "Drought weeks": drought_weeks,
+                "Approx. years": round(drought_weeks / 52.0, 1),
+                "From #1 song": prev_run["song"],
+                "From week": pd.to_datetime(prev_run["end_date"]).strftime("%Y-%m-%d"),
+                "To #1 song": next_run["song"],
+                "To week": pd.to_datetime(next_run["start_date"]).strftime("%Y-%m-%d"),
+                "Credit type": f"{prev_run['end_roles']} → {next_run['start_roles']}",
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values(["Drought weeks", "To week", "Artist"], ascending=[False, False, True]).head(int(limit)).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    return out
+
+
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_artist_exclusive_top25(limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
@@ -5325,6 +5454,7 @@ def render_special_tables_tab() -> None:
                 "Artists with most Top 10 weeks",
                 "Artists reaching #1 in the same chart week in consecutive years",
                 "Artists with #1 hits in consecutive years",
+                "Longest #1 droughts",
             ],
             key="quick_artists_view",
         )
@@ -5337,7 +5467,7 @@ def render_special_tables_tab() -> None:
             st.markdown("**Artists reaching #1 in the same chart week in consecutive years**")
             st.caption("Uses the sequential chart-week number within each calendar year, so Chart Week #1 is the first chart published that year, Chart Week #2 is the second, and so on. Lead and featured artists both count.")
             _display_df(build_quick_artist_num1_same_chart_week_streaks())
-        else:
+        elif table_kind == "Artists with #1 hits in consecutive years":
             st.markdown("**Artists with #1 hits in consecutive years**")
             song_mode = st.radio(
                 "Song filter",
@@ -5350,6 +5480,31 @@ def render_special_tables_tab() -> None:
             else:
                 st.caption("Shows only artist streaks where every credited #1 song appears in exactly one year of the streak. If a song repeats across years, that streak is omitted. Lead and featured artists both count.")
             _display_df(build_quick_artist_num1_year_streaks(song_mode))
+        else:
+            st.markdown("**Longest #1 droughts**")
+            st.caption("Droughts are measured in available chart weeks between #1 appearances. Consecutive weeks at #1 by the same song/artist are treated as one reign, so the drought starts after the final week of that reign.")
+            drought_cols = st.columns(4)
+            credit_mode = drought_cols[0].radio(
+                "Credit mode",
+                ["Lead + featured artists", "Lead artists only"],
+                horizontal=False,
+                key="quick_artist_num1_drought_credit_mode",
+            )
+            song_mode = drought_cols[1].radio(
+                "Song filter",
+                ["Different songs only", "Any #1 return"],
+                horizontal=False,
+                key="quick_artist_num1_drought_song_mode",
+            )
+            drought_week_options = [52] + list(range(55, 501, 5))
+            min_drought_weeks = drought_cols[2].select_slider(
+                "Minimum drought length",
+                options=drought_week_options,
+                value=52,
+                key="quick_artist_num1_drought_min_weeks",
+            )
+            limit = drought_cols[3].slider("Rows", 10, 500, 100, 10, key="quick_artist_num1_drought_limit")
+            _display_df(build_quick_artist_num1_droughts(credit_mode, song_mode, min_drought_weeks, limit))
 
     elif subsection == "Debuts / Re-entries":
         table_kind = st.selectbox(
