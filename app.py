@@ -4257,18 +4257,18 @@ def render_weekly_top_artists_tab() -> None:
     render_kpis([
         ("Chart week", selected_date),
         ("#1 artist", top_artist["artist"]),
-        ("#1 score", f'{float(top_artist["score"]):.1f}'),
+        ("#1 raw score", f'{float(top_artist["raw_score"]):.3f}'),
         ("Runner-up", runner_up["artist"] if runner_up is not None else "—"),
         ("Artists ranked", len(weekly_scores)),
     ])
 
-    display_cols = ["rank", "artist", "score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"]
+    display_cols = ["rank", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"]
 
     if view == "Weekly chart":
         st.markdown("**Weekly artist chart**")
         _display_df(weekly_scores.head(top_n), display_cols)
         with st.expander("Show raw score details", expanded=False):
-            _display_df(weekly_scores.head(top_n), display_cols[:3] + ["raw_score"] + display_cols[3:])
+            _display_df(weekly_scores.head(top_n), display_cols)
         return
 
     # The all-time artist-history table is the heaviest part of this section, so
@@ -4297,8 +4297,9 @@ def render_weekly_top_artists_tab() -> None:
             display_winners = winners.copy()
             if selected_year != "All":
                 display_winners = display_winners.loc[display_winners["year"].eq(int(selected_year))].copy()
+                display_winners = display_winners.sort_values(["chart_date", "artist"], ascending=[True, True])
             st.caption(f"Showing {len(display_winners):,} weekly #1 artist row(s). This view ignores the Top N rows slider.")
-            _display_df(display_winners, ["chart_date", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
+            _display_df(display_winners, ["chart_date", "artist", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
         return
 
     if view == "Most artist #1s":
@@ -4872,8 +4873,9 @@ def build_quick_top10_hits(selected_years: tuple[int, ...] | tuple() = (), limit
         .reset_index()
         .rename(columns={"chart_date": "first_top10_week"})
     )
+    top10_rows = top10_rows.assign(top10_year=pd.to_datetime(top10_rows["chart_date"]).dt.year)
     top10_by_year = (
-        top10_rows.assign(top10_year=pd.to_datetime(top10_rows["chart_date"]).dt.year)
+        top10_rows
         .groupby(["song_key", "top10_year"], dropna=False)
         .size()
         .reset_index(name="top10_weeks_in_selected_years")
@@ -4882,18 +4884,26 @@ def build_quick_top10_hits(selected_years: tuple[int, ...] | tuple() = (), limit
     out = songs.merge(first_top10, on="song_key", how="left")
     if selected_years:
         yrs = sorted({int(y) for y in selected_years})
-        eligible_keys = set(top10_by_year.loc[top10_by_year["top10_year"].isin(yrs), "song_key"].tolist())
+        selected_top10_rows = top10_rows.loc[top10_rows["top10_year"].isin(yrs)].copy()
+        eligible_keys = set(selected_top10_rows["song_key"].tolist())
         out = out.loc[out["song_key"].isin(eligible_keys)].copy()
-        if out.empty:
+        if out.empty or selected_top10_rows.empty:
             return pd.DataFrame(columns=["First Top 10 Week", "Song", "Artist", "Weeks in Top 10 in Selected Year(s)", "Weeks in Top 10", "Peak"])
-        yr_counts = (
-            top10_by_year.loc[top10_by_year["top10_year"].isin(yrs)]
-            .groupby("song_key", dropna=False)["top10_weeks_in_selected_years"]
-            .sum()
+        first_top10_selected = (
+            selected_top10_rows.groupby("song_key", dropna=False)["chart_date"]
+            .min()
             .reset_index()
+            .rename(columns={"chart_date": "first_top10_week_selected"})
         )
+        yr_counts = (
+            selected_top10_rows.groupby("song_key", dropna=False)
+            .size()
+            .reset_index(name="top10_weeks_in_selected_years")
+        )
+        out = out.merge(first_top10_selected, on="song_key", how="left")
         out = out.merge(yr_counts, on="song_key", how="left")
-        out = out.sort_values(["first_top10_week", "title", "artist"], ascending=[False, True, True]).head(limit)
+        out["first_top10_week"] = out["first_top10_week_selected"]
+        out = out.sort_values(["first_top10_week", "title", "artist"], ascending=[True, True, True]).head(limit)
         out = out.rename(columns={
             "first_top10_week": "First Top 10 Week",
             "title": "Song",
@@ -5416,6 +5426,7 @@ def render_special_tables_tab() -> None:
             table = load_special_entries(table_kind, 1000000)
             if selected_year != "All years" and not table.empty and "chart_date" in table.columns:
                 table = table.loc[table["chart_date"].astype(str).str.startswith(selected_year)].copy()
+                table = table.sort_values(["chart_date", "position", "song"], ascending=[True, True, True])
             st.markdown("**#1 Hits**")
             _display_df(table)
         else:
@@ -5435,7 +5446,7 @@ def render_special_tables_tab() -> None:
             if selected_year == "All years":
                 st.caption("All-time list shows each song once, using its first-ever Top 10 week.")
             else:
-                st.caption("Selected year list includes songs with any Top 10 weeks in that year, while keeping each song's true first-ever Top 10 week.")
+                st.caption("Selected year list includes each song's first Top 10 appearance within that selected year, even if the song first reached the Top 10 in an earlier year.")
 
     elif subsection == "Movement":
         table_kind = st.selectbox(
