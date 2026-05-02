@@ -1779,6 +1779,206 @@ def _format_probability_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_lastfm_forecast_weeks() -> pd.DataFrame:
+    """Chart weeks that have imported Last.fm play data."""
+    conn = get_connection()
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "lastfm_weekly_track_play" not in tables:
+        return pd.DataFrame(columns=["chart_week_id", "chart_date", "period_from_local", "period_to_local", "lastfm_tracks", "matched_tracks", "total_plays"])
+
+    sql = """
+        SELECT
+            cw.chart_week_id,
+            cw.chart_date,
+            MIN(l.period_from_local) AS period_from_local,
+            MAX(l.period_to_local) AS period_to_local,
+            COUNT(*) AS lastfm_tracks,
+            SUM(CASE WHEN l.canonical_song_id IS NOT NULL THEN 1 ELSE 0 END) AS matched_tracks,
+            SUM(COALESCE(l.playcount, 0)) AS total_plays
+        FROM lastfm_weekly_track_play l
+        JOIN chart_week cw ON cw.chart_week_id = l.chart_week_id
+        GROUP BY cw.chart_week_id, cw.chart_date
+        ORDER BY cw.chart_date DESC
+    """
+    return pd.read_sql_query(sql, conn)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_lastfm_forecast_signals(chart_week_id: int) -> pd.DataFrame:
+    """Matched chart songs with imported Last.fm play-rank pressure for one chart week."""
+    conn = get_connection()
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "lastfm_weekly_track_play" not in tables:
+        return pd.DataFrame()
+
+    sql = """
+        SELECT
+            e.position AS chart_rank,
+            l.lastfm_rank,
+            e.song_title_display AS song,
+            e.full_artist_display AS artist,
+            l.playcount AS plays,
+            (e.position - l.lastfm_rank) AS play_pressure,
+            l.lastfm_track_name,
+            l.lastfm_artist_name,
+            e.canonical_song_id
+        FROM entry e
+        JOIN lastfm_weekly_track_play l
+          ON l.chart_week_id = e.chart_week_id
+         AND l.canonical_song_id = e.canonical_song_id
+        WHERE e.chart_week_id = ?
+        ORDER BY e.position
+    """
+    df = pd.read_sql_query(sql, conn, params=(chart_week_id,))
+    if df.empty:
+        return df
+    df["chart_rank"] = pd.to_numeric(df["chart_rank"], errors="coerce")
+    df["lastfm_rank"] = pd.to_numeric(df["lastfm_rank"], errors="coerce")
+    df["plays"] = pd.to_numeric(df["plays"], errors="coerce").fillna(0).astype(int)
+    df["play_pressure"] = pd.to_numeric(df["play_pressure"], errors="coerce")
+    total_plays = float(df["plays"].sum())
+    df["matched_play_share"] = (df["plays"] / total_plays) if total_plays > 0 else 0.0
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_lastfm_off_chart_watch(chart_week_id: int) -> pd.DataFrame:
+    """Imported Last.fm rows that are not currently matched to a song on the selected chart week."""
+    conn = get_connection()
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "lastfm_weekly_track_play" not in tables:
+        return pd.DataFrame()
+
+    sql = """
+        SELECT
+            l.lastfm_rank,
+            l.lastfm_track_name AS song,
+            l.lastfm_artist_name AS artist,
+            l.playcount AS plays,
+            l.canonical_song_id
+        FROM lastfm_weekly_track_play l
+        LEFT JOIN entry e
+          ON e.chart_week_id = l.chart_week_id
+         AND e.canonical_song_id = l.canonical_song_id
+        WHERE l.chart_week_id = ?
+          AND e.entry_id IS NULL
+        ORDER BY l.lastfm_rank
+    """
+    df = pd.read_sql_query(sql, conn, params=(chart_week_id,))
+    if df.empty:
+        return df
+    df["lastfm_rank"] = pd.to_numeric(df["lastfm_rank"], errors="coerce")
+    df["plays"] = pd.to_numeric(df["plays"], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+def _format_lastfm_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "matched_play_share" in out.columns:
+        out["matched_play_share"] = (pd.to_numeric(out["matched_play_share"], errors="coerce") * 100).round(1).astype(str) + "%"
+    if "play_pressure" in out.columns:
+        out["play_pressure"] = pd.to_numeric(out["play_pressure"], errors="coerce").round(0).astype("Int64")
+    for col in ["chart_rank", "lastfm_rank", "plays"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+    return out
+
+
+def _render_lastfm_forecast_lab(top_n: int) -> None:
+    st.markdown("### Last.fm Play Data Model")
+    st.caption(
+        "This model uses imported Last.fm play counts for the selected chart week. "
+        "Positive play pressure means a song ranked higher in Last.fm plays than it did on the chart; "
+        "negative pressure means the chart rank was stronger than the Last.fm play rank."
+    )
+
+    weeks = load_lastfm_forecast_weeks()
+    if weeks.empty:
+        st.info("No imported Last.fm play data was found. Run scripts/import_lastfm_weekly.py for a chart date first.")
+        return
+
+    weeks = weeks.copy()
+    weeks["label"] = weeks.apply(
+        lambda r: f"{r['chart_date']} | {int(r['lastfm_tracks'])} Last.fm rows | {int(r['matched_tracks'] or 0)} matched",
+        axis=1,
+    )
+    selected_label = st.selectbox("Last.fm forecast week", weeks["label"].tolist(), key="forecast_lab_lastfm_chart_date")
+    selected_week = weeks.loc[weeks["label"] == selected_label].iloc[0]
+    chart_week_id = int(selected_week["chart_week_id"])
+
+    period_from = selected_week.get("period_from_local") or "—"
+    period_to = selected_week.get("period_to_local") or "—"
+    st.caption(f"Forecast listening window: {period_from} through {period_to}")
+
+    signals = load_lastfm_forecast_signals(chart_week_id)
+    off_chart = load_lastfm_off_chart_watch(chart_week_id)
+
+    imported_tracks = int(selected_week.get("lastfm_tracks") or 0)
+    matched_tracks = int(selected_week.get("matched_tracks") or 0)
+    total_plays = int(selected_week.get("total_plays") or 0)
+    matched_chart_songs = int(len(signals))
+
+    strongest = signals.sort_values(["play_pressure", "plays"], ascending=[False, False]).head(1) if not signals.empty else pd.DataFrame()
+    softest = signals.sort_values(["play_pressure", "plays"], ascending=[True, False]).head(1) if not signals.empty else pd.DataFrame()
+
+    render_kpis([
+        ("Imported Last.fm rows", f"{imported_tracks:,}"),
+        ("Matched Last.fm rows", f"{matched_tracks:,}"),
+        ("Matched chart songs", f"{matched_chart_songs:,}"),
+        ("Imported plays", f"{total_plays:,}"),
+        ("Strongest upward pressure", strongest["song"].iloc[0] if not strongest.empty else "—"),
+        ("Strongest softening signal", softest["song"].iloc[0] if not softest.empty else "—"),
+    ])
+
+    if signals.empty:
+        st.info("Last.fm rows exist for this week, but none are matched to songs on this chart week yet. Run the matcher script or add aliases.")
+        if not off_chart.empty:
+            st.markdown("**Imported Last.fm rows**")
+            _display_df(off_chart.head(top_n), ["lastfm_rank", "song", "artist", "plays", "canonical_song_id"])
+        return
+
+    st.markdown("**Last.fm play pressure by chart rank**")
+    _display_df(
+        _format_lastfm_signal_columns(signals),
+        ["chart_rank", "lastfm_rank", "song", "artist", "plays", "play_pressure", "matched_play_share", "lastfm_track_name", "lastfm_artist_name"],
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Upward pressure watch**")
+        upward = signals.loc[pd.to_numeric(signals["play_pressure"], errors="coerce") > 0].sort_values(
+            ["play_pressure", "plays"], ascending=[False, False]
+        ).head(top_n)
+        if upward.empty:
+            st.caption("No matched chart songs had positive Last.fm play pressure.")
+        else:
+            _display_df(
+                _format_lastfm_signal_columns(upward),
+                ["chart_rank", "lastfm_rank", "song", "artist", "plays", "play_pressure", "matched_play_share"],
+            )
+
+    with c2:
+        st.markdown("**Softening watch**")
+        softening = signals.loc[pd.to_numeric(signals["play_pressure"], errors="coerce") < 0].sort_values(
+            ["play_pressure", "plays"], ascending=[True, False]
+        ).head(top_n)
+        if softening.empty:
+            st.caption("No matched chart songs had negative Last.fm play pressure.")
+        else:
+            _display_df(
+                _format_lastfm_signal_columns(softening),
+                ["chart_rank", "lastfm_rank", "song", "artist", "plays", "play_pressure", "matched_play_share"],
+            )
+
+    st.markdown("**Off-chart / unmatched Last.fm watch**")
+    st.caption("These imported Last.fm rows are not currently matched to songs on the selected chart week. Some may be future debuts/re-entries; others may be old catalog tracks, podcasts, or unmatched aliases.")
+    if off_chart.empty:
+        st.caption("No off-chart or unmatched Last.fm rows for this week.")
+    else:
+        _display_df(off_chart.head(top_n), ["lastfm_rank", "song", "artist", "plays", "canonical_song_id"])
+
 def _render_forecast_lab(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     chart = pkg["chart"]
     if chart.empty:
@@ -4334,12 +4534,24 @@ def render_weekly_top_artists_tab() -> None:
 
 def render_forecast_lab_tab() -> None:
     st.subheader("Forecast Lab")
-    st.caption("Forward-looking chart estimates based on historical neighbors. This lives outside Analytics so the heavier forecast work only runs when you open this section.")
+    st.caption("Choose between the historical neighbor forecast and the imported Last.fm play-data view.")
+
+    forecast_mode = st.radio(
+        "Forecast mode",
+        ["Historical chart model", "Last.fm play data model"],
+        horizontal=True,
+        key="forecast_lab_mode",
+    )
+    top_n = int(st.slider("Top N rows", 5, 100, 25, 5, key="forecast_lab_top_n"))
+
+    if forecast_mode == "Last.fm play data model":
+        _render_lastfm_forecast_lab(top_n)
+        return
+
     base = load_analytics_base()
     if base.empty:
         st.info("No chart data is available in the database yet.")
         return
-    top_n = int(st.slider("Top N rows", 5, 100, 25, 5, key="forecast_lab_top_n"))
     _render_forecast_lab({"chart": base}, top_n)
 
 
