@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+db/*.backup*.sqlite
+db/Backups/
+*.backup*.sqlite
+
+app_*backup*.py
+lastfm_unmatched_candidates_*.csv
