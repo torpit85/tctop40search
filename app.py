@@ -5784,7 +5784,17 @@ def render_chart_recap_tab() -> None:
     if prev_date:
         st.caption(f"Previous chart used for dropout comparison: {prev_date}")
     recap = _build_chart_recap_text(selected_date, df, prev_df)
-    st.text_area("Generated recap draft", recap, height=260, key="chart_recap_text")
+
+    # Use a date-specific widget key so Streamlit does not preserve an old/blank
+    # text-area value when the user switches chart weeks. With a fixed key,
+    # Streamlit session state can ignore the newly generated default text.
+    st.text_area(
+        "Generated recap draft",
+        recap,
+        height=260,
+        key=f"chart_recap_text_{selected_date}",
+    )
+
     with st.expander("Show source chart rows"):
         _display_df(_week_browser_display_table(df))
 
