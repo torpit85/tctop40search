@@ -3873,7 +3873,7 @@ def render_admin_tab() -> None:
     st.subheader("Admin")
     admin_section = st.selectbox(
         "Admin section",
-        ["Songs", "Artists", "Data Quality", "Maintenance"],
+        ["Songs", "Artists", "Data Quality", "Data Health / Import QA", "Maintenance"],
         key="admin_section_selector",
     )
 
@@ -4172,6 +4172,9 @@ def render_admin_tab() -> None:
             else:
                 _display_df(known_anomalies, ["chart_date", "issue_type", "severity", "summary", "status", "notes"])
 
+    elif admin_section == "Data Health / Import QA":
+        render_data_health_tab()
+
     else:
         st.markdown("### Maintenance")
         stats = admin_db_stats()
@@ -4467,8 +4470,6 @@ def render_weekly_top_artists_tab() -> None:
     if view == "Weekly chart":
         st.markdown("**Weekly artist chart**")
         _display_df(weekly_scores.head(top_n), display_cols)
-        with st.expander("Show raw score details", expanded=False):
-            _display_df(weekly_scores.head(top_n), display_cols)
         return
 
     # The all-time artist-history table is the heaviest part of this section, so
@@ -4928,13 +4929,37 @@ def render_song_history_tab() -> None:
                     f"Featured: {featured_credit} | "
                     f"Alias variants: {int(stats['alias_count'])}"
                 )
-                chart_df = history.set_index("chart_date")["position"].sort_index()
-                st.line_chart((-chart_df).rename("inverted_position"))
-                st.caption("Line chart uses inverted positions so higher placements plot higher.")
-                st.markdown("**Week-by-week history**")
-                _display_df(history)
-                st.markdown("**Alias variants in this canonical song**")
-                _display_df(aliases)
+
+                view = st.radio(
+                    "Canonical song view",
+                    ["History", "Lifecycle"],
+                    horizontal=True,
+                    key="canonical_song_history_view",
+                )
+
+                if view == "History":
+                    chart_df = history.set_index("chart_date")["position"].sort_index()
+                    st.line_chart((-chart_df).rename("inverted_position"))
+                    st.caption("Line chart uses inverted positions so higher placements plot higher.")
+                    st.markdown("**Week-by-week history**")
+                    _display_df(history)
+                    st.markdown("**Alias variants in this canonical song**")
+                    _display_df(aliases)
+                else:
+                    st.caption("Milestone arc for this canonical song: debut, Top 20/10/5, #1, peak, final week, and trajectory type.")
+                    render_kpis([("Lifecycle type", _classify_song_lifecycle(history))])
+                    st.markdown("**Milestone timeline**")
+                    _display_df(_song_lifecycle_table(history))
+                    st.markdown("**Position history**")
+                    chart_line = history.copy()
+                    chart_line["chart_date"] = pd.to_datetime(chart_line["chart_date"])
+                    chart_line["position"] = pd.to_numeric(chart_line["position"], errors="coerce")
+                    st.line_chart(chart_line.set_index("chart_date")[["position"]], width="stretch")
+                    st.markdown("**Full history**")
+                    _display_df(history)
+                    if not aliases.empty:
+                        with st.expander("Aliases / source variants"):
+                            _display_df(aliases)
     else:
         st.info("Type part of a title or artist to load a canonical song history.")
 
@@ -4962,14 +4987,51 @@ def render_artist_history_tab() -> None:
                 c3.metric("Distinct songs", int(stats["distinct_songs"]))
                 c4.metric("Span", f"{stats['first_date']} to {stats['last_date']}")
                 st.caption(f"Mode: {artist_role_config(role_mode)['label']}")
-                st.markdown("**Song summary**")
-                _display_df(songs)
-                st.markdown("**Full week-by-week history**")
-                _display_df(history)
+
+                view = st.radio(
+                    "Artist view",
+                    ["History", "Career timeline"],
+                    horizontal=True,
+                    key="artist_history_view",
+                )
+
+                if view == "History":
+                    st.markdown("**Song summary**")
+                    _display_df(songs)
+                    st.markdown("**Full week-by-week history**")
+                    _display_df(history)
+                else:
+                    st.caption("Milestone view for this artist: first charting week, first Top 20/Top 10/Top 5/#1, signature songs, and yearly activity.")
+                    h = history.copy()
+                    h["chart_date"] = pd.to_datetime(h["chart_date"])
+                    h["position"] = pd.to_numeric(h["position"], errors="coerce")
+                    milestones = []
+                    for name, subset in [
+                        ("First chart appearance", h.head(1)),
+                        ("First Top 20", h.loc[h["position"] <= 20].head(1)),
+                        ("First Top 10", h.loc[h["position"] <= 10].head(1)),
+                        ("First Top 5", h.loc[h["position"] <= 5].head(1)),
+                        ("First #1", h.loc[h["position"] == 1].head(1)),
+                    ]:
+                        if not subset.empty:
+                            r = subset.iloc[0]
+                            milestones.append({"Milestone": name, "Chart date": _date_string(r["chart_date"]), "Song": r.get("song", ""), "Position": _fmt_rank(r.get("position"))})
+                    st.markdown("**Career milestones**")
+                    _display_df(pd.DataFrame(milestones))
+                    st.markdown("**Signature songs**")
+                    _display_df(songs.head(25), ["song", "chart_weeks", "first_date", "last_date", "peak"])
+                    yearly = h.groupby(h["chart_date"].dt.year).agg(
+                        chart_weeks=("song", "count"),
+                        distinct_songs=("song", "nunique"),
+                        best_peak=("position", "min"),
+                    ).reset_index().rename(columns={"chart_date": "year"})
+                    yearly.columns = ["year", "chart_weeks", "distinct_songs", "best_peak"]
+                    st.markdown("**Yearly activity**")
+                    _display_df(yearly.sort_values("year"))
+                    st.markdown("**Full artist history**")
+                    _display_df(history)
     else:
         st.info("Type part of an artist name to load an artist history.")
-
-
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_num1_gains(limit: int = 100) -> pd.DataFrame:
@@ -5608,6 +5670,595 @@ def build_quick_artist_exclusive_top25(limit: int = 100) -> pd.DataFrame:
     out = out.sort_values(["__tier_order", "Chart date", "Artist"], ascending=[False, False, True]).drop(columns=["__tier_order"])
     return out.head(limit)
 
+
+
+# -----------------------------------------------------------------------------
+# New historian/workflow sections: recap, QA, lifecycle, career timeline,
+# forecast scorecard, and head-to-head rivalries.
+# -----------------------------------------------------------------------------
+
+
+def _date_string(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except Exception:
+        return str(value)
+
+
+def _song_artist_label_from_row(row: pd.Series | dict[str, object], song_col: str = "song", artist_col: str = "artist") -> str:
+    getter = row.get if hasattr(row, "get") else lambda k, d=None: d
+    song = str(getter(song_col, "") or getter("title", "") or "").strip()
+    artist = str(getter(artist_col, "") or "").strip()
+    if song and artist:
+        return f"{song} — {artist}"
+    return song or artist or "—"
+
+
+def _chart_date_selectbox(label: str, key: str, default_latest: bool = True) -> str | None:
+    dates = load_chart_dates()
+    if not dates:
+        st.info("No chart dates are available.")
+        return None
+    return st.selectbox(label, dates, index=0 if default_latest else len(dates) - 1, key=key)
+
+
+def _previous_chart_for_date(chart_date: str) -> tuple[str | None, pd.DataFrame]:
+    dates = sorted(load_chart_dates())
+    prior = [d for d in dates if d < chart_date]
+    if not prior:
+        return None, pd.DataFrame()
+    prev_date = prior[-1]
+    prev_df, _ = load_chart(prev_date)
+    return prev_date, prev_df
+
+
+def _build_chart_recap_text(chart_date: str, df: pd.DataFrame, previous_df: pd.DataFrame) -> str:
+    if df.empty:
+        return "No chart rows are available for this date."
+
+    top = df.sort_values("position").iloc[0]
+    prev_no1 = ""
+    if previous_df is not None and not previous_df.empty:
+        prev_top = previous_df.sort_values("position").iloc[0]
+        prev_no1 = _song_artist_label_from_row(prev_top)
+    no1_label = _song_artist_label_from_row(top)
+    last_week = _safe_int(top.get("last_week_position"))
+    no1_move = f" moves #{last_week} → #1" if last_week and last_week != 1 else " holds at #1" if last_week == 1 else " is #1"
+
+    movers = df.loc[df.get("movement", pd.Series(index=df.index, dtype="float64")).notna()].copy()
+    climbers = movers.loc[movers["movement"] > 0].sort_values(["movement", "position"], ascending=[False, True]) if not movers.empty else pd.DataFrame()
+    fallers = movers.loc[movers["movement"] < 0].sort_values(["movement", "position"], ascending=[True, True]) if not movers.empty else pd.DataFrame()
+    debuts = df.loc[_marker_contains(df, "DEBUT")].sort_values("position")
+    reentries = df.loc[_marker_contains(df, "RE-ENTRY")].sort_values("position")
+    top10_arrivals = df.loc[(pd.to_numeric(df.get("last_week_position"), errors="coerce") > 10) & (pd.to_numeric(df.get("position"), errors="coerce") <= 10)].sort_values("position")
+    veterans = df.sort_values("weeks_on_chart", ascending=False).head(3) if "weeks_on_chart" in df.columns else pd.DataFrame()
+
+    def labels(table: pd.DataFrame, n: int = 3) -> str:
+        if table.empty:
+            return "none"
+        return "; ".join(_song_artist_label_from_row(r) for _, r in table.head(n).iterrows())
+
+    if prev_no1 and prev_no1 != no1_label:
+        p1 = f"This week's Torrey's Corner Top 40 ({chart_date}) gets a new #1 as {no1_label}{no1_move}. Last week's leader was {prev_no1}, so the top slot changes hands this week."
+    else:
+        p1 = f"This week's Torrey's Corner Top 40 ({chart_date}) is led by {no1_label}, which{no1_move}."
+
+    if not climbers.empty:
+        climber = climbers.iloc[0]
+        climber_text = f"The biggest upward move belongs to {_song_artist_label_from_row(climber)}, climbing {_format_movement(climber.get('movement'))} spots."
+    else:
+        climber_text = "There were no ranked upward moves among returning songs."
+    if not fallers.empty:
+        faller = fallers.iloc[0]
+        faller_text = f"The sharpest decline is {_song_artist_label_from_row(faller)}, falling {_format_movement(faller.get('movement'))} spots."
+    else:
+        faller_text = "There were no ranked declines among returning songs."
+    p2 = f"Movement is headlined by the returning songs: {climber_text} {faller_text} Top 10 movement includes {labels(top10_arrivals)}."
+
+    p3 = f"Fresh activity includes {len(debuts)} debut(s) and {len(reentries)} re-entry/re-entries. The top debut group is {labels(debuts)}, while the re-entry list is {labels(reentries)}. The chart veterans worth watching are {labels(veterans)}, giving the week a mix of new arrivals, return traffic, and long-running holdovers."
+    return "\n\n".join([p1, p2, p3])
+
+
+def render_chart_recap_tab() -> None:
+    st.subheader("Chart Recap Generator")
+    st.caption("Creates a copy-ready weekly summary draft from the selected chart week.")
+    selected_date = _chart_date_selectbox("Chart week", "chart_recap_date")
+    if not selected_date:
+        return
+    df, meta = load_chart(selected_date)
+    prev_date, prev_df = _previous_chart_for_date(selected_date)
+    if df.empty:
+        st.info("No chart rows are available for this week.")
+        return
+    summary = _week_browser_summary(df, prev_df)
+    render_kpis([
+        ("#1", summary["number_one"]),
+        ("Top debut", summary["top_debut"]),
+        ("Biggest climber", summary["biggest_climber"]),
+        ("Debuts", summary["debuts"]),
+        ("Re-entries", summary["reentries"]),
+        ("Dropouts", summary["dropouts"]),
+    ])
+    if prev_date:
+        st.caption(f"Previous chart used for dropout comparison: {prev_date}")
+    recap = _build_chart_recap_text(selected_date, df, prev_df)
+    st.text_area("Generated recap draft", recap, height=260, key="chart_recap_text")
+    with st.expander("Show source chart rows"):
+        _display_df(_week_browser_display_table(df))
+
+
+def _db_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _db_has_table(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row is not None
+
+
+def _query_df(conn: sqlite3.Connection, sql: str, params: tuple[object, ...] = ()) -> pd.DataFrame:
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    except Exception as exc:
+        return pd.DataFrame({"error": [str(exc)]})
+
+
+def render_data_health_tab() -> None:
+    st.subheader("Data Health / Import QA")
+    st.caption("Sanity checks for imports, canonical IDs, markers, chart-week row counts, and duplicate-looking records.")
+    conn = get_connection()
+    top_n = st.slider("Rows per check", 10, 500, 100, 10, key="data_health_rows")
+
+    checks: list[tuple[str, str, pd.DataFrame]] = []
+    checks.append((
+        "Chart weeks with row count not equal to 40",
+        "Useful after imports; every weekly chart should normally have exactly 40 rows.",
+        _query_df(conn, """
+            SELECT cw.chart_date, COUNT(e.entry_id) AS entry_rows, cw.row_count, cw.source_file
+            FROM chart_week cw
+            LEFT JOIN entry e ON e.chart_week_id = cw.chart_week_id
+            GROUP BY cw.chart_week_id, cw.chart_date, cw.row_count, cw.source_file
+            HAVING COUNT(e.entry_id) <> 40 OR COALESCE(cw.row_count, 40) <> 40
+            ORDER BY cw.chart_date DESC
+            LIMIT ?
+        """, (top_n,)),
+    ))
+    checks.append((
+        "Entries missing canonical_song_id",
+        "These usually appear right after import before the artist-role/canonical assignment script is run.",
+        _query_df(conn, """
+            SELECT cw.chart_date, e.position, e.song_title_display AS song, e.full_artist_display AS artist, e.derived_marker
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id IS NULL
+            ORDER BY cw.chart_date DESC, e.position
+            LIMIT ?
+        """, (top_n,)),
+    ))
+    checks.append((
+        "Duplicate chart dates",
+        "Flags cases where more than one chart_week row has the same chart_date.",
+        _query_df(conn, """
+            SELECT chart_date, COUNT(*) AS chart_week_rows, GROUP_CONCAT(chart_week_id) AS chart_week_ids
+            FROM chart_week
+            GROUP BY chart_date
+            HAVING COUNT(*) > 1
+            ORDER BY chart_date DESC
+            LIMIT ?
+        """, (top_n,)),
+    ))
+    checks.append((
+        "Duplicate positions within a chart week",
+        "A chart week should not have two entries with the same position.",
+        _query_df(conn, """
+            SELECT cw.chart_date, e.position, COUNT(*) AS entries_at_position,
+                   GROUP_CONCAT(e.song_title_display || ' — ' || e.full_artist_display, ' | ') AS entries
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            GROUP BY cw.chart_week_id, cw.chart_date, e.position
+            HAVING COUNT(*) > 1
+            ORDER BY cw.chart_date DESC, e.position
+            LIMIT ?
+        """, (top_n,)),
+    ))
+    checks.append((
+        "Invalid chart positions",
+        "Flags positions outside the expected 1–40 range.",
+        _query_df(conn, """
+            SELECT cw.chart_date, e.position, e.song_title_display AS song, e.full_artist_display AS artist
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.position < 1 OR e.position > 40 OR e.position IS NULL
+            ORDER BY cw.chart_date DESC, e.position
+            LIMIT ?
+        """, (top_n,)),
+    ))
+    checks.append((
+        "Rows marked as both debut and re-entry",
+        "Derived debut/re-entry flags should be mutually exclusive.",
+        _query_df(conn, """
+            SELECT cw.chart_date, e.position, e.song_title_display AS song, e.full_artist_display AS artist,
+                   e.derived_marker, e.derived_is_debut, e.derived_is_reentry
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE COALESCE(e.derived_is_debut, 0) = 1 AND COALESCE(e.derived_is_reentry, 0) = 1
+            ORDER BY cw.chart_date DESC, e.position
+            LIMIT ?
+        """, (top_n,)),
+    ))
+    if _db_has_table(conn, "canonical_song"):
+        checks.append((
+            "Canonical songs with zero attached entries",
+            "Usually harmless after editing, but worth reviewing if the count grows.",
+            _query_df(conn, """
+                SELECT cs.canonical_song_id, cs.canonical_title AS song,
+                       COALESCE(cs.canonical_full_artist, cs.canonical_artist) AS artist
+                FROM canonical_song cs
+                LEFT JOIN entry e ON e.canonical_song_id = cs.canonical_song_id
+                GROUP BY cs.canonical_song_id, cs.canonical_title, cs.canonical_artist, cs.canonical_full_artist
+                HAVING COUNT(e.entry_id) = 0
+                ORDER BY cs.canonical_song_id DESC
+                LIMIT ?
+            """, (top_n,)),
+        ))
+        checks.append((
+            "Possible duplicate canonical songs by normalized title + artist",
+            "These are candidates for manual merge review, not automatic errors.",
+            _query_df(conn, """
+                SELECT LOWER(TRIM(canonical_title)) AS title_key,
+                       LOWER(TRIM(COALESCE(canonical_full_artist, canonical_artist))) AS artist_key,
+                       COUNT(*) AS canonical_rows,
+                       GROUP_CONCAT(canonical_song_id) AS canonical_song_ids,
+                       GROUP_CONCAT(canonical_title || ' — ' || COALESCE(canonical_full_artist, canonical_artist), ' | ') AS labels
+                FROM canonical_song
+                GROUP BY title_key, artist_key
+                HAVING COUNT(*) > 1
+                ORDER BY canonical_rows DESC, title_key
+                LIMIT ?
+            """, (top_n,)),
+        ))
+
+    overview_rows = []
+    for title, _, df in checks:
+        issue_count = 0 if df.empty else len(df)
+        if "error" in df.columns:
+            status = "Check error"
+        elif issue_count == 0:
+            status = "OK"
+        else:
+            status = f"Review {issue_count:,} row(s)"
+        overview_rows.append({"Check": title, "Status": status})
+    st.markdown("**QA summary**")
+    st.dataframe(pd.DataFrame(overview_rows), width="stretch", hide_index=True)
+
+    for title, help_text, df in checks:
+        with st.expander(title, expanded=not df.empty and "error" not in df.columns):
+            st.caption(help_text)
+            if df.empty:
+                st.success("No issues found.")
+            else:
+                _display_df(df)
+
+
+def _song_lifecycle_table(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame()
+    h = history.copy()
+    h["chart_date"] = pd.to_datetime(h["chart_date"])
+    h["position"] = pd.to_numeric(h["position"], errors="coerce")
+    milestones: list[dict[str, object]] = []
+    checks = [
+        ("Debut", h.head(1)),
+        ("First Top 20", h.loc[h["position"] <= 20].head(1)),
+        ("First Top 10", h.loc[h["position"] <= 10].head(1)),
+        ("First Top 5", h.loc[h["position"] <= 5].head(1)),
+        ("First #1", h.loc[h["position"] == 1].head(1)),
+    ]
+    peak_pos = h["position"].min()
+    checks.append(("Peak", h.loc[h["position"] == peak_pos].head(1)))
+    checks.append(("Final chart week", h.tail(1)))
+    for name, rows in checks:
+        if rows.empty:
+            continue
+        r = rows.iloc[0]
+        milestones.append({
+            "Milestone": name,
+            "Chart date": _date_string(r.get("chart_date")),
+            "Position": _fmt_rank(r.get("position")),
+            "Last Week": _fmt_rank(r.get("last_week_position")),
+            "Weeks on chart": _safe_int(r.get("weeks_on_chart")) or "—",
+            "Marker": r.get("derived_marker", ""),
+        })
+    return pd.DataFrame(milestones)
+
+
+def _classify_song_lifecycle(history: pd.DataFrame) -> str:
+    if history.empty:
+        return "Unknown"
+    h = history.copy()
+    h["position"] = pd.to_numeric(h["position"], errors="coerce")
+    weeks = len(h)
+    peak = int(h["position"].min())
+    weeks_to_peak = int(h["position"].idxmin()) if h.index.is_monotonic_increasing else int(h.reset_index(drop=True)["position"].idxmin())
+    reentries = int(_marker_contains(h, "RE-ENTRY").sum())
+    if peak == 1 and weeks >= 20:
+        return "Blockbuster / long-running #1"
+    if weeks_to_peak >= 8 and peak <= 10:
+        return "Slow-burn climber"
+    if weeks <= 4 and peak <= 10:
+        return "Flash hit"
+    if reentries > 0:
+        return "Comeback / re-entry runner"
+    if weeks >= 20:
+        return "Long-runner"
+    return "Standard chart run"
+
+
+def render_song_lifecycle_tab() -> None:
+    st.subheader("Song Lifecycle")
+    st.caption("Turns a canonical song history into a milestone arc: debut, Top 20/10/5, #1, peak, final week, and trajectory type.")
+    term = st.text_input("Find a song", key="song_lifecycle_search", placeholder="Search title or artist")
+    if not term.strip():
+        st.info("Search for a canonical song to view its lifecycle.")
+        return
+    matches = canonical_song_matches(term, 200)
+    if matches.empty:
+        st.warning("No canonical songs matched that search.")
+        return
+    matches["label"] = matches.apply(lambda r: f"{r['canonical_title']} — {r['canonical_artist']} ({int(r['chart_weeks'] or 0)} weeks, peak #{int(r['peak']) if pd.notna(r['peak']) else '—'})", axis=1)
+    choice = st.selectbox("Canonical song", matches["label"].tolist(), key="song_lifecycle_choice")
+    song_id = int(matches.loc[matches["label"] == choice, "canonical_song_id"].iloc[0])
+    history, stats, aliases = canonical_song_history(song_id)
+    if history.empty or stats is None:
+        st.info("No history rows are attached to this canonical song.")
+        return
+    render_kpis([
+        ("Peak", _fmt_rank(stats.get("peak"))),
+        ("Chart weeks", stats.get("chart_weeks", "—")),
+        ("First week", stats.get("first_date", "—")),
+        ("Last week", stats.get("last_date", "—")),
+        ("Lifecycle type", _classify_song_lifecycle(history)),
+    ])
+    st.markdown("**Milestone timeline**")
+    _display_df(_song_lifecycle_table(history))
+    st.markdown("**Position history**")
+    chart_line = history.copy()
+    chart_line["chart_date"] = pd.to_datetime(chart_line["chart_date"])
+    chart_line["position"] = pd.to_numeric(chart_line["position"], errors="coerce")
+    st.line_chart(chart_line.set_index("chart_date")[["position"]], width="stretch")
+    st.markdown("**Full history**")
+    _display_df(history)
+    if not aliases.empty:
+        with st.expander("Aliases / source variants"):
+            _display_df(aliases)
+
+
+def render_artist_career_timeline_tab() -> None:
+    st.subheader("Artist Career Timeline")
+    st.caption("Milestone view for an artist: first charting week, first Top 10/Top 5/#1, signature songs, yearly activity, and gaps.")
+    role_mode = st.radio("Credit mode", ["Full credit", "Lead artist", "Featured artist"], horizontal=True, key="artist_career_role")
+    term = st.text_input("Find an artist", key="artist_career_search", placeholder="Search artist name")
+    if not term.strip():
+        st.info("Search for an artist to view their career timeline.")
+        return
+    matches = artist_matches(term, role_mode, 200)
+    if matches.empty:
+        st.warning("No artists matched that search.")
+        return
+    matches["label"] = matches.apply(lambda r: f"{r['display_artist']} ({int(r['chart_weeks'] or 0)} weeks, peak #{int(r['peak']) if pd.notna(r['peak']) else '—'})", axis=1)
+    choice = st.selectbox("Artist", matches["label"].tolist(), key="artist_career_choice")
+    artist_key = str(matches.loc[matches["label"] == choice, "normalized_artist"].iloc[0])
+    history, stats, songs = artist_history(artist_key, role_mode)
+    if history.empty or stats is None:
+        st.info("No chart history is available for this artist under the selected credit mode.")
+        return
+    h = history.copy()
+    h["chart_date"] = pd.to_datetime(h["chart_date"])
+    h["position"] = pd.to_numeric(h["position"], errors="coerce")
+    milestones = []
+    for name, subset in [
+        ("First chart appearance", h.head(1)),
+        ("First Top 20", h.loc[h["position"] <= 20].head(1)),
+        ("First Top 10", h.loc[h["position"] <= 10].head(1)),
+        ("First Top 5", h.loc[h["position"] <= 5].head(1)),
+        ("First #1", h.loc[h["position"] == 1].head(1)),
+    ]:
+        if not subset.empty:
+            r = subset.iloc[0]
+            milestones.append({"Milestone": name, "Chart date": _date_string(r["chart_date"]), "Song": r.get("song", ""), "Position": _fmt_rank(r.get("position"))})
+    render_kpis([
+        ("Chart weeks", stats.get("chart_weeks", "—")),
+        ("Distinct songs", stats.get("distinct_songs", "—")),
+        ("Peak", _fmt_rank(stats.get("peak"))),
+        ("First week", stats.get("first_date", "—")),
+        ("Last week", stats.get("last_date", "—")),
+    ])
+    st.markdown("**Career milestones**")
+    _display_df(pd.DataFrame(milestones))
+    st.markdown("**Signature songs**")
+    _display_df(songs.head(25), ["song", "chart_weeks", "first_date", "last_date", "peak"])
+    yearly = h.groupby(h["chart_date"].dt.year).agg(
+        chart_weeks=("song", "count"),
+        distinct_songs=("song", "nunique"),
+        best_peak=("position", "min"),
+    ).reset_index().rename(columns={"chart_date": "year"})
+    yearly.columns = ["year", "chart_weeks", "distinct_songs", "best_peak"]
+    st.markdown("**Yearly activity**")
+    _display_df(yearly.sort_values("year"))
+    st.markdown("**Full artist history**")
+    _display_df(history)
+
+
+def _forecast_backtest_rows(limit_weeks: int, max_neighbors: int) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+    chart = _add_num1_reign_features(chart)
+    dates = sorted(pd.to_datetime(chart.loc[chart["next_chart_date"].notna(), "chart_date"].dropna().unique()))
+    if not dates:
+        return pd.DataFrame()
+    dates = dates[-limit_weeks:]
+    rows: list[pd.DataFrame] = []
+    for d in dates:
+        forecast, _ = _forecast_for_chart_date(chart, d, max_neighbors=max_neighbors)
+        if forecast.empty:
+            continue
+        actual = chart.loc[chart["chart_date"] == d, ["title", "artist", "position", "next_position", "dropped_out_next_week"]].copy()
+        comp = forecast.merge(actual, on=["title", "artist", "position"], how="left")
+        comp["backtest_chart_date"] = d
+        rows.append(comp)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    out["rank_error"] = (pd.to_numeric(out["expected_next_position"], errors="coerce") - pd.to_numeric(out["next_position"], errors="coerce")).abs()
+    out["predicted_top10"] = pd.to_numeric(out["top10_probability"], errors="coerce") >= 0.5
+    out["actual_top10"] = pd.to_numeric(out["next_position"], errors="coerce") <= 10
+    out["predicted_dropout"] = pd.to_numeric(out["dropout_risk"], errors="coerce") >= 0.5
+    out["actual_dropout"] = out["dropped_out_next_week"].fillna(False).astype(bool)
+    return out
+
+
+def render_forecast_scorecard_tab() -> None:
+    st.subheader("Forecast Lab Scorecard")
+    st.caption("Backtests the historical-neighbor Forecast Lab across recent historical weeks with known next-week outcomes.")
+    cols = st.columns(2)
+    weeks = cols[0].slider("Historical weeks to test", 5, 60, 20, 5, key="forecast_scorecard_weeks")
+    max_neighbors = cols[1].slider("Similar cases per song", 25, 250, 100, 25, key="forecast_scorecard_neighbors")
+    if not st.checkbox("Run scorecard", value=False, key="forecast_scorecard_run"):
+        st.info("Turn on the checkbox to run the backtest. This is intentionally gated because it loops through multiple forecast weeks.")
+        return
+    scored = _forecast_backtest_rows(weeks, max_neighbors)
+    if scored.empty:
+        st.info("No backtest rows were available.")
+        return
+    present = scored.loc[scored["next_position"].notna()].copy()
+    avg_rank_error = present["rank_error"].mean() if not present.empty else float("nan")
+    top10_accuracy = (scored["predicted_top10"] == scored["actual_top10"]).mean()
+    dropout_accuracy = (scored["predicted_dropout"] == scored["actual_dropout"]).mean()
+    num1_hits = []
+    for d, g in scored.groupby("backtest_chart_date"):
+        pred = g.sort_values("projected_rank").head(1)
+        actual = g.loc[g["next_position"] == 1].head(1)
+        if not pred.empty and not actual.empty:
+            num1_hits.append(str(pred.iloc[0]["title"]) == str(actual.iloc[0]["title"]))
+    render_kpis([
+        ("Rows tested", f"{len(scored):,}"),
+        ("Avg rank error", f"{avg_rank_error:.2f}" if pd.notna(avg_rank_error) else "—"),
+        ("Top 10 accuracy", f"{top10_accuracy * 100:.1f}%"),
+        ("Dropout accuracy", f"{dropout_accuracy * 100:.1f}%"),
+        ("#1 exact hit rate", f"{(sum(num1_hits) / len(num1_hits) * 100):.1f}%" if num1_hits else "—"),
+    ])
+    by_week = scored.groupby("backtest_chart_date").agg(
+        rows=("title", "count"),
+        avg_rank_error=("rank_error", "mean"),
+        top10_accuracy=("predicted_top10", lambda s: float((s == scored.loc[s.index, "actual_top10"]).mean())),
+        dropout_accuracy=("predicted_dropout", lambda s: float((s == scored.loc[s.index, "actual_dropout"]).mean())),
+    ).reset_index()
+    st.markdown("**Week-by-week scorecard**")
+    _display_df(by_week.sort_values("backtest_chart_date", ascending=False))
+    st.markdown("**Largest rank misses**")
+    _display_df(
+        _format_probability_columns(scored.sort_values("rank_error", ascending=False).head(50)),
+        ["backtest_chart_date", "title", "artist", "position", "projected_rank", "expected_next_position", "next_position", "rank_error", "dropout_risk", "top10_probability"],
+    )
+
+
+def _battle_summary(a: pd.DataFrame, b: pd.DataFrame, a_name: str, b_name: str) -> tuple[pd.DataFrame, list[tuple[str, object]]]:
+    if a.empty or b.empty:
+        return pd.DataFrame(), []
+    aa = a.copy()
+    bb = b.copy()
+    aa["chart_date"] = pd.to_datetime(aa["chart_date"])
+    bb["chart_date"] = pd.to_datetime(bb["chart_date"])
+    aa["position"] = pd.to_numeric(aa["position"], errors="coerce")
+    bb["position"] = pd.to_numeric(bb["position"], errors="coerce")
+    aa = aa.sort_values(["chart_date", "position"]).drop_duplicates("chart_date")[["chart_date", "position", "song"]].rename(columns={"position": f"{a_name} position", "song": f"{a_name} song"})
+    bb = bb.sort_values(["chart_date", "position"]).drop_duplicates("chart_date")[["chart_date", "position", "song"]].rename(columns={"position": f"{b_name} position", "song": f"{b_name} song"})
+    both = aa.merge(bb, on="chart_date", how="inner")
+    if both.empty:
+        metrics = [
+            (f"{a_name} chart weeks", len(a)),
+            (f"{b_name} chart weeks", len(b)),
+            ("Same-week battles", 0),
+        ]
+        return both, metrics
+    both["winner"] = both.apply(lambda r: a_name if r[f"{a_name} position"] < r[f"{b_name} position"] else b_name if r[f"{b_name} position"] < r[f"{a_name} position"] else "Tie", axis=1)
+    both["rank_gap"] = (both[f"{a_name} position"] - both[f"{b_name} position"]).abs()
+    metrics = [
+        (f"{a_name} chart weeks", len(a)),
+        (f"{b_name} chart weeks", len(b)),
+        ("Same-week battles", len(both)),
+        (f"{a_name} wins", int((both["winner"] == a_name).sum())),
+        (f"{b_name} wins", int((both["winner"] == b_name).sum())),
+        ("Ties", int((both["winner"] == "Tie").sum())),
+    ]
+    return both.sort_values("chart_date", ascending=False), metrics
+
+
+def render_rivalries_tab() -> None:
+    st.subheader("Rivalries / Head-to-Head")
+    st.caption("Compare two songs or two artists on chart weeks, peaks, #1 weeks, and same-week battles.")
+    mode = st.radio("Comparison type", ["Songs", "Artists"], horizontal=True, key="rivalry_mode")
+    if mode == "Songs":
+        c1, c2 = st.columns(2)
+        term_a = c1.text_input("Song/artist A search", key="rival_song_a")
+        term_b = c2.text_input("Song/artist B search", key="rival_song_b")
+        if not term_a.strip() or not term_b.strip():
+            st.info("Search and select two canonical songs.")
+            return
+        ma = canonical_song_matches(term_a, 100)
+        mb = canonical_song_matches(term_b, 100)
+        if ma.empty or mb.empty:
+            st.warning("One of the searches returned no canonical song matches.")
+            return
+        ma["label"] = ma.apply(lambda r: f"{r['canonical_title']} — {r['canonical_artist']}", axis=1)
+        mb["label"] = mb.apply(lambda r: f"{r['canonical_title']} — {r['canonical_artist']}", axis=1)
+        la = c1.selectbox("Song A", ma["label"].tolist(), key="rival_song_a_choice")
+        lb = c2.selectbox("Song B", mb["label"].tolist(), key="rival_song_b_choice")
+        ha, sa, _ = canonical_song_history(int(ma.loc[ma["label"] == la, "canonical_song_id"].iloc[0]))
+        hb, sb, _ = canonical_song_history(int(mb.loc[mb["label"] == lb, "canonical_song_id"].iloc[0]))
+        a_name = str(sa.get("song", la)) if sa else la
+        b_name = str(sb.get("song", lb)) if sb else lb
+    else:
+        c1, c2 = st.columns(2)
+        role_mode = st.radio("Credit mode", ["Full credit", "Lead artist", "Featured artist"], horizontal=True, key="rival_artist_role")
+        term_a = c1.text_input("Artist A search", key="rival_artist_a")
+        term_b = c2.text_input("Artist B search", key="rival_artist_b")
+        if not term_a.strip() or not term_b.strip():
+            st.info("Search and select two artists.")
+            return
+        ma = artist_matches(term_a, role_mode, 100)
+        mb = artist_matches(term_b, role_mode, 100)
+        if ma.empty or mb.empty:
+            st.warning("One of the searches returned no artist matches.")
+            return
+        ma["label"] = ma["display_artist"]
+        mb["label"] = mb["display_artist"]
+        la = c1.selectbox("Artist A", ma["label"].tolist(), key="rival_artist_a_choice")
+        lb = c2.selectbox("Artist B", mb["label"].tolist(), key="rival_artist_b_choice")
+        ha, sa, _ = artist_history(str(ma.loc[ma["label"] == la, "normalized_artist"].iloc[0]), role_mode)
+        hb, sb, _ = artist_history(str(mb.loc[mb["label"] == lb, "normalized_artist"].iloc[0]), role_mode)
+        a_name = str(sa.get("artist", la)) if sa else la
+        b_name = str(sb.get("artist", lb)) if sb else lb
+
+    battle, metrics = _battle_summary(ha, hb, a_name, b_name)
+    if metrics:
+        render_kpis(metrics)
+    st.markdown("**Same-week battles**")
+    if battle.empty:
+        st.info("These two did not overlap on the chart under the selected comparison mode.")
+    else:
+        _display_df(battle)
+    st.markdown("**A history**")
+    _display_df(ha.head(200))
+    st.markdown("**B history**")
+    _display_df(hb.head(200))
+
 def render_special_tables_tab() -> None:
     st.subheader("Quick tables")
     subsection = st.selectbox(
@@ -5737,7 +6388,8 @@ def render_special_tables_tab() -> None:
         )
         limit = st.slider("Rows", 10, 500, 100, 10, key="quick_debuts_limit")
         st.markdown(f"**{table_kind}**")
-        _display_df(load_special_entries(table_kind, limit))
+        table = load_special_entries(table_kind, limit).drop(columns=["last_week_position"], errors="ignore")
+        _display_df(table)
 
     else:
         feat_view = st.selectbox(
@@ -5805,10 +6457,13 @@ def main() -> None:
             "Week browser",
             "Canonical song history",
             "Artist history",
+            "Chart Recap Generator",
+            "Rivalries / Head-to-Head",
             "Quick tables",
             "Analytics",
             "Weekly Top Artists",
             "Forecast Lab",
+            "Forecast Lab Scorecard",
             "Admin",
         ],
         key="main_section_selector",
@@ -5839,6 +6494,10 @@ def main() -> None:
         render_song_history_tab()
     elif main_section == "Artist history":
         render_artist_history_tab()
+    elif main_section == "Chart Recap Generator":
+        render_chart_recap_tab()
+    elif main_section == "Rivalries / Head-to-Head":
+        render_rivalries_tab()
     elif main_section == "Quick tables":
         render_special_tables_tab()
     elif main_section == "Analytics":
@@ -5847,6 +6506,8 @@ def main() -> None:
         render_weekly_top_artists_tab()
     elif main_section == "Forecast Lab":
         render_forecast_lab_tab()
+    elif main_section == "Forecast Lab Scorecard":
+        render_forecast_scorecard_tab()
     else:
         render_admin_tab()
 
