@@ -612,7 +612,7 @@ def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[s
         SELECT
             alias_song_title AS song,
             alias_artist AS artist,
-            entry_count AS chart_weeks,
+            COALESCE(NULLIF(week_count, 0), entry_count, 0) AS chart_weeks,
             week_count,
             first_chart_date AS first_date,
             last_chart_date AS last_date
@@ -717,7 +717,7 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
         credits.groupby(["song_key"], dropna=True)
         .agg(
             song=("title", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
-            chart_weeks=("entry_id", "count"),
+            chart_weeks=("entry_id", "nunique"),
             first_date=("chart_date", "min"),
             last_date=("chart_date", "max"),
             peak=("position", "min"),
@@ -770,7 +770,7 @@ def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
             top10.groupby("artist_key", dropna=True)
             .agg(
                 lead_artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
-                top_10_weeks=("entry_id", "count"),
+                top_10_weeks=("entry_id", "nunique"),
                 distinct_songs=("song_key", "nunique"),
                 first_date=("chart_date", "min"),
                 last_date=("chart_date", "max"),
@@ -1207,16 +1207,23 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
         last_chart_date=("last_chart_date", "max"),
     ).reset_index()
 
-    week_agg = df_artist_credits.groupby(["artist_key"], dropna=True).agg(
-        total_chart_entries=("song_key", "nunique"),
-        total_chart_weeks=("song_key", "size"),
-        total_top20_weeks=("top20_flag", "sum"),
-        total_top10_weeks=("top10_flag", "sum"),
-        total_top5_weeks=("top5_flag", "sum"),
-        total_num1_weeks=("num1_flag", "sum"),
-        lead_chart_weeks=("artist_role_mode", lambda s: int((s == "Lead").sum())),
-        featured_chart_weeks=("artist_role_mode", lambda s: int((s == "Featured").sum())),
-    ).reset_index()
+    # "Chart weeks" should mean actual unique chart appearances, not raw credit-row counts.
+    # This avoids inflated totals when an artist has multiple resolved credit rows attached
+    # to the same weekly entry.
+    week_rows: list[dict[str, object]] = []
+    for artist_key, g in df_artist_credits.groupby("artist_key", dropna=True):
+        week_rows.append({
+            "artist_key": artist_key,
+            "total_chart_entries": int(g["song_key"].nunique()),
+            "total_chart_weeks": int(g["entry_id"].nunique()),
+            "total_top20_weeks": int(g.loc[g["position"] <= 20, "entry_id"].nunique()),
+            "total_top10_weeks": int(g.loc[g["position"] <= 10, "entry_id"].nunique()),
+            "total_top5_weeks": int(g.loc[g["position"] <= 5, "entry_id"].nunique()),
+            "total_num1_weeks": int(g.loc[g["position"] == 1, "entry_id"].nunique()),
+            "lead_chart_weeks": int(g.loc[g["artist_role_mode"] == "Lead", "entry_id"].nunique()),
+            "featured_chart_weeks": int(g.loc[g["artist_role_mode"] == "Featured", "entry_id"].nunique()),
+        })
+    week_agg = pd.DataFrame(week_rows)
 
     role_song_agg = (
         df_artist_credits.groupby(["artist_key", "artist_role_mode"], dropna=True)["song_key"]
@@ -1240,8 +1247,32 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
         lambda r: preferred_artist_display(r["artist_key"], r.get("artist", "")),
         axis=1,
     )
-    out["lead_distinct_songs"] = out["lead_distinct_songs"].fillna(0).astype(int)
-    out["featured_distinct_songs"] = out["featured_distinct_songs"].fillna(0).astype(int)
+    count_cols = [
+        "total_chart_entries",
+        "total_chart_weeks",
+        "total_top20_weeks",
+        "total_top10_weeks",
+        "total_top5_weeks",
+        "total_num1_weeks",
+        "lead_chart_weeks",
+        "featured_chart_weeks",
+        "distinct_songs",
+        "top20_hits",
+        "top10_hits",
+        "top5_hits",
+        "num1_hits",
+        "lead_distinct_songs",
+        "featured_distinct_songs",
+        "max_simultaneous_entries",
+    ]
+    for col in count_cols:
+        if col not in out.columns:
+            out[col] = 0
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+
+    # Keep rows with partial merge data from ever surfacing as a blank/nan artist label.
+    out["artist"] = out["artist"].fillna(out["artist_key"].astype(str))
+
     out["active_span_weeks"] = (
         (pd.to_datetime(out["last_chart_date"]) - pd.to_datetime(out["first_chart_date"])) / pd.Timedelta(days=7)
     ).fillna(0).round().astype(int) + 1
@@ -2268,6 +2299,22 @@ def _render_artists(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     if artists.empty:
         st.info("No artist-summary rows available for the selected filters.")
         return
+    count_cols = [
+        "total_chart_weeks",
+        "total_top10_weeks",
+        "total_num1_weeks",
+        "featured_chart_weeks",
+        "distinct_songs",
+        "max_simultaneous_entries",
+        "top10_hits",
+        "num1_hits",
+    ]
+    for col in count_cols:
+        if col in artists.columns:
+            artists[col] = pd.to_numeric(artists[col], errors="coerce").fillna(0)
+    if "artist" in artists.columns:
+        artists["artist"] = artists["artist"].fillna(artists["artist_key"].astype(str))
+
     top_chart_weeks = artists.sort_values(["total_chart_weeks", "artist"], ascending=[False, True]).iloc[0]
     top_top10 = artists.sort_values(["total_top10_weeks", "artist"], ascending=[False, True]).iloc[0]
     top_num1 = artists.sort_values(["total_num1_weeks", "artist"], ascending=[False, True]).iloc[0]
@@ -2313,13 +2360,13 @@ def _render_artists(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         key = labels[selected]
         row = artists.loc[artists["artist_key"] == key].iloc[0]
         render_kpis([
-            ("Distinct songs", int(row["distinct_songs"])),
-            ("Chart weeks", int(row["total_chart_weeks"])),
-            ("Featured weeks", int(row["featured_chart_weeks"])),
-            ("Top 10 hits", int(row["top10_hits"])),
-            ("#1 hits", int(row["num1_hits"])),
+            ("Distinct songs", _safe_int(row["distinct_songs"]) or 0),
+            ("Chart weeks", _safe_int(row["total_chart_weeks"]) or 0),
+            ("Featured weeks", _safe_int(row["featured_chart_weeks"]) or 0),
+            ("Top 10 hits", _safe_int(row["top10_hits"]) or 0),
+            ("#1 hits", _safe_int(row["num1_hits"]) or 0),
             ("Best peak", _fmt_rank(row["best_peak"])),
-            ("Max simultaneous", int(row["max_simultaneous_entries"] or 0)),
+            ("Max simultaneous", _safe_int(row["max_simultaneous_entries"]) or 0),
         ])
         artist_song_keys = pkg["artist_credits"].loc[pkg["artist_credits"]["artist_key"] == key, "song_key"].unique().tolist()
         artist_songs = songs.loc[songs["song_key"].isin(artist_song_keys)].sort_values(["peak_position", "total_chart_weeks", "title"], ascending=[True, False, True])
@@ -2506,7 +2553,7 @@ def admin_song_aliases(canonical_song_id: int) -> pd.DataFrame:
         SELECT
             alias_song_title AS song,
             alias_artist AS artist,
-            entry_count AS chart_weeks,
+            COALESCE(NULLIF(week_count, 0), entry_count, 0) AS chart_weeks,
             week_count,
             first_chart_date AS first_date,
             last_chart_date AS last_date
@@ -3732,7 +3779,7 @@ def admin_artist_variants_for_key(artist_key: str) -> pd.DataFrame:
     return (
         subset.groupby(["artist", "artist_role_mode"], dropna=True)
         .agg(
-            chart_weeks=("entry_id", "count"),
+            chart_weeks=("entry_id", "nunique"),
             first_date=("chart_date", "min"),
             last_date=("chart_date", "max"),
             best_peak=("position", "min"),
@@ -6093,7 +6140,7 @@ def render_artist_career_timeline_tab() -> None:
     st.markdown("**Signature songs**")
     _display_df(songs.head(25), ["song", "chart_weeks", "first_date", "last_date", "peak"])
     yearly = h.groupby(h["chart_date"].dt.year).agg(
-        chart_weeks=("song", "count"),
+        chart_weeks=("song", "count"),  # one deduped history row per actual chart appearance
         distinct_songs=("song", "nunique"),
         best_peak=("position", "min"),
     ).reset_index().rename(columns={"chart_date": "year"})
