@@ -1212,6 +1212,13 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
     # to the same weekly entry.
     week_rows: list[dict[str, object]] = []
     for artist_key, g in df_artist_credits.groupby("artist_key", dropna=True):
+        num1_rows = g.loc[g["position"] == 1].copy()
+        first_num1_date = pd.NaT
+        last_num1_date = pd.NaT
+        if not num1_rows.empty:
+            first_num1_date = pd.to_datetime(num1_rows["chart_date"], errors="coerce").min()
+            last_num1_date = pd.to_datetime(num1_rows["chart_date"], errors="coerce").max()
+
         week_rows.append({
             "artist_key": artist_key,
             "total_chart_entries": int(g["song_key"].nunique()),
@@ -1220,6 +1227,8 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
             "total_top10_weeks": int(g.loc[g["position"] <= 10, "entry_id"].nunique()),
             "total_top5_weeks": int(g.loc[g["position"] <= 5, "entry_id"].nunique()),
             "total_num1_weeks": int(g.loc[g["position"] == 1, "entry_id"].nunique()),
+            "first_num1_date": first_num1_date,
+            "last_num1_date": last_num1_date,
             "lead_chart_weeks": int(g.loc[g["artist_role_mode"] == "Lead", "entry_id"].nunique()),
             "featured_chart_weeks": int(g.loc[g["artist_role_mode"] == "Featured", "entry_id"].nunique()),
         })
@@ -1272,6 +1281,17 @@ def build_artist_summary(df_artist_credits: pd.DataFrame, df_song: pd.DataFrame,
 
     # Keep rows with partial merge data from ever surfacing as a blank/nan artist label.
     out["artist"] = out["artist"].fillna(out["artist_key"].astype(str))
+
+    def _num1_date_range(row: pd.Series) -> str:
+        first = pd.to_datetime(row.get("first_num1_date"), errors="coerce")
+        last = pd.to_datetime(row.get("last_num1_date"), errors="coerce")
+        if pd.isna(first) or pd.isna(last):
+            return "—"
+        first_s = first.strftime("%Y-%m-%d")
+        last_s = last.strftime("%Y-%m-%d")
+        return first_s if first_s == last_s else f"{first_s} – {last_s}"
+
+    out["num1_date_range"] = out.apply(_num1_date_range, axis=1)
 
     out["active_span_weeks"] = (
         (pd.to_datetime(out["last_chart_date"]) - pd.to_datetime(out["first_chart_date"])) / pd.Timedelta(days=7)
@@ -2350,7 +2370,10 @@ def _render_artists(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         st.markdown("**Most distinct songs charted**")
         _display_df(artists.sort_values(["distinct_songs", "artist"], ascending=[False, True]).head(top_n), ["artist", "distinct_songs", "lead_distinct_songs", "featured_distinct_songs", "total_chart_weeks", "best_peak"])
         st.markdown("**Most #1 hits**")
-        _display_df(artists.sort_values(["num1_hits", "total_num1_weeks"], ascending=[False, False]).head(top_n), ["artist", "num1_hits", "total_num1_weeks", "best_peak"])
+        _display_df(
+            artists.sort_values(["num1_hits", "total_num1_weeks", "artist"], ascending=[False, False, True]).head(top_n),
+            ["artist", "num1_hits", "total_num1_weeks", "num1_date_range"],
+        )
         st.markdown("**Most simultaneous entries**")
         _display_df(artists.sort_values(["max_simultaneous_entries", "week_of_max_simultaneous_entries"], ascending=[False, False]).head(top_n), ["artist", "max_simultaneous_entries", "week_of_max_simultaneous_entries", "distinct_songs", "total_chart_weeks"])
     labels = {row.artist: row.artist_key for row in artists.sort_values("artist").itertuples(index=False) if pd.notna(row.artist_key)}
