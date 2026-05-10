@@ -564,6 +564,7 @@ def canonical_song_history(canonical_song_id: int) -> tuple[pd.DataFrame, dict[s
             COALESCE(cs.canonical_lead_artist, cs.canonical_artist) AS lead_artist,
             COALESCE(cs.canonical_featured_artist, '') AS featured_artist,
             COUNT(DISTINCT e.entry_id) AS chart_weeks,
+            ROUND(AVG(e.position), 2) AS avg_position,
             MIN(cw.chart_date) AS first_date,
             MAX(cw.chart_date) AS last_date,
             MIN(e.position) AS peak,
@@ -694,10 +695,13 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
     fallback_artist = artist_name.mode().iloc[0] if not artist_name.empty else normalized_artist
     display_artist = preferred_artist_display(normalized_artist, fallback_artist)
 
+    song_peaks_for_stats = credits.groupby("song_key", dropna=True)["position"].min()
     stats = {
         "artist": display_artist,
         "chart_weeks": int(credits["entry_id"].nunique()),
         "distinct_songs": int(credits["song_key"].nunique()),
+        "num1_songs": int((song_peaks_for_stats == 1).sum()),
+        "top10_songs": int((song_peaks_for_stats <= 10).sum()),
         "peak": int(credits["position"].min()),
         "first_date": pd.to_datetime(credits["chart_date"]).min().strftime("%Y-%m-%d"),
         "last_date": pd.to_datetime(credits["chart_date"]).max().strftime("%Y-%m-%d"),
@@ -4986,11 +4990,12 @@ def render_song_history_tab() -> None:
             selected_song_id = display_options[selected_label]
             history, stats, aliases = canonical_song_history(selected_song_id)
             if stats:
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Peak", f"#{int(stats['peak'])}")
                 c2.metric("Chart weeks", int(stats["chart_weeks"]))
-                c3.metric("First week", stats["first_date"])
-                c4.metric("Last week", stats["last_date"])
+                c3.metric("Avg position", f"{float(stats.get('avg_position') or 0):.2f}")
+                c4.metric("First week", stats["first_date"])
+                c5.metric("Last week", stats["last_date"])
                 full_credit = _escape_streamlit_caption_text(stats['artist'])
                 lead_credit = _escape_streamlit_caption_text(stats['lead_artist'])
                 featured_credit = _escape_streamlit_caption_text(stats['featured_artist'] or '—')
@@ -5052,11 +5057,21 @@ def render_artist_history_tab() -> None:
             selected_artist = display_options[selected_label]
             history, stats, songs = artist_history(selected_artist, role_mode)
             if stats:
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Peak", f"#{int(stats['peak'])}")
-                c2.metric("Chart weeks", int(stats["chart_weeks"]))
-                c3.metric("Distinct songs", int(stats["distinct_songs"]))
-                c4.metric("Span", f"{stats['first_date']} to {stats['last_date']}")
+                c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1.5])
+                c1.metric("Chart weeks", int(stats["chart_weeks"]))
+                c2.metric("Distinct songs", int(stats["distinct_songs"]))
+                c3.metric("#1 songs", int(stats.get("num1_songs", 0)))
+                c4.metric("Top 10 songs", int(stats.get("top10_songs", 0)))
+                span_text = f"{stats['first_date']} to {stats['last_date']}"
+                c5.markdown(
+                    """
+                    <div style="line-height:1.15; padding-top:0.15rem;">
+                        <div style="font-size:0.875rem; color:rgba(49,51,63,0.75); margin-bottom:0.35rem;">Span</div>
+                        <div style="font-size:1.35rem; font-weight:400; white-space:normal; overflow-wrap:anywhere;">{span_text}</div>
+                    </div>
+                    """.format(span_text=span_text),
+                    unsafe_allow_html=True,
+                )
                 st.caption(f"Mode: {artist_role_config(role_mode)['label']}")
 
                 view = st.radio(
@@ -6101,6 +6116,7 @@ def render_song_lifecycle_tab() -> None:
     render_kpis([
         ("Peak", _fmt_rank(stats.get("peak"))),
         ("Chart weeks", stats.get("chart_weeks", "—")),
+        ("Avg position", f"{float(stats.get('avg_position') or 0):.2f}"),
         ("First week", stats.get("first_date", "—")),
         ("Last week", stats.get("last_date", "—")),
         ("Lifecycle type", _classify_song_lifecycle(history)),
