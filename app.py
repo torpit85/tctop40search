@@ -460,6 +460,7 @@ def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]
             GROUP BY ke.song_identity
         )
         SELECT
+            e.entry_id,
             e.position,
             es.last_week_position,
             CASE
@@ -487,6 +488,7 @@ def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]
         ORDER BY e.position
         """
     df = pd.read_sql_query(sql, conn, params=(chart_date, chart_date))
+    df = _attach_momentum_awards_to_chart_df(df, chart_date)
     return df, meta
 
 
@@ -947,6 +949,350 @@ def load_analytics_base() -> pd.DataFrame:
     return df
 
 
+def _momentum_debut_bonus(position: object) -> float:
+    pos = _safe_int(position)
+    if pos is None:
+        return 0.0
+    if pos == 1:
+        return 30.0
+    if pos <= 5:
+        return 22.0
+    if pos <= 10:
+        return 16.0
+    if pos <= 20:
+        return 8.0
+    return 3.0
+
+
+def _momentum_reentry_bonus(position: object) -> float:
+    pos = _safe_int(position)
+    if pos is None:
+        return 0.0
+    if pos <= 10:
+        return 12.0
+    if pos <= 20:
+        return 7.0
+    return 3.0
+
+
+def _momentum_hold_bonus(position: object, move: object) -> float:
+    pos = _safe_int(position)
+    try:
+        mv = float(move)
+    except Exception:
+        return 0.0
+    if pos is None or mv != 0:
+        return 0.0
+    if pos == 1:
+        return 12.0
+    if pos <= 3:
+        return 8.0
+    if pos <= 5:
+        return 6.0
+    if pos <= 10:
+        return 4.0
+    if pos <= 20:
+        return 2.0
+    return 0.0
+
+
+def _momentum_drop_penalty(row: pd.Series) -> float:
+    move = row.get("move")
+    if move is None or pd.isna(move) or float(move) >= 0:
+        return 0.0
+    drop = abs(float(move))
+    penalty = 2.0 if drop <= 3 else 5.0 if drop <= 7 else 10.0
+    if bool(row.get("exited_top10_this_week", False)):
+        penalty += 5.0
+    if bool(row.get("has_prior_rank", False)) and row.get("last_week_position", 999) <= 5 and row.get("position", 999) > 5:
+        penalty += 4.0
+    return penalty
+
+
+def _momentum_fatigue_penalty(row: pd.Series) -> float:
+    weeks = _safe_int(row.get("weeks_on_chart")) or 0
+    move = row.get("move")
+    not_gaining = pd.isna(move) or float(move) <= 0
+    if not not_gaining:
+        return 0.0
+    if weeks > 40:
+        return 10.0
+    if weeks > 30:
+        return 6.0
+    if weeks > 20:
+        return 3.0
+    return 0.0
+
+
+def _momentum_type(row: pd.Series) -> str:
+    pos = _safe_int(row.get("position")) or 999
+    move = row.get("move")
+    mv = 0.0 if move is None or pd.isna(move) else float(move)
+    if bool(row.get("is_debut", False)):
+        return "Debut Heat" if pos <= 20 else "New Arrival"
+    if bool(row.get("is_reentry", False)):
+        return "Rebound"
+    if mv <= -8:
+        return "Freefall"
+    if mv < 0 and pos <= 10:
+        return "Cooling Hit"
+    if bool(row.get("is_hold", False)) and pos <= 10:
+        return "Power Hold"
+    if mv >= 5 and pos <= 10:
+        return "Breakout"
+    if mv > 0 and pos <= 5:
+        return "Peak Threat"
+    if mv > 0:
+        return "Building"
+    if bool(row.get("is_hold", False)):
+        return "Holding"
+    if mv < 0:
+        return "Sliding"
+    return "Stable"
+
+
+def _merge_markers(base_marker: object, awards: list[str]) -> str:
+    parts: list[str] = []
+    marker_text = "" if base_marker is None or pd.isna(base_marker) else str(base_marker).strip()
+    if marker_text and marker_text != "—":
+        for part in re.split(r"\s*;\s*", marker_text):
+            part = part.strip()
+            if part and part not in parts:
+                parts.append(part)
+    for award in ["MOMENTUM IMPACT", "GREATEST GAINER"]:
+        if award in awards and award not in parts:
+            parts.append(award)
+    return "; ".join(parts)
+
+
+def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
+    if chart.empty:
+        return chart
+    df = chart.copy().sort_values(["song_key", "chart_date", "position", "entry_id"]).reset_index(drop=True)
+    df["position_score"] = ((41 - pd.to_numeric(df["position"], errors="coerce")) / 40 * 100).clip(lower=0)
+    df["movement_raw"] = pd.to_numeric(df.get("move"), errors="coerce").fillna(0.0)
+    df["movement_clamped"] = df["movement_raw"].clip(-15, 15)
+    df["trend_raw"] = (
+        df.groupby("song_key", dropna=False)["movement_raw"]
+        .transform(lambda s: s.rolling(3, min_periods=1).mean())
+        .fillna(0.0)
+    )
+    df["trend_clamped"] = df["trend_raw"].clip(-10, 10)
+    df["debut_reentry_bonus"] = 0.0
+    df.loc[df["is_debut"], "debut_reentry_bonus"] = df.loc[df["is_debut"], "position"].map(_momentum_debut_bonus)
+    df.loc[df["is_reentry"], "debut_reentry_bonus"] = df.loc[df["is_reentry"], "position"].map(_momentum_reentry_bonus)
+    df["hold_bonus"] = df.apply(lambda r: _momentum_hold_bonus(r.get("position"), r.get("move")), axis=1)
+    df["drop_penalty"] = df.apply(_momentum_drop_penalty, axis=1)
+    df["fatigue_penalty"] = df.apply(_momentum_fatigue_penalty, axis=1)
+    df["raw_momentum_index"] = (
+        0.45 * df["position_score"]
+        + 2.0 * df["movement_clamped"]
+        + 1.5 * df["trend_clamped"]
+        + df["debut_reentry_bonus"]
+        + df["hold_bonus"]
+        - df["drop_penalty"]
+        - df["fatigue_penalty"]
+    ).clip(lower=0).round(2)
+    df["momentum_type"] = df.apply(_momentum_type, axis=1)
+
+    df = df.sort_values(["song_key", "chart_date", "position", "entry_id"]).reset_index(drop=True)
+    df["last_raw_momentum_index"] = df.groupby("song_key", dropna=False)["raw_momentum_index"].shift(1)
+    df["last_momentum_chart_date"] = df.groupby("song_key", dropna=False)["chart_date"].shift(1)
+
+    ordered_dates = sorted(pd.to_datetime(df["chart_date"].dropna().unique()))
+    prev_date_map = {ordered_dates[i]: ordered_dates[i - 1] for i in range(1, len(ordered_dates))}
+    df["previous_available_chart_date"] = df["chart_date"].map(prev_date_map)
+    df["raw_momentum_change"] = (df["raw_momentum_index"] - df["last_raw_momentum_index"]).round(2)
+    df["raw_momentum_pct_gain"] = (df["raw_momentum_change"] / df["last_raw_momentum_index"] * 100).round(1)
+    df.loc[df["last_raw_momentum_index"].isna() | (df["last_raw_momentum_index"] <= 0), "raw_momentum_pct_gain"] = pd.NA
+    df["greatest_gainer_eligible"] = (
+        df["last_raw_momentum_index"].ge(10)
+        & df["raw_momentum_index"].gt(df["last_raw_momentum_index"])
+        & (pd.to_datetime(df["last_momentum_chart_date"]) == pd.to_datetime(df["previous_available_chart_date"]))
+    )
+
+    df["momentum_award"] = ""
+    for chart_date, week in df.groupby("chart_date", sort=False):
+        if week.empty:
+            continue
+        impact_idx = week.sort_values(["raw_momentum_index", "position"], ascending=[False, True]).index[0]
+        df.loc[impact_idx, "momentum_award"] = _merge_markers(df.loc[impact_idx, "momentum_award"], ["MOMENTUM IMPACT"])
+        eligible = week.loc[week["greatest_gainer_eligible"].fillna(False)].copy()
+        if not eligible.empty:
+            gainer_idx = eligible.sort_values(
+                ["raw_momentum_pct_gain", "raw_momentum_change", "position"],
+                ascending=[False, False, True],
+            ).index[0]
+            df.loc[gainer_idx, "momentum_award"] = _merge_markers(df.loc[gainer_idx, "momentum_award"], ["GREATEST GAINER"])
+
+    df["derived_marker_with_momentum"] = df.apply(
+        lambda r: _merge_markers(r.get("derived_marker"), [p.strip() for p in str(r.get("momentum_award", "")).split(";") if p.strip()]),
+        axis=1,
+    )
+
+    max_by_week = df.groupby("chart_date")["raw_momentum_index"].transform("max")
+    df["normalized_momentum_index"] = (df["raw_momentum_index"] / max_by_week.replace(0, pd.NA) * 100).round(1)
+    return df.sort_values(["chart_date", "position", "entry_id"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_momentum_index_base() -> pd.DataFrame:
+    return _add_momentum_columns(load_analytics_base())
+
+
+def _attach_momentum_awards_to_chart_df(df: pd.DataFrame, chart_date: str) -> pd.DataFrame:
+    if df.empty or "entry_id" not in df.columns:
+        return df
+    momentum = load_momentum_index_base()
+    if momentum.empty:
+        return df
+    week = momentum.loc[momentum["chart_date"].dt.strftime("%Y-%m-%d") == chart_date, [
+        "entry_id",
+        "raw_momentum_index",
+        "normalized_momentum_index",
+        "last_raw_momentum_index",
+        "raw_momentum_change",
+        "raw_momentum_pct_gain",
+        "momentum_type",
+        "momentum_award",
+        "derived_marker_with_momentum",
+    ]].copy()
+    if week.empty:
+        return df
+    out = df.merge(week, on="entry_id", how="left")
+    if "derived_marker_with_momentum" in out.columns:
+        out["derived_marker"] = out["derived_marker_with_momentum"].where(
+            out["derived_marker_with_momentum"].notna(),
+            out["derived_marker"],
+        )
+    return out
+
+
+
+def _momentum_display_table(df: pd.DataFrame, sort_by_momentum: bool = True) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if sort_by_momentum:
+        out = out.sort_values(["raw_momentum_index", "position"], ascending=[False, True])
+    out = out.reset_index(drop=True)
+    out.insert(0, "momentum_rank", range(1, len(out) + 1))
+    out = out[[c for c in [
+        "momentum_rank", "position", "title", "artist", "derived_marker_with_momentum",
+        "last_week_position", "move", "weeks_on_chart", "raw_momentum_index",
+        "normalized_momentum_index", "last_raw_momentum_index", "raw_momentum_change",
+        "raw_momentum_pct_gain", "momentum_type",
+    ] if c in out.columns]].copy()
+    rename = {
+        "momentum_rank": "Momentum Rank",
+        "position": "Chart Rank",
+        "title": "Song",
+        "artist": "Artist",
+        "derived_marker_with_momentum": "Marker",
+        "last_week_position": "Last Week",
+        "move": "Movement",
+        "weeks_on_chart": "Weeks",
+        "raw_momentum_index": "Raw Momentum Index",
+        "normalized_momentum_index": "Normalized Index",
+        "last_raw_momentum_index": "Last Raw Index",
+        "raw_momentum_change": "Raw Change",
+        "raw_momentum_pct_gain": "% Gain",
+        "momentum_type": "Momentum Type",
+    }
+    out = out.rename(columns=rename)
+    if "Movement" in out.columns:
+        out["Movement"] = out["Movement"].apply(_format_movement)
+    if "% Gain" in out.columns:
+        out["% Gain"] = out["% Gain"].map(lambda v: "—" if pd.isna(v) else f"{float(v):+.1f}%")
+    for col in ["Raw Momentum Index", "Normalized Index", "Last Raw Index", "Raw Change"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda v: "—" if pd.isna(v) else f"{float(v):.1f}")
+    return out
+
+
+def render_momentum_index_tab() -> None:
+    st.subheader("Momentum Index")
+    st.caption("Measures weekly chart energy from rank strength, movement, recent trend, debut/re-entry status, strong holds, and cooling/fatigue penalties. Momentum Impact uses the highest raw score; Greatest Gainer uses the largest percentage gain in raw score from the previous available chart week.")
+    momentum = load_momentum_index_base()
+    if momentum.empty:
+        st.info("No momentum rows are available.")
+        return
+
+    view = st.radio(
+        "Momentum view",
+        ["Weekly Momentum", "Momentum Changes", "Song Momentum History"],
+        horizontal=True,
+        key="momentum_view",
+    )
+
+    if view in {"Weekly Momentum", "Momentum Changes"}:
+        dates = [d.strftime("%Y-%m-%d") for d in sorted(momentum["chart_date"].dropna().unique(), reverse=True)]
+        selected_date = st.selectbox("Chart week", dates, index=0, key="momentum_chart_week")
+        week = momentum.loc[momentum["chart_date"].dt.strftime("%Y-%m-%d") == selected_date].copy()
+        if week.empty:
+            st.info("No momentum rows are available for this week.")
+            return
+
+        impact = week.loc[week["momentum_award"].astype(str).str.contains("MOMENTUM IMPACT", na=False)].head(1)
+        gainer = week.loc[week["momentum_award"].astype(str).str.contains("GREATEST GAINER", na=False)].head(1)
+        cols = st.columns(2)
+        if not impact.empty:
+            r = impact.iloc[0]
+            cols[0].metric("Momentum Impact", _song_artist_label_from_row({"song": r["title"], "artist": r["artist"]}), f"Raw {r['raw_momentum_index']:.1f}")
+        else:
+            cols[0].metric("Momentum Impact", "—")
+        if not gainer.empty:
+            r = gainer.iloc[0]
+            pct = r.get("raw_momentum_pct_gain")
+            delta = "" if pd.isna(pct) else f"{float(pct):+.1f}%"
+            cols[1].metric("Greatest Gainer", _song_artist_label_from_row({"song": r["title"], "artist": r["artist"]}), delta)
+        else:
+            cols[1].metric("Greatest Gainer", "—")
+
+        rows = st.slider("Rows", 10, 40, 40, 5, key=f"momentum_rows_{view}")
+        if view == "Weekly Momentum":
+            st.markdown("**Weekly Momentum ranking**")
+            _display_df(_momentum_display_table(week).head(rows))
+        else:
+            gains = week.loc[week["raw_momentum_change"].notna() & (week["raw_momentum_change"] > 0)].copy()
+            drops = week.loc[week["raw_momentum_change"].notna() & (week["raw_momentum_change"] < 0)].copy()
+            st.markdown("**Biggest raw-index gains**")
+            _display_df(_momentum_display_table(gains.sort_values(["raw_momentum_pct_gain", "raw_momentum_change", "position"], ascending=[False, False, True])).head(rows))
+            st.markdown("**Biggest raw-index drops**")
+            _display_df(_momentum_display_table(drops.sort_values(["raw_momentum_change", "position"], ascending=[True, True])).head(rows))
+        return
+
+    st.markdown("**Song Momentum History**")
+    term = st.text_input("Search song or artist", key="momentum_song_search")
+    if not term.strip():
+        st.info("Search for a song or artist to view its momentum history.")
+        return
+    matches = canonical_song_matches(term.strip(), limit=100)
+    if matches.empty:
+        st.info("No canonical song matches found.")
+        return
+    options = {
+        f"{r.canonical_title} — {r.canonical_artist} ({int(r.chart_weeks)} weeks)": int(r.canonical_song_id)
+        for r in matches.itertuples(index=False)
+    }
+    selected_label = st.selectbox("Canonical song", list(options.keys()), key="momentum_song_select")
+    selected_id = options[selected_label]
+    hist = momentum.loc[momentum["canonical_song_id"].fillna(-1).astype(int) == selected_id].copy()
+    if hist.empty:
+        st.info("No momentum history is available for this canonical song.")
+        return
+    hist = hist.sort_values("chart_date")
+    render_kpis([
+        ("Peak raw index", f"{hist['raw_momentum_index'].max():.1f}"),
+        ("Average raw index", f"{hist['raw_momentum_index'].mean():.1f}"),
+        ("Weeks", len(hist)),
+        ("Peak chart rank", _fmt_rank(hist["position"].min())),
+    ])
+    display = _momentum_display_table(hist.sort_values("chart_date"), sort_by_momentum=False)
+    if "Momentum Rank" in display.columns:
+        display = display.drop(columns=["Momentum Rank"])
+    display.insert(0, "Chart Date", hist["chart_date"].dt.strftime("%Y-%m-%d").tolist())
+    _display_df(display)
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
@@ -4852,6 +5198,9 @@ def _week_browser_display_table(df: pd.DataFrame) -> pd.DataFrame:
         "peak_position",
         "week_hit_peak",
         "canonical_song_id",
+        "raw_momentum_index",
+        "normalized_momentum_index",
+        "momentum_type",
     ]
     out = df[[c for c in visible_cols if c in df.columns]].copy()
     if "movement" in out.columns:
@@ -4867,8 +5216,15 @@ def _week_browser_display_table(df: pd.DataFrame) -> pd.DataFrame:
         "peak_position": "Peak Position",
         "week_hit_peak": "Week Hit Peak",
         "canonical_song_id": "Canonical Song ID",
+        "raw_momentum_index": "Raw Momentum Index",
+        "normalized_momentum_index": "Normalized Index",
+        "momentum_type": "Momentum Type",
     }
-    return out.rename(columns=rename_map)
+    out = out.rename(columns=rename_map)
+    for col in ["Raw Momentum Index", "Normalized Index"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda v: "—" if pd.isna(v) else f"{float(v):.1f}")
+    return out
 
 
 def _week_artist_appearances(df: pd.DataFrame) -> pd.DataFrame:
@@ -6669,6 +7025,7 @@ def main() -> None:
             "Quick tables",
             "Analytics",
             "Weekly Top Artists",
+            "Momentum Index",
             "Forecast Lab",
             "Forecast Lab Scorecard",
             "Admin",
@@ -6711,6 +7068,8 @@ def main() -> None:
         render_analytics_tab()
     elif main_section == "Weekly Top Artists":
         render_weekly_top_artists_tab()
+    elif main_section == "Momentum Index":
+        render_momentum_index_tab()
     elif main_section == "Forecast Lab":
         render_forecast_lab_tab()
     elif main_section == "Forecast Lab Scorecard":
