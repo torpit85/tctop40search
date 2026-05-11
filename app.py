@@ -949,6 +949,118 @@ def load_analytics_base() -> pd.DataFrame:
 
 
 
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_analytics_base_range(start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
+    """
+    Load Analytics chart rows for the selected date range, plus one following chart week.
+
+    The extra following chart week lets the app calculate next-week fields such as
+    dropped_out_next_week for the final selected week without returning the entire
+    chart history to pandas.
+    """
+    conn = get_connection()
+    sql = ENTRY_STATS_CTE + """
+        SELECT
+            e.entry_id,
+            cw.chart_date,
+            e.chart_week_id,
+            e.position,
+            es.last_week_position,
+            es.weeks_on_chart,
+            e.song_title_display AS title,
+            e.full_artist_display AS artist,
+            e.lead_artist_display AS lead_artist,
+            e.featured_artist_display AS featured_artist,
+            e.derived_marker,
+            e.derived_is_debut,
+            e.derived_is_reentry,
+            e.canonical_song_id,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            e.normalized_lead_artist,
+            e.normalized_featured_artist
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        LEFT JOIN entry_stats es ON es.entry_id = e.entry_id
+        WHERE DATE(cw.chart_date) >= DATE(?)
+          AND DATE(cw.chart_date) <= DATE(
+                COALESCE(
+                    (
+                        SELECT MIN(cw2.chart_date)
+                        FROM chart_week cw2
+                        WHERE DATE(cw2.chart_date) > DATE(?)
+                    ),
+                    ?
+                )
+          )
+        ORDER BY cw.chart_date, e.position
+    """
+    df = pd.read_sql_query(
+        sql,
+        conn,
+        params=(start_date.isoformat(), end_date.isoformat(), end_date.isoformat()),
+    )
+    if df.empty:
+        return df
+    df["chart_date"] = pd.to_datetime(df["chart_date"])
+    df["year"] = df["chart_date"].dt.year
+    df["month"] = df["chart_date"].dt.month
+    df["position"] = pd.to_numeric(df["position"], errors="coerce")
+    df["last_week_position"] = pd.to_numeric(df["last_week_position"], errors="coerce")
+    df["weeks_on_chart"] = pd.to_numeric(df["weeks_on_chart"], errors="coerce")
+    df["derived_is_debut"] = pd.to_numeric(df["derived_is_debut"], errors="coerce").fillna(0).astype(int)
+    df["derived_is_reentry"] = pd.to_numeric(df["derived_is_reentry"], errors="coerce").fillna(0).astype(int)
+    df["song_key"] = df["canonical_song_id"].apply(lambda x: f"cs_{int(x)}" if pd.notna(x) else None)
+    fallback_song_key = (
+        df["normalized_song_title"].fillna("").astype(str).str.strip().str.lower()
+        + "||"
+        + df["normalized_full_artist"].fillna("").astype(str).str.strip().str.lower()
+    )
+    df["song_key"] = df["song_key"].fillna(fallback_song_key)
+    df["artist_key"] = df["normalized_lead_artist"].fillna("").astype(str).str.strip().str.lower()
+    df.loc[df["artist_key"] == "", "artist_key"] = df["normalized_full_artist"].fillna("").astype(str).str.strip().str.lower()
+    df["artist_key"] = df["artist_key"].replace("", pd.NA)
+    df["artist_key"] = df["artist_key"].map(resolve_artist_key_alias)
+    df["is_debut"] = df["derived_is_debut"].eq(1)
+    df["is_reentry"] = df["derived_is_reentry"].eq(1)
+    df["has_prior_rank"] = df["last_week_position"].notna() & ~df["is_debut"] & ~df["is_reentry"]
+    df["move"] = pd.NA
+    df.loc[df["has_prior_rank"], "move"] = df.loc[df["has_prior_rank"], "last_week_position"] - df.loc[df["has_prior_rank"], "position"]
+    df["move"] = pd.to_numeric(df["move"], errors="coerce")
+    df["abs_move"] = df["move"].abs()
+    df["is_up"] = df["move"] > 0
+    df["is_down"] = df["move"] < 0
+    df["is_hold"] = df["move"] == 0
+    df["top20_flag"] = df["position"] <= 20
+    df["top10_flag"] = df["position"] <= 10
+    df["top5_flag"] = df["position"] <= 5
+    df["num1_flag"] = df["position"] == 1
+
+    ordered_dates = sorted(df["chart_date"].dropna().unique())
+    next_map = {ordered_dates[i]: ordered_dates[i + 1] for i in range(len(ordered_dates) - 1)}
+    df["next_chart_date"] = df["chart_date"].map(next_map)
+    next_lookup = df[["song_key", "chart_date", "position", "top10_flag", "top20_flag", "top5_flag"]].rename(
+        columns={
+            "chart_date": "next_chart_date",
+            "position": "next_position",
+            "top10_flag": "next_top10_flag",
+            "top20_flag": "next_top20_flag",
+            "top5_flag": "next_top5_flag",
+        }
+    )
+    df = df.merge(next_lookup, on=["song_key", "next_chart_date"], how="left")
+    df["present_next_week"] = df["next_position"].notna()
+    df["dropped_out_next_week"] = df["next_chart_date"].notna() & ~df["present_next_week"]
+    df["entered_top10_this_week"] = df["top10_flag"] & df["has_prior_rank"] & (df["last_week_position"] > 10)
+    df["entered_top20_this_week"] = df["top20_flag"] & df["has_prior_rank"] & (df["last_week_position"] > 20)
+    df["entered_top5_this_week"] = df["top5_flag"] & df["has_prior_rank"] & (df["last_week_position"] > 5)
+    df["exited_top10_this_week"] = df["has_prior_rank"] & (df["last_week_position"] <= 10) & (df["position"] > 10)
+
+    keep_mask = (df["chart_date"].dt.date >= start_date) & (df["chart_date"].dt.date <= end_date)
+    return df.loc[keep_mask].copy()
+
+
+
 def _split_credit_people(norm_value: object, display_value: object) -> list[tuple[str, str]]:
     norm_text = "" if norm_value is None else str(norm_value).strip()
     display_text = "" if display_value is None else str(display_value).strip()
@@ -1408,11 +1520,9 @@ def load_analytics_date_bounds() -> tuple[dt.date | None, dt.date | None]:
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def _analytics_filtered_chart(start_date: dt.date, end_date: dt.date, include_reentries: bool) -> pd.DataFrame:
-    chart = load_analytics_base().copy()
+    chart = load_analytics_base_range(start_date, end_date)
     if chart.empty:
         return chart
-    mask = (chart["chart_date"].dt.date >= start_date) & (chart["chart_date"].dt.date <= end_date)
-    chart = chart.loc[mask].copy()
     if not include_reentries:
         chart = chart.loc[~chart["is_reentry"]].copy()
     return chart
