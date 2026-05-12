@@ -1241,6 +1241,66 @@ def _momentum_num1_songs_display_table(df: pd.DataFrame, earliest_to_latest: boo
     return out
 
 
+def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Display the selected week's raw Momentum Index inputs, including the unclipped formula score."""
+    if df.empty:
+        return pd.DataFrame()
+    out = df.copy().sort_values(["raw_momentum_index", "position", "title"], ascending=[False, True, True]).reset_index(drop=True)
+    out.insert(0, "momentum_rank", range(1, len(out) + 1))
+    out["raw_momentum_index_unclipped"] = (
+        0.45 * pd.to_numeric(out.get("position_score"), errors="coerce").fillna(0.0)
+        + 2.0 * pd.to_numeric(out.get("movement_clamped"), errors="coerce").fillna(0.0)
+        + 1.5 * pd.to_numeric(out.get("trend_clamped"), errors="coerce").fillna(0.0)
+        + pd.to_numeric(out.get("debut_reentry_bonus"), errors="coerce").fillna(0.0)
+        + pd.to_numeric(out.get("hold_bonus"), errors="coerce").fillna(0.0)
+        - pd.to_numeric(out.get("drop_penalty"), errors="coerce").fillna(0.0)
+        - pd.to_numeric(out.get("fatigue_penalty"), errors="coerce").fillna(0.0)
+    ).round(2)
+    out = out[[c for c in [
+        "momentum_rank",
+        "title",
+        "artist",
+        "position_score",
+        "movement_clamped",
+        "trend_clamped",
+        "debut_reentry_bonus",
+        "hold_bonus",
+        "drop_penalty",
+        "fatigue_penalty",
+        "raw_momentum_index_unclipped",
+    ] if c in out.columns]].copy()
+    rename = {
+        "momentum_rank": "Momentum Rank",
+        "title": "Song",
+        "artist": "Artist",
+        "position_score": "Raw Position Score",
+        "movement_clamped": "Raw Clamped Movement Score",
+        "trend_clamped": "Raw Clamped Recent Trend",
+        "debut_reentry_bonus": "Raw Debut/Re-Entry bonus",
+        "hold_bonus": "Raw Hold Bonus",
+        "drop_penalty": "Raw Drop Penalty",
+        "fatigue_penalty": "Raw Fatigue Penalty",
+        "raw_momentum_index_unclipped": "Raw Momentum Index Score",
+    }
+    out = out.rename(columns=rename)
+    numeric_cols = [
+        "Raw Position Score",
+        "Raw Clamped Movement Score",
+        "Raw Clamped Recent Trend",
+        "Raw Debut/Re-Entry bonus",
+        "Raw Hold Bonus",
+        "Raw Drop Penalty",
+        "Raw Fatigue Penalty",
+        "Raw Momentum Index Score",
+    ]
+    for col in numeric_cols:
+        if col in out.columns:
+            # Keep these as numeric values so Streamlit sorts negative scores correctly.
+            # Formatting them as strings makes the column sort lexicographically.
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(1)
+    return out
+
+
 def render_momentum_index_tab() -> None:
     st.subheader("Momentum Index")
     st.caption("Measures weekly chart energy from rank strength, movement, recent trend, debut/re-entry status, strong holds, and cooling/fatigue penalties. Momentum Impact uses the highest raw score; Greatest Gainer uses the largest percentage gain in raw score from the previous available chart week.")
@@ -1387,6 +1447,10 @@ This makes each week easier to scan, but awards are based on the raw score.
         rows = st.slider("Rows", 10, 40, 40, 5, key="momentum_rows_weekly")
         st.markdown("**Weekly Momentum ranking**")
         _display_df(_momentum_display_table(week).head(rows))
+
+        with st.expander("Weekly Momentum raw data points", expanded=False):
+            st.caption("Raw scoring inputs for the selected chart week. The Raw Momentum Index Score shown here is the unclipped formula result, so it can go below zero for diagnostic purposes.")
+            _display_df(_momentum_raw_points_display_table(week))
         return
 
     if view == "#1 Songs":
