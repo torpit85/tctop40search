@@ -397,8 +397,22 @@ def run_search(query: str, limit: int, marker_filter: str) -> pd.DataFrame:
     return pd.read_sql_query(sql, conn, params=params)
 
 
+def _coerce_chart_date_value(value: object) -> str:
+    """Return a SQLite-safe YYYY-MM-DD string for chart date parameters."""
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, dt.datetime):
+        return value.date().isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+    text = "" if value is None else str(value).strip()
+    # Handles numpy.datetime64 / Timestamp-like string forms such as 2026-05-12T00:00:00.
+    return text[:10]
+
+
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_chart(chart_date: str) -> tuple[pd.DataFrame, dict[str, object] | None]:
+    chart_date = _coerce_chart_date_value(chart_date)
     conn = get_connection()
 
     # Be tolerant of older deployed DBs that may not have every chart_week metadata column.
