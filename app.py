@@ -5363,6 +5363,18 @@ def _format_movement(value: object) -> str:
     return str(iv)
 
 
+def _format_signed_decimal(value: object, digits: int = 1) -> str:
+    try:
+        fv = float(value)
+    except Exception:
+        return "—"
+    if math.isnan(fv):
+        return "—"
+    if fv > 0:
+        return f"+{fv:.{digits}f}"
+    return f"{fv:.{digits}f}"
+
+
 def _week_browser_summary(df: pd.DataFrame, previous_df: pd.DataFrame | None) -> dict[str, object]:
     if df.empty:
         return {
@@ -5370,6 +5382,9 @@ def _week_browser_summary(df: pd.DataFrame, previous_df: pd.DataFrame | None) ->
             "top_debut": "—",
             "biggest_climber": "—",
             "biggest_faller": "—",
+            "average_chart_age": "—",
+            "average_chart_movement": "—",
+            "average_absolute_movement": "—",
             "debuts": 0,
             "reentries": 0,
             "dropouts": 0,
@@ -5389,6 +5404,12 @@ def _week_browser_summary(df: pd.DataFrame, previous_df: pd.DataFrame | None) ->
     climbers = movers.loc[movers["movement"] > 0].sort_values(["movement", "position"], ascending=[False, True]) if not movers.empty else pd.DataFrame()
     fallers = movers.loc[movers["movement"] < 0].sort_values(["movement", "position"], ascending=[True, True]) if not movers.empty else pd.DataFrame()
 
+    weeks_on_chart = pd.to_numeric(df.get("weeks_on_chart"), errors="coerce")
+    avg_chart_age = float(weeks_on_chart.dropna().mean()) if weeks_on_chart.notna().any() else float("nan")
+    movement_values = pd.to_numeric(movers.get("movement"), errors="coerce") if not movers.empty else pd.Series(dtype="float64")
+    avg_chart_movement = float(movement_values.dropna().mean()) if movement_values.notna().any() else float("nan")
+    avg_absolute_movement = float(movement_values.dropna().abs().mean()) if movement_values.notna().any() else float("nan")
+
     previous_count = 0
     if previous_df is not None and not previous_df.empty:
         current_ids = _week_identity_set(df)
@@ -5406,6 +5427,9 @@ def _week_browser_summary(df: pd.DataFrame, previous_df: pd.DataFrame | None) ->
             f"{_week_row_label(fallers.iloc[0])} ({_format_movement(fallers.iloc[0]['movement'])})"
             if not fallers.empty else "—"
         ),
+        "average_chart_age": f"{avg_chart_age:.1f} weeks" if not math.isnan(avg_chart_age) else "—",
+        "average_chart_movement": _format_signed_decimal(avg_chart_movement) if not math.isnan(avg_chart_movement) else "—",
+        "average_absolute_movement": f"{avg_absolute_movement:.1f}" if not math.isnan(avg_absolute_movement) else "—",
         "debuts": int(_marker_contains(df, "DEBUT").sum()),
         "reentries": int(_marker_contains(df, "RE-ENTRY").sum()),
         "dropouts": previous_count,
@@ -5508,6 +5532,9 @@ def _render_week_summary_expander(summary: dict[str, object]) -> None:
         {"Metric": "Re-entries", "Value": summary["reentries"]},
         {"Metric": "Biggest climber", "Value": summary["biggest_climber"]},
         {"Metric": "Biggest faller", "Value": summary["biggest_faller"]},
+        {"Metric": "Average Chart Age", "Value": summary["average_chart_age"]},
+        {"Metric": "Average Chart Movement", "Value": summary["average_chart_movement"]},
+        {"Metric": "Average Absolute Movement", "Value": summary["average_absolute_movement"]},
     ])
     # Keep the compact summary Arrow-friendly: this column mixes text labels
     # and numeric counts, so render all values as strings.
