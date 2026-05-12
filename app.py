@@ -1178,7 +1178,7 @@ def _momentum_display_table(df: pd.DataFrame, sort_by_momentum: bool = True) -> 
     out = out.reset_index(drop=True)
     out.insert(0, "momentum_rank", range(1, len(out) + 1))
     out = out[[c for c in [
-        "momentum_rank", "position", "title", "artist", "derived_marker_with_momentum",
+        "momentum_rank", "title", "artist", "derived_marker_with_momentum", "position",
         "last_week_position", "move", "weeks_on_chart", "raw_momentum_index",
         "normalized_momentum_index", "last_raw_momentum_index", "raw_momentum_change",
         "raw_momentum_pct_gain", "momentum_type",
@@ -1210,9 +1210,144 @@ def _momentum_display_table(df: pd.DataFrame, sort_by_momentum: bool = True) -> 
     return out
 
 
+def _momentum_num1_songs_display_table(df: pd.DataFrame, earliest_to_latest: bool = False) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    out = df.copy().sort_values(
+        ["chart_date", "raw_momentum_index", "position", "title"],
+        ascending=[earliest_to_latest, False, True, True],
+    ).reset_index(drop=True)
+    out = out[[c for c in [
+        "chart_date", "title", "artist", "raw_momentum_index",
+        "raw_momentum_change", "raw_momentum_pct_gain",
+    ] if c in out.columns]].copy()
+    rename = {
+        "chart_date": "Chart Date",
+        "title": "Song",
+        "artist": "Artist",
+        "raw_momentum_index": "Raw Momentum Score",
+        "raw_momentum_change": "Raw Change",
+        "raw_momentum_pct_gain": "% Change",
+    }
+    out = out.rename(columns=rename)
+    if "Chart Date" in out.columns:
+        out["Chart Date"] = pd.to_datetime(out["Chart Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    if "% Change" in out.columns:
+        out["% Change"] = out["% Change"].map(lambda v: "—" if pd.isna(v) else f"{float(v):+.1f}%")
+    if "Raw Momentum Score" in out.columns:
+        out["Raw Momentum Score"] = out["Raw Momentum Score"].map(lambda v: "—" if pd.isna(v) else f"{float(v):.1f}")
+    if "Raw Change" in out.columns:
+        out["Raw Change"] = out["Raw Change"].map(lambda v: "—" if pd.isna(v) else f"{float(v):+.1f}")
+    return out
+
+
 def render_momentum_index_tab() -> None:
     st.subheader("Momentum Index")
     st.caption("Measures weekly chart energy from rank strength, movement, recent trend, debut/re-entry status, strong holds, and cooling/fatigue penalties. Momentum Impact uses the highest raw score; Greatest Gainer uses the largest percentage gain in raw score from the previous available chart week.")
+
+    with st.expander("Momentum Index explanations and calculations", expanded=False):
+        st.markdown(
+            """
+**Raw Momentum Index** is the internal score used for Momentum awards. **Normalized Index** is only a display score that scales the week leader to 100.
+
+**Main formula**
+
+```text
+Raw Momentum Index =
+    0.45 × Position Score
+  + 2.00 × Clamped Movement
+  + 1.50 × Clamped Recent Trend
+  + Debut/Re-entry Bonus
+  + Hold Bonus
+  - Drop Penalty
+  - Fatigue Penalty
+```
+
+**Position Score**
+
+```text
+Position Score = ((41 - chart position) / 40) × 100
+```
+
+So #1 starts at 100.0, #10 starts at 77.5, #20 starts at 52.5, and #40 starts at 2.5 before bonuses/penalties.
+
+**Movement and trend**
+
+```text
+Movement = last week position - current position
+Clamped Movement = Movement capped from -15 to +15
+Recent Trend = 3-appearance rolling average of movement
+Clamped Recent Trend = Recent Trend capped from -10 to +10
+```
+
+Positive movement means a song climbed. Negative movement means it fell. Debuts and re-entries do not have normal prior-rank movement, so their movement contribution starts at 0.
+
+**Debut bonus**
+
+| Debut rank | Bonus |
+|---:|---:|
+| #1 | +30 |
+| Top 5 | +22 |
+| Top 10 | +16 |
+| Top 20 | +8 |
+| #21-#40 | +3 |
+
+**Re-entry bonus**
+
+| Re-entry rank | Bonus |
+|---:|---:|
+| Top 10 | +12 |
+| Top 20 | +7 |
+| #21-#40 | +3 |
+
+**Hold bonus**
+
+Only applies when a song holds the same position.
+
+| Hold rank | Bonus |
+|---:|---:|
+| #1 | +12 |
+| Top 3 | +8 |
+| Top 5 | +6 |
+| Top 10 | +4 |
+| Top 20 | +2 |
+
+**Drop penalty**
+
+| Drop size | Penalty |
+|---:|---:|
+| 1-3 positions | -2 |
+| 4-7 positions | -5 |
+| 8+ positions | -10 |
+
+Extra penalties apply when a song drops out of the Top 10 or falls from the Top 5.
+
+**Fatigue penalty**
+
+Applies only when a longer-running song is not gaining.
+
+| Weeks on chart | Penalty |
+|---:|---:|
+| 21-30 | -3 |
+| 31-40 | -6 |
+| 41+ | -10 |
+
+**Awards**
+
+- **Momentum Impact** goes to the song with the highest current-week Raw Momentum Index.
+- **Greatest Gainer** goes to the eligible song with the highest positive percentage gain in Raw Momentum Index from the previous available chart week.
+- Greatest Gainer requires the song to appear on both adjacent available chart weeks and have a previous raw score of at least 10.
+
+**Normalized Index**
+
+```text
+Normalized Index = (Raw Momentum Index / highest Raw Momentum Index that week) × 100
+```
+
+This makes each week easier to scan, but awards are based on the raw score.
+"""
+        )
+
     momentum = load_momentum_index_base()
     if momentum.empty:
         st.info("No momentum rows are available.")
@@ -1220,12 +1355,12 @@ def render_momentum_index_tab() -> None:
 
     view = st.radio(
         "Momentum view",
-        ["Weekly Momentum", "Momentum Changes", "Song Momentum History"],
+        ["Weekly Momentum", "#1 Songs", "Song Momentum History"],
         horizontal=True,
         key="momentum_view",
     )
 
-    if view in {"Weekly Momentum", "Momentum Changes"}:
+    if view == "Weekly Momentum":
         dates = [d.strftime("%Y-%m-%d") for d in sorted(momentum["chart_date"].dropna().unique(), reverse=True)]
         selected_date = st.selectbox("Chart week", dates, index=0, key="momentum_chart_week")
         week = momentum.loc[momentum["chart_date"].dt.strftime("%Y-%m-%d") == selected_date].copy()
@@ -1249,17 +1384,30 @@ def render_momentum_index_tab() -> None:
         else:
             cols[1].metric("Greatest Gainer", "—")
 
-        rows = st.slider("Rows", 10, 40, 40, 5, key=f"momentum_rows_{view}")
-        if view == "Weekly Momentum":
-            st.markdown("**Weekly Momentum ranking**")
-            _display_df(_momentum_display_table(week).head(rows))
-        else:
-            gains = week.loc[week["raw_momentum_change"].notna() & (week["raw_momentum_change"] > 0)].copy()
-            drops = week.loc[week["raw_momentum_change"].notna() & (week["raw_momentum_change"] < 0)].copy()
-            st.markdown("**Biggest raw-index gains**")
-            _display_df(_momentum_display_table(gains.sort_values(["raw_momentum_pct_gain", "raw_momentum_change", "position"], ascending=[False, False, True])).head(rows))
-            st.markdown("**Biggest raw-index drops**")
-            _display_df(_momentum_display_table(drops.sort_values(["raw_momentum_change", "position"], ascending=[True, True])).head(rows))
+        rows = st.slider("Rows", 10, 40, 40, 5, key="momentum_rows_weekly")
+        st.markdown("**Weekly Momentum ranking**")
+        _display_df(_momentum_display_table(week).head(rows))
+        return
+
+    if view == "#1 Songs":
+        st.markdown("**#1 Songs**")
+        st.caption("Songs with the highest raw Momentum Index score for each chart week.")
+        leaders = (
+            momentum.sort_values(["chart_date", "raw_momentum_index", "position", "title"], ascending=[True, False, True, True])
+            .drop_duplicates(subset=["chart_date"], keep="first")
+            .copy()
+        )
+        if leaders.empty:
+            st.info("No Momentum Index #1 song rows are available.")
+            return
+        leaders["year"] = leaders["chart_date"].dt.year
+        year_options = ["All years"] + [str(y) for y in sorted(leaders["year"].dropna().astype(int).unique(), reverse=True)]
+        selected_year = st.selectbox("Year", year_options, key="momentum_num1_year")
+        earliest_to_latest = selected_year != "All years"
+        if selected_year != "All years":
+            leaders = leaders.loc[leaders["year"].eq(int(selected_year))].copy()
+        st.caption(f"Showing {len(leaders):,} weekly Momentum Index #1 song row(s).")
+        _display_df(_momentum_num1_songs_display_table(leaders, earliest_to_latest=earliest_to_latest))
         return
 
     st.markdown("**Song Momentum History**")
