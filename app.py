@@ -5375,6 +5375,77 @@ def _format_signed_decimal(value: object, digits: int = 1) -> str:
     return f"{fv:.{digits}f}"
 
 
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_chart_age_category_stats() -> dict[str, float]:
+    """Return baseline chart-age stats for Week Browser category labels.
+
+    The center point is the weighted overall average chart age across every
+    chart entry. The spread is the population standard deviation of each
+    chart week's average age, which keeps the labels aligned with the
+    whole-chart weekly categories.
+    """
+    conn = get_connection()
+    sql = ENTRY_STATS_CTE + """
+        SELECT
+            cw.chart_date,
+            AVG(es.weeks_on_chart) AS avg_chart_age
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        LEFT JOIN entry_stats es ON es.entry_id = e.entry_id
+        WHERE es.weeks_on_chart IS NOT NULL
+        GROUP BY cw.chart_date
+        ORDER BY cw.chart_date
+    """
+    weekly = pd.read_sql_query(sql, conn)
+    if weekly.empty or weekly["avg_chart_age"].dropna().empty:
+        return {"overall_mean": float("nan"), "weekly_std": float("nan")}
+
+    overall_sql = ENTRY_STATS_CTE + """
+        SELECT AVG(es.weeks_on_chart) AS overall_mean
+        FROM entry e
+        LEFT JOIN entry_stats es ON es.entry_id = e.entry_id
+        WHERE es.weeks_on_chart IS NOT NULL
+    """
+    overall_row = conn.execute(overall_sql).fetchone()
+    overall_mean = float(overall_row["overall_mean"] if overall_row and overall_row["overall_mean"] is not None else weekly["avg_chart_age"].mean())
+    weekly_std = float(pd.to_numeric(weekly["avg_chart_age"], errors="coerce").dropna().std(ddof=0))
+    return {"overall_mean": overall_mean, "weekly_std": weekly_std}
+
+
+def _chart_age_category(avg_chart_age: float) -> str:
+    try:
+        value = float(avg_chart_age)
+    except Exception:
+        return ""
+    if math.isnan(value):
+        return ""
+
+    stats = load_chart_age_category_stats()
+    mean = stats.get("overall_mean", float("nan"))
+    std = stats.get("weekly_std", float("nan"))
+    if math.isnan(mean) or math.isnan(std) or std <= 0:
+        return ""
+
+    half_std = std / 2
+    if value < mean - std:
+        return "Well below average"
+    if value < mean - half_std:
+        return "Below average"
+    if value <= mean + half_std:
+        return "Near average"
+    if value <= mean + std:
+        return "Above average"
+    return "Well above average"
+
+
+def _format_average_chart_age(avg_chart_age: float) -> str:
+    if math.isnan(avg_chart_age):
+        return "—"
+    category = _chart_age_category(avg_chart_age)
+    suffix = f" ({category})" if category else ""
+    return f"{avg_chart_age:.1f} weeks{suffix}"
+
+
 def _week_browser_summary(df: pd.DataFrame, previous_df: pd.DataFrame | None) -> dict[str, object]:
     if df.empty:
         return {
@@ -5427,7 +5498,7 @@ def _week_browser_summary(df: pd.DataFrame, previous_df: pd.DataFrame | None) ->
             f"{_week_row_label(fallers.iloc[0])} ({_format_movement(fallers.iloc[0]['movement'])})"
             if not fallers.empty else "—"
         ),
-        "average_chart_age": f"{avg_chart_age:.1f} weeks" if not math.isnan(avg_chart_age) else "—",
+        "average_chart_age": _format_average_chart_age(avg_chart_age),
         "average_chart_movement": _format_signed_decimal(avg_chart_movement) if not math.isnan(avg_chart_movement) else "—",
         "average_absolute_movement": f"{avg_absolute_movement:.1f}" if not math.isnan(avg_absolute_movement) else "—",
         "debuts": int(_marker_contains(df, "DEBUT").sum()),
