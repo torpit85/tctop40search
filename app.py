@@ -1038,6 +1038,40 @@ def _momentum_fatigue_penalty(row: pd.Series) -> float:
     return 0.0
 
 
+def _momentum_chart_zone_weight(position: object) -> float:
+    """Lower-chart gains get less movement credit until they convert into stronger chart rank."""
+    pos = _safe_int(position)
+    if pos is None:
+        return 1.0
+    if pos <= 10:
+        return 1.0
+    if pos <= 20:
+        return 0.80
+    if pos <= 30:
+        return 0.55
+    return 0.35
+
+
+def _momentum_slow_burn_bonus_from_streak(gain_streak: object) -> float:
+    streak = _safe_int(gain_streak) or 0
+    if streak >= 4:
+        return 8.0
+    if streak == 3:
+        return 5.0
+    if streak == 2:
+        return 3.0
+    return 0.0
+
+
+def _positive_streak(values: pd.Series) -> pd.Series:
+    streaks: list[int] = []
+    cur = 0
+    for value in values.fillna(False).astype(bool):
+        cur = cur + 1 if value else 0
+        streaks.append(cur)
+    return pd.Series(streaks, index=values.index)
+
+
 def _momentum_type(row: pd.Series) -> str:
     pos = _safe_int(row.get("position")) or 999
     move = row.get("move")
@@ -1086,12 +1120,48 @@ def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
     df["position_score"] = ((41 - pd.to_numeric(df["position"], errors="coerce")) / 40 * 100).clip(lower=0)
     df["movement_raw"] = pd.to_numeric(df.get("move"), errors="coerce").fillna(0.0)
     df["movement_clamped"] = df["movement_raw"].clip(-15, 15)
+    df["chart_zone_movement_weight"] = df["position"].map(_momentum_chart_zone_weight)
+    # Apply the chart-zone movement weight only to positive movement. Lower-chart surges still count,
+    # but they no longer overwhelm stronger Top 20 / Top 10 momentum before they prove staying power.
+    df["movement_weighted"] = df["movement_clamped"].where(
+        df["movement_clamped"] <= 0,
+        df["movement_clamped"] * df["chart_zone_movement_weight"],
+    )
     df["trend_raw"] = (
         df.groupby("song_key", dropna=False)["movement_raw"]
         .transform(lambda s: s.rolling(3, min_periods=1).mean())
         .fillna(0.0)
     )
     df["trend_clamped"] = df["trend_raw"].clip(-10, 10)
+
+    # Slow Burn Bonus: only for songs whose current run began as a debut, not re-entries.
+    # It does not activate until week 3+ of the run, and only after at least two straight post-debut gains.
+    run_start = df["is_debut"].fillna(False) | df["is_reentry"].fillna(False)
+    first_in_song = df.groupby("song_key", dropna=False).cumcount().eq(0)
+    run_start = run_start | first_in_song
+    df["momentum_run_id"] = run_start.groupby(df["song_key"], dropna=False).cumsum()
+    run_group = ["song_key", "momentum_run_id"]
+    df["momentum_run_week"] = df.groupby(run_group, dropna=False).cumcount() + 1
+    df["momentum_run_debut_position"] = df.groupby(run_group, dropna=False)["position"].transform("first")
+    df["momentum_run_began_as_debut"] = df.groupby(run_group, dropna=False)["is_debut"].transform("first").fillna(False).astype(bool)
+    df["momentum_run_best_position_so_far"] = df.groupby(run_group, dropna=False)["position"].cummin()
+    df["momentum_gain_streak"] = (
+        df.groupby(run_group, dropna=False)["is_up"]
+        .transform(_positive_streak)
+        .fillna(0)
+        .astype(int)
+    )
+    slow_burn_eligible = (
+        df["momentum_run_began_as_debut"]
+        & ~df["is_reentry"].fillna(False)
+        & df["momentum_run_debut_position"].ge(30)
+        & df["momentum_run_week"].ge(3)
+        & df["momentum_gain_streak"].ge(2)
+        & df["position"].le(df["momentum_run_best_position_so_far"] + 2)
+    )
+    df["slow_burn_bonus"] = 0.0
+    df.loc[slow_burn_eligible, "slow_burn_bonus"] = df.loc[slow_burn_eligible, "momentum_gain_streak"].map(_momentum_slow_burn_bonus_from_streak)
+
     df["debut_reentry_bonus"] = 0.0
     df.loc[df["is_debut"], "debut_reentry_bonus"] = df.loc[df["is_debut"], "position"].map(_momentum_debut_bonus)
     df.loc[df["is_reentry"], "debut_reentry_bonus"] = df.loc[df["is_reentry"], "position"].map(_momentum_reentry_bonus)
@@ -1100,10 +1170,11 @@ def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
     df["fatigue_penalty"] = df.apply(_momentum_fatigue_penalty, axis=1)
     df["raw_momentum_index"] = (
         0.45 * df["position_score"]
-        + 2.0 * df["movement_clamped"]
+        + 2.0 * df["movement_weighted"]
         + 1.5 * df["trend_clamped"]
         + df["debut_reentry_bonus"]
         + df["hold_bonus"]
+        + df["slow_burn_bonus"]
         - df["drop_penalty"]
         - df["fatigue_penalty"]
     ).clip(lower=0).round(2)
@@ -1122,6 +1193,8 @@ def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
     df["greatest_gainer_eligible"] = (
         df["last_raw_momentum_index"].ge(10)
         & df["raw_momentum_index"].gt(df["last_raw_momentum_index"])
+        & df["raw_momentum_change"].ge(10)
+        & df["position"].le(25)
         & (pd.to_datetime(df["last_momentum_chart_date"]) == pd.to_datetime(df["previous_available_chart_date"]))
     )
 
@@ -1263,10 +1336,11 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
     out.insert(0, "momentum_rank", range(1, len(out) + 1))
     out["raw_momentum_index_unclipped"] = (
         0.45 * pd.to_numeric(out.get("position_score"), errors="coerce").fillna(0.0)
-        + 2.0 * pd.to_numeric(out.get("movement_clamped"), errors="coerce").fillna(0.0)
+        + 2.0 * pd.to_numeric(out.get("movement_weighted"), errors="coerce").fillna(0.0)
         + 1.5 * pd.to_numeric(out.get("trend_clamped"), errors="coerce").fillna(0.0)
         + pd.to_numeric(out.get("debut_reentry_bonus"), errors="coerce").fillna(0.0)
         + pd.to_numeric(out.get("hold_bonus"), errors="coerce").fillna(0.0)
+        + pd.to_numeric(out.get("slow_burn_bonus"), errors="coerce").fillna(0.0)
         - pd.to_numeric(out.get("drop_penalty"), errors="coerce").fillna(0.0)
         - pd.to_numeric(out.get("fatigue_penalty"), errors="coerce").fillna(0.0)
     ).round(2)
@@ -1276,9 +1350,12 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
         "artist",
         "position_score",
         "movement_clamped",
+        "chart_zone_movement_weight",
+        "movement_weighted",
         "trend_clamped",
         "debut_reentry_bonus",
         "hold_bonus",
+        "slow_burn_bonus",
         "drop_penalty",
         "fatigue_penalty",
         "raw_momentum_index_unclipped",
@@ -1288,10 +1365,13 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
         "title": "Song",
         "artist": "Artist",
         "position_score": "Raw Position Score",
-        "movement_clamped": "Raw Clamped Movement Score",
+        "movement_clamped": "Raw Clamped Movement",
+        "chart_zone_movement_weight": "Raw Chart-Zone Movement Weight",
+        "movement_weighted": "Raw Weighted Movement",
         "trend_clamped": "Raw Clamped Recent Trend",
         "debut_reentry_bonus": "Raw Debut/Re-Entry bonus",
         "hold_bonus": "Raw Hold Bonus",
+        "slow_burn_bonus": "Raw Slow Burn Bonus",
         "drop_penalty": "Raw Drop Penalty",
         "fatigue_penalty": "Raw Fatigue Penalty",
         "raw_momentum_index_unclipped": "Raw Momentum Index Score",
@@ -1299,10 +1379,13 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
     out = out.rename(columns=rename)
     numeric_cols = [
         "Raw Position Score",
-        "Raw Clamped Movement Score",
+        "Raw Clamped Movement",
+        "Raw Chart-Zone Movement Weight",
+        "Raw Weighted Movement",
         "Raw Clamped Recent Trend",
         "Raw Debut/Re-Entry bonus",
         "Raw Hold Bonus",
+        "Raw Slow Burn Bonus",
         "Raw Drop Penalty",
         "Raw Fatigue Penalty",
         "Raw Momentum Index Score",
@@ -1329,10 +1412,11 @@ def render_momentum_index_tab() -> None:
 ```text
 Raw Momentum Index =
     0.45 × Position Score
-  + 2.00 × Clamped Movement
+  + 2.00 × Weighted Movement
   + 1.50 × Clamped Recent Trend
   + Debut/Re-entry Bonus
   + Hold Bonus
+  + Slow Burn Bonus
   - Drop Penalty
   - Fatigue Penalty
 ```
@@ -1350,11 +1434,21 @@ So #1 starts at 100.0, #10 starts at 77.5, #20 starts at 52.5, and #40 starts at
 ```text
 Movement = last week position - current position
 Clamped Movement = Movement capped from -15 to +15
+Weighted Movement = Clamped Movement × Chart-Zone Movement Weight for positive moves
 Recent Trend = 3-appearance rolling average of movement
 Clamped Recent Trend = Recent Trend capped from -10 to +10
 ```
 
-Positive movement means a song climbed. Negative movement means it fell. Debuts and re-entries do not have normal prior-rank movement, so their movement contribution starts at 0.
+Positive movement means a song climbed. Negative movement means it fell. Debuts and re-entries do not have normal prior-rank movement, so their movement contribution starts at 0. The chart-zone weight applies only to positive movement, so lower-chart surges still count but receive less credit until they convert into stronger chart position.
+
+**Chart-Zone Movement Weight**
+
+| Current rank after gain | Weight |
+|---:|---:|
+| #1-#10 | 1.00 |
+| #11-#20 | 0.80 |
+| #21-#30 | 0.55 |
+| #31-#40 | 0.35 |
 
 **Debut bonus**
 
@@ -1386,6 +1480,16 @@ Only applies when a song holds the same position.
 | Top 10 | +4 |
 | Top 20 | +2 |
 
+**Slow Burn Bonus**
+
+Applies only to songs whose current run began as a debut. Re-entries are excluded. The bonus does not activate until week 3 or later of the run, requires a debut at #30 or lower, at least two straight post-debut gains, and the current rank must be at or near the run's best rank so far.
+
+| Current gain streak | Bonus |
+|---:|---:|
+| 2 straight gains | +3 |
+| 3 straight gains | +5 |
+| 4+ straight gains | +8 |
+
 **Drop penalty**
 
 | Drop size | Penalty |
@@ -1410,7 +1514,7 @@ Applies only when a longer-running song is not gaining.
 
 - **Momentum Impact** goes to the song with the highest current-week Raw Momentum Index.
 - **Greatest Gainer** goes to the eligible song with the highest positive percentage gain in Raw Momentum Index from the previous available chart week.
-- Greatest Gainer requires the song to appear on both adjacent available chart weeks and have a previous raw score of at least 10.
+- Greatest Gainer requires the song to appear on both adjacent available chart weeks, have a previous raw score of at least 10, gain at least 10 raw points, and land at #25 or better.
 
 **Normalized Index**
 
