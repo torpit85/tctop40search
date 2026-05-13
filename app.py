@@ -1334,15 +1334,34 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = df.copy().sort_values(["raw_momentum_index", "position", "title"], ascending=[False, True, True]).reset_index(drop=True)
     out.insert(0, "momentum_rank", range(1, len(out) + 1))
+
+    def _numeric_series(col: str, default: float = 0.0) -> pd.Series:
+        """Return a numeric Series aligned to out, even when an optional column is missing."""
+        if col in out.columns:
+            return pd.to_numeric(out[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=out.index, dtype="float64")
+
+    # Be tolerant of cached/older Momentum frames that may not yet include the new
+    # weighted-movement columns. This keeps the raw expander from crashing while
+    # still showing the best available diagnostic values.
+    if "chart_zone_movement_weight" not in out.columns:
+        out["chart_zone_movement_weight"] = out.get("position", pd.Series(index=out.index)).map(_momentum_chart_zone_weight)
+    if "movement_weighted" not in out.columns:
+        movement_clamped = _numeric_series("movement_clamped")
+        zone_weight = _numeric_series("chart_zone_movement_weight", default=1.0)
+        out["movement_weighted"] = movement_clamped.where(movement_clamped <= 0, movement_clamped * zone_weight)
+    if "slow_burn_bonus" not in out.columns:
+        out["slow_burn_bonus"] = 0.0
+
     out["raw_momentum_index_unclipped"] = (
-        0.45 * pd.to_numeric(out.get("position_score"), errors="coerce").fillna(0.0)
-        + 2.0 * pd.to_numeric(out.get("movement_weighted"), errors="coerce").fillna(0.0)
-        + 1.5 * pd.to_numeric(out.get("trend_clamped"), errors="coerce").fillna(0.0)
-        + pd.to_numeric(out.get("debut_reentry_bonus"), errors="coerce").fillna(0.0)
-        + pd.to_numeric(out.get("hold_bonus"), errors="coerce").fillna(0.0)
-        + pd.to_numeric(out.get("slow_burn_bonus"), errors="coerce").fillna(0.0)
-        - pd.to_numeric(out.get("drop_penalty"), errors="coerce").fillna(0.0)
-        - pd.to_numeric(out.get("fatigue_penalty"), errors="coerce").fillna(0.0)
+        0.45 * _numeric_series("position_score")
+        + 2.0 * _numeric_series("movement_weighted")
+        + 1.5 * _numeric_series("trend_clamped")
+        + _numeric_series("debut_reentry_bonus")
+        + _numeric_series("hold_bonus")
+        + _numeric_series("slow_burn_bonus")
+        - _numeric_series("drop_penalty")
+        - _numeric_series("fatigue_penalty")
     ).round(2)
     out = out[[c for c in [
         "momentum_rank",
