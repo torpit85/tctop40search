@@ -1165,6 +1165,60 @@ def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
     df["debut_reentry_bonus"] = 0.0
     df.loc[df["is_debut"], "debut_reentry_bonus"] = df.loc[df["is_debut"], "position"].map(_momentum_debut_bonus)
     df.loc[df["is_reentry"], "debut_reentry_bonus"] = df.loc[df["is_reentry"], "position"].map(_momentum_reentry_bonus)
+
+    # #1 Debut Context Bonus: small extra credit for #1 debuts with added weekly/historical context.
+    df["num1_debut_only_top10_debut_bonus"] = 0.0
+    df["num1_debut_artist_first_num1_bonus"] = 0.0
+    df["num1_debut_displacement_bonus"] = 0.0
+    is_num1_debut = df["is_debut"].fillna(False) & pd.to_numeric(df["position"], errors="coerce").eq(1)
+
+    top10_debut_counts = (
+        df.loc[df["is_debut"].fillna(False) & pd.to_numeric(df["position"], errors="coerce").le(10)]
+        .groupby("chart_date", dropna=False)["entry_id"]
+        .transform("count")
+    )
+    df["top10_debut_count_this_week"] = 0
+    if not top10_debut_counts.empty:
+        df.loc[df["is_debut"].fillna(False) & pd.to_numeric(df["position"], errors="coerce").le(10), "top10_debut_count_this_week"] = top10_debut_counts
+    df["top10_debut_count_this_week"] = (
+        df.groupby("chart_date", dropna=False)["top10_debut_count_this_week"].transform("max").fillna(0).astype(int)
+    )
+    df.loc[is_num1_debut & df["top10_debut_count_this_week"].eq(1), "num1_debut_only_top10_debut_bonus"] = 3.0
+
+    artist_ordered = df.sort_values(["artist_key", "chart_date", "position", "entry_id"]).copy()
+    artist_ordered["prior_artist_num1_count"] = (
+        artist_ordered.groupby("artist_key", dropna=False)["num1_flag"].cumsum()
+        - artist_ordered["num1_flag"].astype(int)
+    )
+    df["prior_artist_num1_count"] = artist_ordered.sort_index()["prior_artist_num1_count"]
+    df.loc[is_num1_debut & df["prior_artist_num1_count"].eq(0), "num1_debut_artist_first_num1_bonus"] = 5.0
+
+    num1_weeks = (
+        df.loc[pd.to_numeric(df["position"], errors="coerce").eq(1), ["chart_date", "song_key", "entry_id"]]
+        .sort_values(["chart_date", "entry_id"])
+        .drop_duplicates(subset=["chart_date"], keep="first")
+        .copy()
+    )
+    prev_num1_streak_by_date: dict[pd.Timestamp, int] = {}
+    prev_song = None
+    current_streak = 0
+    for row in num1_weeks.itertuples(index=False):
+        chart_dt = row.chart_date
+        prev_num1_streak_by_date[chart_dt] = current_streak
+        if row.song_key == prev_song:
+            current_streak += 1
+        else:
+            current_streak = 1
+            prev_song = row.song_key
+    df["previous_num1_reign_weeks"] = df["chart_date"].map(prev_num1_streak_by_date).fillna(0).astype(int)
+    df.loc[is_num1_debut & df["previous_num1_reign_weeks"].between(3, 4), "num1_debut_displacement_bonus"] = 3.0
+    df.loc[is_num1_debut & df["previous_num1_reign_weeks"].ge(5), "num1_debut_displacement_bonus"] = 6.0
+    df["num1_debut_context_bonus"] = (
+        df["num1_debut_only_top10_debut_bonus"]
+        + df["num1_debut_artist_first_num1_bonus"]
+        + df["num1_debut_displacement_bonus"]
+    )
+
     df["hold_bonus"] = df.apply(lambda r: _momentum_hold_bonus(r.get("position"), r.get("move")), axis=1)
     df["drop_penalty"] = df.apply(_momentum_drop_penalty, axis=1)
     df["fatigue_penalty"] = df.apply(_momentum_fatigue_penalty, axis=1)
@@ -1173,6 +1227,7 @@ def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
         + 2.0 * df["movement_weighted"]
         + 1.5 * df["trend_clamped"]
         + df["debut_reentry_bonus"]
+        + df["num1_debut_context_bonus"]
         + df["hold_bonus"]
         + df["slow_burn_bonus"]
         - df["drop_penalty"]
@@ -1352,12 +1407,21 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
         out["movement_weighted"] = movement_clamped.where(movement_clamped <= 0, movement_clamped * zone_weight)
     if "slow_burn_bonus" not in out.columns:
         out["slow_burn_bonus"] = 0.0
+    for col in [
+        "num1_debut_only_top10_debut_bonus",
+        "num1_debut_artist_first_num1_bonus",
+        "num1_debut_displacement_bonus",
+        "num1_debut_context_bonus",
+    ]:
+        if col not in out.columns:
+            out[col] = 0.0
 
     out["raw_momentum_index_unclipped"] = (
         0.45 * _numeric_series("position_score")
         + 2.0 * _numeric_series("movement_weighted")
         + 1.5 * _numeric_series("trend_clamped")
         + _numeric_series("debut_reentry_bonus")
+        + _numeric_series("num1_debut_context_bonus")
         + _numeric_series("hold_bonus")
         + _numeric_series("slow_burn_bonus")
         - _numeric_series("drop_penalty")
@@ -1373,6 +1437,10 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
         "movement_weighted",
         "trend_clamped",
         "debut_reentry_bonus",
+        "num1_debut_only_top10_debut_bonus",
+        "num1_debut_artist_first_num1_bonus",
+        "num1_debut_displacement_bonus",
+        "num1_debut_context_bonus",
         "hold_bonus",
         "slow_burn_bonus",
         "drop_penalty",
@@ -1389,6 +1457,10 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
         "movement_weighted": "Raw Weighted Movement",
         "trend_clamped": "Raw Clamped Recent Trend",
         "debut_reentry_bonus": "Raw Debut/Re-Entry bonus",
+        "num1_debut_only_top10_debut_bonus": "Raw #1 Debut Only Top 10 Debut Bonus",
+        "num1_debut_artist_first_num1_bonus": "Raw #1 Debut Artist First #1 Bonus",
+        "num1_debut_displacement_bonus": "Raw #1 Debut Displacement Bonus",
+        "num1_debut_context_bonus": "Raw #1 Debut Context Bonus",
         "hold_bonus": "Raw Hold Bonus",
         "slow_burn_bonus": "Raw Slow Burn Bonus",
         "drop_penalty": "Raw Drop Penalty",
@@ -1403,6 +1475,10 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
         "Raw Weighted Movement",
         "Raw Clamped Recent Trend",
         "Raw Debut/Re-Entry bonus",
+        "Raw #1 Debut Only Top 10 Debut Bonus",
+        "Raw #1 Debut Artist First #1 Bonus",
+        "Raw #1 Debut Displacement Bonus",
+        "Raw #1 Debut Context Bonus",
         "Raw Hold Bonus",
         "Raw Slow Burn Bonus",
         "Raw Drop Penalty",
@@ -1434,6 +1510,7 @@ Raw Momentum Index =
   + 2.00 × Weighted Movement
   + 1.50 × Clamped Recent Trend
   + Debut/Re-entry Bonus
+  + #1 Debut Context Bonus
   + Hold Bonus
   + Slow Burn Bonus
   - Drop Penalty
@@ -1478,6 +1555,19 @@ Positive movement means a song climbed. Negative movement means it fell. Debuts 
 | Top 10 | +16 |
 | Top 20 | +8 |
 | #21-#40 | +3 |
+
+**#1 Debut Context Bonus**
+
+Applies only when a song debuts at #1.
+
+| #1 debut context | Bonus |
+|---|---:|
+| Only Top 10 debut that week | +3 |
+| Artist's first #1 song | +5 |
+| Replaces a song that had been #1 for 3-4 weeks | +3 |
+| Replaces a song that had been #1 for 5+ weeks | +6 |
+
+These bonuses stack, so a #1 debut can rise above the standard 75-point baseline when the weekly or historical context is stronger.
 
 **Re-entry bonus**
 
