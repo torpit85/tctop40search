@@ -176,6 +176,49 @@ def find_chart_week_id(conn: sqlite3.Connection, chart_date: str) -> int | None:
     return int(row[0]) if row else None
 
 
+
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = ?
+        LIMIT 1
+        """,
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def find_alias_canonical_song_id(
+    conn: sqlite3.Connection,
+    song_key: str,
+    artist_key: str,
+) -> int | None:
+    """Return a manually-approved Last.fm alias match, if one exists.
+
+    This lets future imports reuse matches that were approved by
+    scripts/match_lastfm_tracks.py instead of reporting the same Last.fm
+    formatting variants as unmatched every week.
+    """
+    if not table_exists(conn, "lastfm_track_alias"):
+        return None
+
+    row = conn.execute(
+        """
+        SELECT canonical_song_id
+        FROM lastfm_track_alias
+        WHERE song_title_key = ?
+          AND artist_key = ?
+          AND canonical_song_id IS NOT NULL
+        LIMIT 1
+        """,
+        (song_key, artist_key),
+    ).fetchone()
+
+    return int(row[0]) if row else None
+
 def find_canonical_song_id(
     conn: sqlite3.Connection,
     raw_track_name: str,
@@ -349,13 +392,20 @@ def import_lastfm_week(
 
             lastfm_mbid = track.get("mbid") or None
 
-            canonical_song_id = find_canonical_song_id(
+            canonical_song_id = find_alias_canonical_song_id(
                 conn=conn,
-                raw_track_name=track_name,
-                raw_artist_name=artist_name,
                 song_key=song_key,
                 artist_key=artist_key,
             )
+
+            if canonical_song_id is None:
+                canonical_song_id = find_canonical_song_id(
+                    conn=conn,
+                    raw_track_name=track_name,
+                    raw_artist_name=artist_name,
+                    song_key=song_key,
+                    artist_key=artist_key,
+                )
 
             if canonical_song_id is not None:
                 matched += 1
