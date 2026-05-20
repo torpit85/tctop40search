@@ -7445,6 +7445,244 @@ def render_rivalries_tab() -> None:
     st.markdown("**B history**")
     _display_df(hb.head(200))
 
+
+def _mode_or_first(series: pd.Series) -> str:
+    vals = series.dropna().astype(str)
+    if vals.empty:
+        return ""
+    modes = vals.mode()
+    return modes.iloc[0] if not modes.empty else vals.iloc[0]
+
+
+def _summer_song_base() -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+    df = chart.copy()
+    df["chart_date"] = pd.to_datetime(df["chart_date"], errors="coerce")
+    df["position"] = pd.to_numeric(df["position"], errors="coerce")
+    df = df.loc[df["chart_date"].notna() & df["position"].between(1, 40, inclusive="both")].copy()
+    if df.empty:
+        return df
+    df = df.loc[df["chart_date"].dt.month.between(6, 8, inclusive="both")].copy()
+    if df.empty:
+        return df
+    df["summer_year"] = df["chart_date"].dt.year.astype(int)
+    # Option C: base rank points plus stacked dominance bonuses.
+    df["summer_points"] = 41 - df["position"]
+    df["summer_points"] += df["position"].eq(1).astype(int) * 20
+    df["summer_points"] += df["position"].le(5).astype(int) * 8
+    df["summer_points"] += df["position"].le(10).astype(int) * 4
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_quick_summer_years() -> list[int]:
+    df = _summer_song_base()
+    if df.empty:
+        return []
+    return sorted(df["summer_year"].dropna().astype(int).unique().tolist(), reverse=True)
+
+
+def _aggregate_summer_songs(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    grouped = (
+        df.groupby(group_cols, dropna=False)
+        .agg(
+            song=("title", _mode_or_first),
+            artist=("artist", _mode_or_first),
+            summer_points=("summer_points", "sum"),
+            summer_weeks=("entry_id", "nunique"),
+            peak=("position", "min"),
+            num1_weeks=("position", lambda s: int(pd.to_numeric(s, errors="coerce").eq(1).sum())),
+            top10_weeks=("position", lambda s: int(pd.to_numeric(s, errors="coerce").le(10).sum())),
+            first_summer_week=("chart_date", "min"),
+            last_summer_week=("chart_date", "max"),
+        )
+        .reset_index()
+    )
+    for col in ["summer_points", "summer_weeks", "peak", "num1_weeks", "top10_weeks"]:
+        grouped[col] = pd.to_numeric(grouped[col], errors="coerce").fillna(0).astype(int)
+    return grouped
+
+
+def _format_summer_song_table(df: pd.DataFrame, include_year: bool = False) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    out = df.copy().sort_values(
+        ["summer_points", "num1_weeks", "top10_weeks", "summer_weeks", "peak", "last_summer_week", "song"],
+        ascending=[False, False, False, False, True, False, True],
+    ).reset_index(drop=True)
+    out.insert(0, "rank", range(1, len(out) + 1))
+    for col in ["first_summer_week", "last_summer_week"]:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.strftime("%Y-%m-%d")
+    cols = ["rank"]
+    if include_year and "summer_year" in out.columns:
+        cols.append("summer_year")
+    cols += [
+        "song", "artist", "summer_points", "summer_weeks", "peak",
+        "num1_weeks", "top10_weeks", "first_summer_week", "last_summer_week",
+    ]
+    out = out[[c for c in cols if c in out.columns]].copy()
+    return out.rename(columns={
+        "rank": "Rank",
+        "summer_year": "Summer Year",
+        "song": "Song",
+        "artist": "Artist",
+        "summer_points": "Summer Points",
+        "summer_weeks": "Summer Weeks",
+        "peak": "Peak",
+        "num1_weeks": "#1 Weeks",
+        "top10_weeks": "Top 10 Weeks",
+        "first_summer_week": "First Summer Week",
+        "last_summer_week": "Last Summer Week",
+    })
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_quick_top_summer_songs(selected_year: str, scope: str, limit: int) -> pd.DataFrame:
+    df = _summer_song_base()
+    if df.empty:
+        return pd.DataFrame()
+    if selected_year != "All years":
+        df = df.loc[df["summer_year"].eq(int(selected_year))].copy()
+        scope = "Best single summer"
+    if df.empty:
+        return pd.DataFrame()
+
+    if scope == "Lifetime summer total":
+        agg = _aggregate_summer_songs(df, ["song_key"])
+        return _format_summer_song_table(agg, include_year=False).head(limit)
+
+    yearly = _aggregate_summer_songs(df, ["song_key", "summer_year"])
+    if selected_year == "All years":
+        yearly = yearly.sort_values(
+            ["song_key", "summer_points", "num1_weeks", "top10_weeks", "summer_weeks", "peak", "last_summer_week"],
+            ascending=[True, False, False, False, False, True, False],
+        ).drop_duplicates("song_key", keep="first")
+        include_year = True
+    else:
+        include_year = False
+    return _format_summer_song_table(yearly, include_year=include_year).head(limit)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_quick_summer_num1_songs(selected_year: str, limit: int) -> pd.DataFrame:
+    df = _summer_song_base()
+    if df.empty:
+        return pd.DataFrame()
+    df = df.loc[df["position"].eq(1)].copy()
+    if selected_year != "All years":
+        df = df.loc[df["summer_year"].eq(int(selected_year))].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    out = df.sort_values(["chart_date", "position", "title"], ascending=[False, True, True]).copy()
+    for col in ["chart_date"]:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    cols = []
+    if selected_year == "All years" and "summer_year" in out.columns:
+        cols.append("summer_year")
+    cols += [
+        "chart_date", "position", "last_week_position", "weeks_on_chart",
+        "title", "artist", "lead_artist", "featured_artist", "derived_marker",
+    ]
+    out = out[[c for c in cols if c in out.columns]].copy()
+    rename = {
+        "summer_year": "Summer Year",
+        "chart_date": "Chart Date",
+        "position": "Position",
+        "last_week_position": "Last Week",
+        "weeks_on_chart": "Weeks",
+        "title": "Song",
+        "artist": "Artist",
+        "lead_artist": "Lead Artist",
+        "featured_artist": "Featured Artist",
+        "derived_marker": "Marker",
+    }
+    out = out.rename(columns=rename)
+    # Streamlit/PyArrow dislikes columns that mix integers with display strings
+    # (for example, int ranks plus an em dash for missing values). Keep these
+    # display-only columns consistently string-typed.
+    if "Last Week" in out.columns:
+        out["Last Week"] = out["Last Week"].map(lambda v: "—" if pd.isna(v) else str(int(v)))
+    if "Weeks" in out.columns:
+        out["Weeks"] = out["Weeks"].map(lambda v: "—" if pd.isna(v) else str(int(v)))
+    return out.head(limit)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_quick_summer_year_champions() -> pd.DataFrame:
+    df = _summer_song_base()
+    if df.empty:
+        return pd.DataFrame()
+    yearly = _aggregate_summer_songs(df, ["song_key", "summer_year"])
+    if yearly.empty:
+        return pd.DataFrame()
+    champions = (
+        yearly.sort_values(
+            ["summer_year", "summer_points", "num1_weeks", "top10_weeks", "summer_weeks", "peak", "last_summer_week", "song"],
+            ascending=[False, False, False, False, False, True, False, True],
+        )
+        .drop_duplicates("summer_year", keep="first")
+        .sort_values("summer_year", ascending=False)
+        .reset_index(drop=True)
+    )
+    out = _format_summer_song_table(champions, include_year=True)
+    if "Rank" in out.columns:
+        out = out.drop(columns=["Rank"])
+    return out
+
+
+def render_quick_seasonal_tables() -> None:
+    seasonal_view = st.radio(
+        "Seasonal view",
+        ["Top Summer Songs", "Summer #1 songs", "Summer by Year Champions"],
+        horizontal=True,
+        key="quick_seasonal_view",
+    )
+    years = load_quick_summer_years()
+    if not years:
+        st.info("No June 1-August 31 chart rows are available yet.")
+        return
+
+    if seasonal_view == "Summer by Year Champions":
+        st.markdown("**Summer by Year Champions**")
+        st.caption("Summer is June 1 through August 31. Scoring uses rank points plus #1, Top 5, and Top 10 bonuses.")
+        _display_df(build_quick_summer_year_champions())
+        return
+
+    controls = st.columns([1.0, 1.35, 1.0])
+    year_options = ["All years"] + [str(y) for y in years]
+    selected_year = controls[0].selectbox("Year", year_options, key="quick_summer_year")
+    if selected_year == "All years":
+        scope = controls[1].radio(
+            "Song span mode",
+            ["Best single summer", "Lifetime summer total"],
+            horizontal=False,
+            key="quick_summer_scope",
+        )
+    else:
+        scope = "Best single summer"
+        controls[1].caption("Selected-year view uses that single summer only.")
+    if selected_year == "All years":
+        limit = int(controls[2].slider("Rows", 10, 500, 100, 10, key="quick_summer_limit"))
+    else:
+        limit = int(controls[2].slider("Rows", 10, 100, 100, 10, key="quick_summer_limit_year"))
+
+    if seasonal_view == "Top Summer Songs":
+        st.markdown("**Top Summer Songs**")
+        st.caption("Summer is June 1 through August 31. Score = (41 - position) + 20 for #1 + 8 for Top 5 + 4 for Top 10.")
+        _display_df(build_quick_top_summer_songs(selected_year, scope, limit))
+    else:
+        st.markdown("**Summer #1 songs**")
+        st.caption("Songs that reached #1 during summer chart weeks.")
+        _display_df(build_quick_summer_num1_songs(selected_year, limit))
+
 def render_special_tables_tab() -> None:
     st.subheader("Quick tables")
     subsection = st.selectbox(
@@ -7453,6 +7691,7 @@ def render_special_tables_tab() -> None:
             "Hits & milestones",
             "Movement",
             "Artists",
+            "Seasonal",
             "Debuts / Re-entries",
             "Chart feats",
         ],
@@ -7566,15 +7805,27 @@ def render_special_tables_tab() -> None:
             limit = drought_cols[3].slider("Rows", 10, 500, 100, 10, key="quick_artist_num1_drought_limit")
             _display_df(build_quick_artist_num1_droughts(credit_mode, song_mode, min_drought_weeks, limit))
 
+    elif subsection == "Seasonal":
+        render_quick_seasonal_tables()
+
     elif subsection == "Debuts / Re-entries":
         table_kind = st.selectbox(
             "View",
             ["Top debuts", "Top 5 debuts", "Debut weeks", "Re-entries"],
             key="quick_debuts_view",
         )
-        limit = st.slider("Rows", 10, 500, 100, 10, key="quick_debuts_limit")
+        conn = get_connection()
+        year_rows = conn.execute(
+            "SELECT DISTINCT SUBSTR(chart_date, 1, 4) AS year FROM chart_week ORDER BY year DESC"
+        ).fetchall()
+        year_options = ["All years"] + [row[0] for row in year_rows if row[0]]
+        selected_year = st.selectbox("Year", year_options, key="quick_debuts_year")
+
         st.markdown(f"**{table_kind}**")
-        table = load_special_entries(table_kind, limit).drop(columns=["last_week_position"], errors="ignore")
+        table = load_special_entries(table_kind, 1000000).drop(columns=["last_week_position"], errors="ignore")
+        if selected_year != "All years" and not table.empty and "chart_date" in table.columns:
+            table = table.loc[table["chart_date"].astype(str).str.startswith(selected_year)].copy()
+            table = table.sort_values(["chart_date", "position", "song"], ascending=[True, True, True])
         _display_df(table)
 
     else:
