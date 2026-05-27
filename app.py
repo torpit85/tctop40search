@@ -733,6 +733,13 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
 
     # Group by song_key only so already-merged canonical songs do not split back out
     # just because an old entry used different title casing/punctuation.
+    # Week Hit Peak is the earliest chart week when the song reached its best artist-history rank.
+    song_peak_dates = (
+        credits.sort_values(["song_key", "position", "chart_date", "entry_id"])
+        .drop_duplicates(subset=["song_key"], keep="first")
+        [["song_key", "chart_date"]]
+        .rename(columns={"chart_date": "week_hit_peak"})
+    )
     songs = (
         credits.groupby(["song_key"], dropna=True)
         .agg(
@@ -743,8 +750,9 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
             peak=("position", "min"),
         )
         .reset_index()
+        .merge(song_peak_dates, on="song_key", how="left")
         .sort_values(["peak", "chart_weeks", "last_date", "song"], ascending=[True, False, False, True])
-        [["song", "chart_weeks", "first_date", "last_date", "peak"]]
+        [["song", "chart_weeks", "first_date", "last_date", "peak", "week_hit_peak"]]
     )
 
     return history, stats, songs
@@ -6172,7 +6180,8 @@ def render_artist_history_tab() -> None:
 
                 if view == "History":
                     st.markdown("**Song summary**")
-                    _display_df(songs)
+                    song_summary_display = songs.rename(columns={"week_hit_peak": "Week Hit Peak"})
+                    _display_df(song_summary_display)
                     st.markdown("**Full week-by-week history**")
                     _display_df(history)
                 else:
@@ -7313,7 +7322,7 @@ def render_forecast_scorecard_tab() -> None:
     st.subheader("Forecast Lab Scorecard")
     st.caption("Backtests the historical-neighbor Forecast Lab across recent historical weeks with known next-week outcomes.")
     cols = st.columns(2)
-    weeks = cols[0].slider("Historical weeks to test", 5, 60, 20, 5, key="forecast_scorecard_weeks")
+    weeks = cols[0].slider("Historical weeks to test", 5, 300, 20, 5, key="forecast_scorecard_weeks")
     max_neighbors = cols[1].slider("Similar cases per song", 25, 250, 100, 25, key="forecast_scorecard_neighbors")
     if not st.checkbox("Run scorecard", value=False, key="forecast_scorecard_run"):
         st.info("Turn on the checkbox to run the backtest. This is intentionally gated because it loops through multiple forecast weeks.")
