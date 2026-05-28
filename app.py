@@ -2671,6 +2671,9 @@ def _forecast_for_chart_date(df_chart: pd.DataFrame, chart_date: pd.Timestamp, m
         )
 
         rows.append({
+            "entry_id": row.get("entry_id"),
+            "canonical_song_id": row.get("canonical_song_id"),
+            "song_key": row.get("song_key"),
             "chart_date": chart_date,
             "position": int(row["position"]),
             "title": row.get("title", ""),
@@ -3023,6 +3026,381 @@ def _render_lastfm_forecast_lab(top_n: int) -> None:
     )
     _render_lastfm_play_data_model(selected_chart_date, top_n)
 
+
+
+def _clip_score(value: object, lower: float = 0.0, upper: float = 100.0) -> float:
+    try:
+        val = float(value)
+    except Exception:
+        return 50.0
+    if pd.isna(val):
+        return 50.0
+    return max(lower, min(upper, val))
+
+
+def _historical_forecast_score(row: pd.Series) -> float:
+    """Convert the historical-neighbor forecast outputs into a 0-100 strength score."""
+    expected_rank = pd.to_numeric(pd.Series([row.get("expected_next_position")]), errors="coerce").iloc[0]
+    if pd.isna(expected_rank):
+        expected_rank = 41.0
+    rank_strength = _clip_score(((41.0 - float(expected_rank)) / 40.0) * 100.0)
+    stay = _clip_score(float(row.get("stay_probability", 0.0)) * 100.0)
+    up = _clip_score(float(row.get("up_probability", 0.0)) * 100.0)
+    top10 = _clip_score(float(row.get("top10_probability", 0.0)) * 100.0)
+    num1 = _clip_score(float(row.get("num1_hold_score", 0.0)) * 100.0)
+    dropout = _clip_score(float(row.get("dropout_risk", 0.0)) * 100.0)
+    return _clip_score(
+        0.55 * rank_strength
+        + 0.18 * stay
+        + 0.10 * up
+        + 0.12 * top10
+        + 0.05 * num1
+        - 0.10 * dropout
+    )
+
+
+def _composite_signal(row: pd.Series) -> str:
+    hist = float(row.get("historical_score", 50.0) or 50.0)
+    mom = float(row.get("momentum_score_norm", 50.0) or 50.0)
+    pressure = float(row.get("lastfm_pressure_score", 50.0) or 50.0)
+    lfm_mom = float(row.get("lastfm_momentum_score", 50.0) or 50.0)
+    comp = float(row.get("composite_score", 50.0) or 50.0)
+    pos = _safe_int(row.get("position")) or 99
+    dropout = float(row.get("dropout_risk", 0.0) or 0.0)
+    has_lfm = bool(row.get("has_lastfm_match", False))
+
+    if pos <= 5 and comp >= 78 and hist >= 65:
+        return "High #1 / Top 5 threat"
+    if dropout >= 0.55 and pressure < 50:
+        return "Dropout risk"
+    if hist >= 68 and pressure >= 60 and mom >= 55:
+        return "High-confidence strength"
+    if hist >= 68 and has_lfm and pressure < 42:
+        return "Historical strength, Last.fm weakness"
+    if hist < 58 and pressure >= 65:
+        return "Last.fm sleeper"
+    if pressure <= 35 or lfm_mom <= 35:
+        return "Softening risk"
+    if abs(pressure - 50) <= 8 and abs(lfm_mom - 50) <= 10:
+        return "Stable / aligned"
+    if pressure > 58 or lfm_mom > 58:
+        return "Positive Last.fm nudge"
+    return "Mixed signal"
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_lastfm_composite_signals(chart_date: str) -> dict[str, object]:
+    """Aggregate current and previous imported Last.fm rows by canonical song for composite scoring."""
+    chart_date = _coerce_chart_date_value(chart_date)
+    conn = get_connection()
+
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "lastfm_weekly_track_play" not in tables:
+        return {"summary": {}, "signals": pd.DataFrame(), "previous_chart_date": None}
+
+    chart_row = conn.execute(
+        """
+        SELECT chart_week_id, chart_date
+        FROM chart_week
+        WHERE chart_date = ?
+        LIMIT 1
+        """,
+        (chart_date,),
+    ).fetchone()
+    if chart_row is None:
+        return {"summary": {}, "signals": pd.DataFrame(), "previous_chart_date": None}
+
+    chart_week_id = int(chart_row["chart_week_id"])
+    prev_row = conn.execute(
+        """
+        SELECT cw.chart_week_id, cw.chart_date
+        FROM chart_week cw
+        JOIN lastfm_weekly_track_play l
+          ON l.chart_week_id = cw.chart_week_id
+        WHERE cw.chart_date < ?
+          AND l.canonical_song_id IS NOT NULL
+        GROUP BY cw.chart_week_id, cw.chart_date
+        ORDER BY cw.chart_date DESC
+        LIMIT 1
+        """,
+        (chart_date,),
+    ).fetchone()
+
+    summary_row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN canonical_song_id IS NOT NULL THEN 1 ELSE 0 END) AS matched_rows,
+            SUM(CASE WHEN canonical_song_id IS NULL THEN 1 ELSE 0 END) AS unmatched_rows,
+            SUM(COALESCE(playcount, 0)) AS total_plays,
+            SUM(CASE WHEN canonical_song_id IS NOT NULL THEN COALESCE(playcount, 0) ELSE 0 END) AS matched_plays
+        FROM lastfm_weekly_track_play
+        WHERE chart_week_id = ?
+        """,
+        (chart_week_id,),
+    ).fetchone()
+    total_plays = int(summary_row["total_plays"] or 0) if summary_row else 0
+    matched_plays = int(summary_row["matched_plays"] or 0) if summary_row else 0
+    summary = {
+        "chart_week_id": chart_week_id,
+        "chart_date": chart_date,
+        "total_rows": int(summary_row["total_rows"] or 0) if summary_row else 0,
+        "matched_rows": int(summary_row["matched_rows"] or 0) if summary_row else 0,
+        "unmatched_rows": int(summary_row["unmatched_rows"] or 0) if summary_row else 0,
+        "total_plays": total_plays,
+        "matched_plays": matched_plays,
+        "matched_play_share": (matched_plays / total_plays) if total_plays else 0.0,
+    }
+
+    current = pd.read_sql_query(
+        """
+        SELECT
+            canonical_song_id,
+            MIN(lastfm_rank) AS lastfm_rank,
+            SUM(COALESCE(playcount, 0)) AS lastfm_plays,
+            COUNT(*) AS lastfm_alias_rows
+        FROM lastfm_weekly_track_play
+        WHERE chart_week_id = ?
+          AND canonical_song_id IS NOT NULL
+        GROUP BY canonical_song_id
+        """,
+        conn,
+        params=(chart_week_id,),
+    )
+    if current.empty:
+        return {"summary": summary, "signals": pd.DataFrame(), "previous_chart_date": prev_row["chart_date"] if prev_row else None}
+
+    if prev_row is not None:
+        previous = pd.read_sql_query(
+            """
+            SELECT
+                canonical_song_id,
+                MIN(lastfm_rank) AS previous_lastfm_rank,
+                SUM(COALESCE(playcount, 0)) AS previous_lastfm_plays
+            FROM lastfm_weekly_track_play
+            WHERE chart_week_id = ?
+              AND canonical_song_id IS NOT NULL
+            GROUP BY canonical_song_id
+            """,
+            conn,
+            params=(int(prev_row["chart_week_id"]),),
+        )
+    else:
+        previous = pd.DataFrame(columns=["canonical_song_id", "previous_lastfm_rank", "previous_lastfm_plays"])
+
+    signals = current.merge(previous, on="canonical_song_id", how="left")
+    for col in ["canonical_song_id", "lastfm_rank", "lastfm_plays", "previous_lastfm_rank", "previous_lastfm_plays"]:
+        if col in signals.columns:
+            signals[col] = pd.to_numeric(signals[col], errors="coerce")
+
+    signals["lastfm_play_share"] = signals["lastfm_plays"] / matched_plays if matched_plays else 0.0
+    signals["lastfm_rank_change"] = signals["previous_lastfm_rank"] - signals["lastfm_rank"]
+    signals["lastfm_play_change"] = signals["lastfm_plays"] - signals["previous_lastfm_plays"]
+    return {"summary": summary, "signals": signals, "previous_chart_date": prev_row["chart_date"] if prev_row else None}
+
+
+def _build_composite_forecast(chart: pd.DataFrame, selected_date: pd.Timestamp, max_neighbors: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    forecast, similar = _forecast_for_chart_date(chart, selected_date, max_neighbors=max_neighbors)
+    if forecast.empty:
+        return forecast, similar
+
+    selected_label = pd.to_datetime(selected_date).strftime("%Y-%m-%d")
+    momentum = load_momentum_index_base()
+    if not momentum.empty:
+        momentum_week = momentum.loc[momentum["chart_date"].dt.strftime("%Y-%m-%d") == selected_label, [
+            "entry_id", "canonical_song_id", "song_key", "normalized_momentum_index", "raw_momentum_index", "momentum_type"
+        ]].copy()
+        forecast = forecast.merge(
+            momentum_week,
+            on=[c for c in ["entry_id", "canonical_song_id", "song_key"] if c in forecast.columns and c in momentum_week.columns],
+            how="left",
+        )
+    else:
+        forecast["normalized_momentum_index"] = pd.NA
+        forecast["raw_momentum_index"] = pd.NA
+        forecast["momentum_type"] = ""
+
+    lfm_payload = load_lastfm_composite_signals(selected_label)
+    lfm_summary = lfm_payload.get("summary", {}) if isinstance(lfm_payload, dict) else {}
+    lfm = lfm_payload.get("signals", pd.DataFrame()) if isinstance(lfm_payload, dict) else pd.DataFrame()
+    if not isinstance(lfm, pd.DataFrame):
+        lfm = pd.DataFrame()
+
+    if not lfm.empty and "canonical_song_id" in forecast.columns:
+        forecast = forecast.merge(lfm, on="canonical_song_id", how="left")
+    else:
+        for col in ["lastfm_rank", "lastfm_plays", "lastfm_play_share", "previous_lastfm_rank", "previous_lastfm_plays", "lastfm_rank_change", "lastfm_play_change"]:
+            forecast[col] = pd.NA
+
+    forecast["has_lastfm_match"] = forecast["lastfm_rank"].notna() if "lastfm_rank" in forecast.columns else False
+    forecast["historical_score"] = forecast.apply(_historical_forecast_score, axis=1).round(1)
+    forecast["momentum_score_norm"] = pd.to_numeric(forecast.get("normalized_momentum_index"), errors="coerce").fillna(50.0).clip(0, 100).round(1)
+
+    forecast["lastfm_pressure"] = pd.to_numeric(forecast["position"], errors="coerce") - pd.to_numeric(forecast.get("lastfm_rank"), errors="coerce")
+    forecast["lastfm_pressure_score"] = (50.0 + forecast["lastfm_pressure"].fillna(0) * 2.5).clip(0, 100).round(1)
+    forecast.loc[~forecast["has_lastfm_match"], "lastfm_pressure_score"] = 50.0
+
+    play_delta_score = (50.0 + pd.to_numeric(forecast.get("lastfm_play_change"), errors="coerce").fillna(0) * 2.0).clip(0, 100)
+    rank_delta_score = (50.0 + pd.to_numeric(forecast.get("lastfm_rank_change"), errors="coerce").fillna(0) * 3.0).clip(0, 100)
+    forecast["lastfm_momentum_score"] = (0.6 * play_delta_score + 0.4 * rank_delta_score).clip(0, 100).round(1)
+    forecast.loc[~forecast["has_lastfm_match"], "lastfm_momentum_score"] = 50.0
+
+    # Let Last.fm nudge less when the selected week has weaker matched play coverage.
+    matched_play_share = float(lfm_summary.get("matched_play_share", 0.0) or 0.0) if isinstance(lfm_summary, dict) else 0.0
+    if matched_play_share >= 0.80:
+        lfm_weight_multiplier = 1.0
+    elif matched_play_share >= 0.65:
+        lfm_weight_multiplier = 0.8
+    elif matched_play_share >= 0.50:
+        lfm_weight_multiplier = 0.6
+    else:
+        lfm_weight_multiplier = 0.4
+
+    hist_w = 0.55
+    momentum_w = 0.20
+    pressure_w = 0.15 * lfm_weight_multiplier
+    lfm_momentum_w = 0.10 * lfm_weight_multiplier
+    leftover = 1.0 - (hist_w + momentum_w + pressure_w + lfm_momentum_w)
+    hist_w += max(0.0, leftover)
+
+    forecast["composite_score"] = (
+        hist_w * forecast["historical_score"]
+        + momentum_w * forecast["momentum_score_norm"]
+        + pressure_w * forecast["lastfm_pressure_score"]
+        + lfm_momentum_w * forecast["lastfm_momentum_score"]
+    ).clip(0, 100).round(1)
+    forecast["forecast_signal"] = forecast.apply(_composite_signal, axis=1)
+    forecast = forecast.sort_values(["composite_score", "historical_score", "position"], ascending=[False, False, True]).reset_index(drop=True)
+    forecast["composite_rank"] = forecast.index + 1
+    forecast.attrs["lastfm_summary"] = lfm_summary
+    forecast.attrs["previous_lastfm_chart_date"] = lfm_payload.get("previous_chart_date") if isinstance(lfm_payload, dict) else None
+    forecast.attrs["lastfm_weight_multiplier"] = lfm_weight_multiplier
+    return forecast, similar
+
+
+def _format_composite_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in ["lastfm_rank", "lastfm_plays", "previous_lastfm_rank", "previous_lastfm_plays", "lastfm_rank_change", "lastfm_play_change"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+    for col in ["lastfm_pressure", "historical_score", "momentum_score_norm", "lastfm_pressure_score", "lastfm_momentum_score", "composite_score", "expected_next_position", "dropout_risk", "top10_probability"]:
+        if col in out.columns:
+            if col in ["dropout_risk", "top10_probability"]:
+                out[col] = (pd.to_numeric(out[col], errors="coerce") * 100).round(1).astype(str) + "%"
+            else:
+                out[col] = pd.to_numeric(out[col], errors="coerce").round(1)
+    if "lastfm_play_share" in out.columns:
+        out["lastfm_play_share"] = (pd.to_numeric(out["lastfm_play_share"], errors="coerce") * 100).round(1).astype(str) + "%"
+    if "move" in out.columns:
+        out["move"] = out["move"].apply(_format_movement)
+    return out
+
+
+def _render_composite_forecast_lab(top_n: int) -> None:
+    st.markdown("### Composite Forecast Model")
+    st.caption(
+        "Combines the historical neighbor forecast, Momentum Index, Last.fm rank pressure, "
+        "and Last.fm week-over-week movement. Last.fm contributes less when matched play coverage is weaker."
+    )
+
+    chart = load_analytics_base()
+    if chart.empty:
+        st.info("No chart data is available in the database yet.")
+        return
+    chart_dates = sorted(chart["chart_date"].dropna().unique())
+    if len(chart_dates) < 8:
+        st.info("Composite Forecast needs several historical chart weeks before it can compare similar past cases.")
+        return
+
+    controls = st.columns([1.4, 1.0])
+    date_labels = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in chart_dates]
+    selected_label = controls[0].selectbox("Forecast from chart week", date_labels, index=len(date_labels) - 1, key="forecast_lab_composite_chart_date")
+    max_neighbors = int(controls[1].slider("Similar cases per song", 25, 250, 125, 25, key="forecast_lab_composite_neighbors"))
+    selected_date = pd.to_datetime(selected_label)
+
+    composite, _similar = _build_composite_forecast(chart, selected_date, max_neighbors=max_neighbors)
+    if composite.empty:
+        st.info("Not enough earlier chart history exists before this selected week to build a composite forecast.")
+        return
+
+    summary = composite.attrs.get("lastfm_summary", {}) or {}
+    prev_lfm_date = composite.attrs.get("previous_lastfm_chart_date")
+    weight_mult = float(composite.attrs.get("lastfm_weight_multiplier", 1.0) or 1.0)
+    top_row = composite.iloc[0]
+    render_kpis([
+        ("Forecast week", selected_label),
+        ("Composite leader", top_row.get("title", "—")),
+        ("Leader score", f"{float(top_row.get('composite_score', 0.0)):.1f}"),
+        ("Matched play share", f"{float(summary.get('matched_play_share', 0.0) or 0.0):.1%}"),
+        ("Last.fm prior week", prev_lfm_date or "—"),
+        ("Last.fm weight", f"{weight_mult:.0%}"),
+    ])
+
+    display_cols = [
+        "composite_rank", "title", "artist", "position", "last_week_position", "move", "weeks_on_chart",
+        "lastfm_rank", "lastfm_plays", "lastfm_pressure", "lastfm_rank_change", "lastfm_play_change",
+        "historical_score", "momentum_score_norm", "lastfm_pressure_score", "lastfm_momentum_score",
+        "composite_score", "forecast_signal",
+    ]
+    st.markdown("**Composite forecast ranking**")
+    _display_df(_format_composite_columns(composite), display_cols)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Model agreement**")
+        agreement = composite.sort_values(["forecast_signal", "composite_score"], ascending=[True, False]).copy()
+        _display_df(
+            _format_composite_columns(agreement.head(top_n)),
+            ["forecast_signal", "title", "artist", "position", "historical_score", "momentum_score_norm", "lastfm_pressure_score", "lastfm_momentum_score", "composite_score"],
+        )
+
+        st.markdown("**Helped most by Last.fm**")
+        helped = composite.loc[composite["has_lastfm_match"]].copy()
+        if helped.empty:
+            st.caption("No matched Last.fm rows are available for the selected chart week.")
+        else:
+            helped["lastfm_lift"] = (
+                (0.15 * (helped["lastfm_pressure_score"] - 50.0))
+                + (0.10 * (helped["lastfm_momentum_score"] - 50.0))
+            ).round(1)
+            helped = helped.sort_values(["lastfm_lift", "lastfm_plays"], ascending=[False, False]).head(top_n)
+            _display_df(_format_composite_columns(helped), ["title", "artist", "position", "lastfm_rank", "lastfm_plays", "lastfm_pressure", "lastfm_rank_change", "lastfm_play_change", "lastfm_lift", "composite_score"])
+
+    with c2:
+        st.markdown("**Softened most by Last.fm**")
+        hurt = composite.loc[composite["has_lastfm_match"]].copy()
+        if hurt.empty:
+            st.caption("No matched Last.fm rows are available for the selected chart week.")
+        else:
+            hurt["lastfm_drag"] = (
+                (0.15 * (hurt["lastfm_pressure_score"] - 50.0))
+                + (0.10 * (hurt["lastfm_momentum_score"] - 50.0))
+            ).round(1)
+            hurt = hurt.sort_values(["lastfm_drag", "lastfm_plays"], ascending=[True, False]).head(top_n)
+            _display_df(_format_composite_columns(hurt), ["title", "artist", "position", "lastfm_rank", "lastfm_plays", "lastfm_pressure", "lastfm_rank_change", "lastfm_play_change", "lastfm_drag", "composite_score"])
+
+        st.markdown("**Last.fm movers**")
+        movers = composite.loc[composite["has_lastfm_match"] & composite["previous_lastfm_rank"].notna()].copy()
+        if movers.empty:
+            st.caption("No previous Last.fm week is available for these matched chart songs.")
+        else:
+            movers["abs_rank_change"] = pd.to_numeric(movers["lastfm_rank_change"], errors="coerce").abs()
+            movers["abs_play_change"] = pd.to_numeric(movers["lastfm_play_change"], errors="coerce").abs()
+            movers = movers.sort_values(["abs_rank_change", "abs_play_change", "lastfm_plays"], ascending=[False, False, False]).head(top_n)
+            _display_df(_format_composite_columns(movers), ["title", "artist", "position", "lastfm_rank", "previous_lastfm_rank", "lastfm_rank_change", "lastfm_plays", "previous_lastfm_plays", "lastfm_play_change", "lastfm_momentum_score"])
+
+    if selected_date < max(pd.to_datetime(chart_dates)):
+        compare = composite.merge(
+            chart.loc[chart["chart_date"] == selected_date, ["title", "artist", "position", "next_position", "dropped_out_next_week"]],
+            on=["title", "artist", "position"],
+            how="left",
+        )
+        compare["rank_error"] = (pd.to_numeric(compare["expected_next_position"], errors="coerce") - pd.to_numeric(compare["next_position"], errors="coerce")).abs()
+        st.markdown("### Composite backtest detail")
+        _display_df(
+            _format_composite_columns(compare.sort_values("composite_rank")),
+            ["composite_rank", "title", "artist", "position", "expected_next_position", "next_position", "rank_error", "dropout_risk", "composite_score", "forecast_signal"],
+        )
 
 def _render_forecast_lab(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     chart = pkg["chart"]
@@ -5599,11 +5977,11 @@ def render_weekly_top_artists_tab() -> None:
 
 def render_forecast_lab_tab() -> None:
     st.subheader("Forecast Lab")
-    st.caption("Choose between the historical neighbor forecast and the imported Last.fm play-data view.")
+    st.caption("Choose between the historical neighbor forecast, the imported Last.fm play-data view, and the composite model.")
 
     forecast_mode = st.radio(
         "Forecast mode",
-        ["Historical chart model", "Last.fm play data model"],
+        ["Historical chart model", "Last.fm play data model", "Composite model"],
         horizontal=True,
         key="forecast_lab_mode",
     )
@@ -5611,6 +5989,10 @@ def render_forecast_lab_tab() -> None:
 
     if forecast_mode == "Last.fm play data model":
         _render_lastfm_forecast_lab(top_n)
+        return
+
+    if forecast_mode == "Composite model":
+        _render_composite_forecast_lab(top_n)
         return
 
     base = load_analytics_base()
