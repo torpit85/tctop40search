@@ -5975,6 +5975,475 @@ def render_weekly_top_artists_tab() -> None:
     biggest = history.sort_values(["raw_score", "score", "songs", "chart_date"], ascending=[False, False, False, False]).copy()
     _display_df(biggest.head(top_n), ["chart_date", "rank", "artist", "score", "raw_score", "songs", "lead_songs", "featured_songs", "top_song", "top_position", "top_10_songs", "num1_songs"])
 
+
+
+def _mode_value(series: pd.Series, fallback: str = "") -> str:
+    """Pick a stable display value for grouped chart rows."""
+    clean = series.dropna().astype(str)
+    clean = clean.loc[clean.str.strip() != ""]
+    if clean.empty:
+        return fallback
+    modes = clean.mode()
+    return modes.iloc[0] if not modes.empty else clean.iloc[0]
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_chart_dominance_base() -> pd.DataFrame:
+    """Return row-level dominance inputs for Chart Dominance views."""
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+
+    df = chart.copy()
+    df["position"] = pd.to_numeric(df["position"], errors="coerce")
+    df = df.loc[df["position"].between(1, 40, inclusive="both")].copy()
+    if df.empty:
+        return df
+
+    # Top-heavy but still explainable: lower ranks count, Top 10/Top 5/#1 weeks pop.
+    df["dominance_score"] = (41 - df["position"]).pow(1.25)
+    df["dominance_score"] += df["position"].eq(1).astype(float) * 25.0
+    df["dominance_score"] += df["position"].le(5).astype(float) * 10.0
+    df["dominance_score"] += df["position"].le(10).astype(float) * 5.0
+    df["dominance_score"] = df["dominance_score"].round(4)
+
+    df["chart_date"] = pd.to_datetime(df["chart_date"], errors="coerce")
+    df["calendar_month"] = df["chart_date"].dt.strftime("%Y-%m")
+    df["calendar_year"] = df["chart_date"].dt.year.astype("Int64")
+    return df
+
+
+def _build_chart_dominance_summary(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    work = df.copy()
+    grouped = work.groupby(group_cols + ["song_key"], dropna=False)
+    out = grouped.agg(
+        song=("title", _mode_value),
+        artist=("artist", _mode_value),
+        dominance_score=("dominance_score", "sum"),
+        peak=("position", "min"),
+        num1_weeks=("num1_flag", "sum"),
+        top5_weeks=("top5_flag", "sum"),
+        top10_weeks=("top10_flag", "sum"),
+        chart_weeks=("entry_id", "nunique"),
+        first_week=("chart_date", "min"),
+        last_week=("chart_date", "max"),
+    ).reset_index()
+
+    if group_cols:
+        period_totals = work.groupby(group_cols, dropna=False)["dominance_score"].sum().reset_index(name="period_dominance_total")
+        out = out.merge(period_totals, on=group_cols, how="left")
+    else:
+        out["period_dominance_total"] = float(work["dominance_score"].sum())
+
+    out["score_per_week"] = (out["dominance_score"] / pd.to_numeric(out["chart_weeks"], errors="coerce").replace(0, pd.NA)).round(2)
+    out["dominance_share"] = (out["dominance_score"] / out["period_dominance_total"].replace(0, pd.NA) * 100).round(2)
+    out["dominance_score"] = out["dominance_score"].round(2)
+    out["peak"] = pd.to_numeric(out["peak"], errors="coerce").astype("Int64")
+    for col in ["num1_weeks", "top5_weeks", "top10_weeks", "chart_weeks"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+    out["first_week"] = pd.to_datetime(out["first_week"], errors="coerce")
+    out["last_week"] = pd.to_datetime(out["last_week"], errors="coerce")
+    return out
+
+
+def _build_artist_dominance_summary(df: pd.DataFrame, group_cols: list[str], credit_mode: str) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    credits = build_artist_credit_rows(df)
+    if credits.empty:
+        return pd.DataFrame()
+
+    if credit_mode == "Lead artists only":
+        credits = credits.loc[credits["artist_role_mode"].eq("Lead")].copy()
+    elif credit_mode == "Featured artists only":
+        credits = credits.loc[credits["artist_role_mode"].eq("Featured")].copy()
+    else:
+        credits = credits.loc[credits["artist_role_mode"].isin(["Lead", "Featured"])].copy()
+
+    if credits.empty:
+        return pd.DataFrame()
+
+    # If the same person is credited more than once on the same entry after alias resolution,
+    # count that chart appearance once for that artist.
+    credits = credits.drop_duplicates(subset=group_cols + ["entry_id", "artist_key"]).copy()
+    grouped = credits.groupby(group_cols + ["artist_key"], dropna=True)
+    out = grouped.agg(
+        artist=("artist", _mode_value),
+        dominance_score=("dominance_score", "sum"),
+        peak=("position", "min"),
+        num1_weeks=("num1_flag", "sum"),
+        top5_weeks=("top5_flag", "sum"),
+        top10_weeks=("top10_flag", "sum"),
+        chart_weeks=("entry_id", "nunique"),
+        distinct_songs=("song_key", "nunique"),
+        first_week=("chart_date", "min"),
+        last_week=("chart_date", "max"),
+    ).reset_index()
+    if out.empty:
+        return out
+
+    if group_cols:
+        period_totals = credits.groupby(group_cols, dropna=False)["dominance_score"].sum().reset_index(name="period_dominance_total")
+        out = out.merge(period_totals, on=group_cols, how="left")
+    else:
+        out["period_dominance_total"] = float(credits["dominance_score"].sum())
+
+    out["score_per_week"] = (out["dominance_score"] / pd.to_numeric(out["chart_weeks"], errors="coerce").replace(0, pd.NA)).round(2)
+    out["dominance_share"] = (out["dominance_score"] / out["period_dominance_total"].replace(0, pd.NA) * 100).round(2)
+    out["dominance_score"] = out["dominance_score"].round(2)
+    out["artist"] = out.apply(lambda r: preferred_artist_display(r.get("artist_key"), r.get("artist", "")), axis=1)
+    out["peak"] = pd.to_numeric(out["peak"], errors="coerce").astype("Int64")
+    for col in ["num1_weeks", "top5_weeks", "top10_weeks", "chart_weeks", "distinct_songs"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+    out["first_week"] = pd.to_datetime(out["first_week"], errors="coerce")
+    out["last_week"] = pd.to_datetime(out["last_week"], errors="coerce")
+    return out
+
+
+def _apply_chart_dominance_peak_filter(summary_df: pd.DataFrame, peak_filter: str) -> pd.DataFrame:
+    if summary_df.empty or "peak" not in summary_df.columns:
+        return summary_df
+    peak = pd.to_numeric(summary_df["peak"], errors="coerce")
+    if peak_filter == "#1":
+        return summary_df.loc[peak.eq(1)].copy()
+    if peak_filter == "Top 5":
+        return summary_df.loc[peak.le(5)].copy()
+    if peak_filter == "Top 10":
+        return summary_df.loc[peak.le(10)].copy()
+    if peak_filter == "Top 20":
+        return summary_df.loc[peak.le(20)].copy()
+    return summary_df
+
+
+def _chart_dominance_display_table(
+    df: pd.DataFrame,
+    period_col: str | None = None,
+    top_n: int = 100,
+    entity: str = "song",
+) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    name_col = "song" if entity == "song" else "artist"
+    sort_cols = ["dominance_score", "score_per_week", "num1_weeks", "top5_weeks", "top10_weeks", "peak", "last_week", name_col]
+    ascending = [False, False, False, False, False, True, False, True]
+    out = df.sort_values(sort_cols, ascending=ascending).head(top_n).reset_index(drop=True).copy()
+    out.insert(0, "rank", range(1, len(out) + 1))
+
+    cols = ["rank"]
+    if period_col and period_col in out.columns:
+        cols.append(period_col)
+    if entity == "song":
+        cols += ["song", "artist"]
+    else:
+        cols += ["artist", "distinct_songs"]
+    cols += [
+        "dominance_score", "score_per_week", "dominance_share", "peak",
+        "num1_weeks", "top5_weeks", "top10_weeks", "chart_weeks", "first_week", "last_week",
+    ]
+    out = out[[c for c in cols if c in out.columns]].copy()
+    rename = {
+        "rank": "Rank",
+        "calendar_month": "Calendar Month",
+        "calendar_year": "Year",
+        "song": "Song",
+        "artist": "Artist",
+        "distinct_songs": "Distinct Songs",
+        "dominance_score": "Dominance Score",
+        "score_per_week": "Score Per Week",
+        "dominance_share": "Dominance Share %",
+        "peak": "Peak",
+        "num1_weeks": "#1 Weeks",
+        "top5_weeks": "Top 5 Weeks",
+        "top10_weeks": "Top 10 Weeks",
+        "chart_weeks": "Chart Weeks",
+        "first_week": "First Week",
+        "last_week": "Last Week",
+    }
+    out = out.rename(columns=rename)
+    for date_col in ["First Week", "Last Week"]:
+        if date_col in out.columns:
+            out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+    for col in ["Dominance Score", "Score Per Week", "Dominance Share %"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+    return out
+
+
+def _build_dominance_blowouts(summary: pd.DataFrame, period_col: str) -> pd.DataFrame:
+    if summary.empty or period_col not in summary.columns:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    for period, group in summary.groupby(period_col, dropna=False):
+        leaders = group.sort_values(
+            ["dominance_score", "num1_weeks", "top5_weeks", "top10_weeks", "peak", "last_week", "song"],
+            ascending=[False, False, False, False, True, False, True],
+        ).head(2)
+        if len(leaders) < 2:
+            continue
+        winner = leaders.iloc[0]
+        runner = leaders.iloc[1]
+        runner_score = float(runner.get("dominance_score", 0) or 0)
+        winner_score = float(winner.get("dominance_score", 0) or 0)
+        rows.append({
+            period_col: period,
+            "winner_song": winner.get("song", ""),
+            "winner_artist": winner.get("artist", ""),
+            "winner_score": round(winner_score, 2),
+            "winner_share": winner.get("dominance_share", pd.NA),
+            "runner_up_song": runner.get("song", ""),
+            "runner_up_artist": runner.get("artist", ""),
+            "runner_up_score": round(runner_score, 2),
+            "margin": round(winner_score - runner_score, 2),
+            "ratio": round(winner_score / runner_score, 2) if runner_score else pd.NA,
+        })
+    return pd.DataFrame(rows)
+
+
+def _chart_dominance_blowout_display_table(df: pd.DataFrame, period_col: str, top_n: int) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    out = df.sort_values(["margin", "ratio", "winner_score"], ascending=[False, False, False]).head(top_n).reset_index(drop=True).copy()
+    out.insert(0, "rank", range(1, len(out) + 1))
+    out = out[[
+        "rank", period_col, "winner_song", "winner_artist", "winner_score", "winner_share",
+        "runner_up_song", "runner_up_artist", "runner_up_score", "margin", "ratio",
+    ]].copy()
+    rename = {
+        "rank": "Rank",
+        "calendar_month": "Calendar Month",
+        "calendar_year": "Year",
+        "winner_song": "Winner",
+        "winner_artist": "Winner Artist",
+        "winner_score": "Winner Score",
+        "winner_share": "Winner Share %",
+        "runner_up_song": "Runner-Up",
+        "runner_up_artist": "Runner-Up Artist",
+        "runner_up_score": "Runner-Up Score",
+        "margin": "Margin",
+        "ratio": "Ratio",
+    }
+    out = out.rename(columns=rename)
+    for col in ["Winner Score", "Winner Share %", "Runner-Up Score", "Margin", "Ratio"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+    return out
+
+
+def _dominant_without_num1_filter(summary: pd.DataFrame, peak_mode: str) -> pd.DataFrame:
+    if summary.empty:
+        return summary
+    peak = pd.to_numeric(summary["peak"], errors="coerce")
+    out = summary.loc[peak.gt(1)].copy()
+    peak = pd.to_numeric(out["peak"], errors="coerce")
+    if peak_mode == "Peak exactly #2":
+        out = out.loc[peak.eq(2)].copy()
+    elif peak_mode == "Top 3 but not #1":
+        out = out.loc[peak.le(3)].copy()
+    elif peak_mode == "Top 5 but not #1":
+        out = out.loc[peak.le(5)].copy()
+    elif peak_mode == "Top 10 but not #1":
+        out = out.loc[peak.le(10)].copy()
+    elif peak_mode == "Did not reach Top 10":
+        out = out.loc[peak.gt(10)].copy()
+    return out
+
+
+def render_chart_dominance_tab() -> None:
+    st.subheader("Chart Dominance")
+    st.caption("Ranks the most dominant song and artist performances overall, by calendar month, and by calendar year.")
+
+    base = load_chart_dominance_base()
+    if base.empty:
+        st.info("No chart data is available for Chart Dominance yet.")
+        return
+
+    with st.expander("Dominance score formula", expanded=False):
+        st.markdown(
+            """
+The dominance score is intentionally top-heavy while still letting long strong runs matter.
+
+```text
+Weekly dominance score = (41 - chart position) ^ 1.25
+                       + 25 if #1
+                       + 10 if Top 5
+                       + 5 if Top 10
+```
+
+Monthly performances use the song's appearances inside the actual calendar month from `chart_date`, such as `2026-05-01` through `2026-05-31`. They do **not** use the T-10 chart-month cutoff logic.
+
+**Dominance Share %** is the song or artist's share of all dominance points in the selected universe. **Score Per Week** divides total dominance score by chart weeks, which helps surface short but explosive runs.
+"""
+        )
+
+    section = st.radio(
+        "Dominance section",
+        ["Songs", "Artists", "Blowouts", "Dominant Without #1"],
+        horizontal=True,
+        key="chart_dominance_section_v2",
+    )
+
+    control_cols = st.columns(4)
+    top_n = control_cols[0].slider("Rows", 10, 500, 100, 10, key="chart_dominance_top_n")
+    min_chart_weeks = control_cols[1].slider("Minimum chart weeks", 1, 52, 1, 1, key="chart_dominance_min_weeks")
+    peak_options = ["Any peak", "#1", "Top 5", "Top 10", "Top 20"]
+    peak_filter = control_cols[2].selectbox("Peak filter", peak_options, key="chart_dominance_peak_filter")
+
+    filtered = base.copy()
+
+    if section == "Songs":
+        view = st.radio(
+            "Song dominance view",
+            ["Overall", "Monthly", "Yearly"],
+            horizontal=True,
+            key="chart_dominance_song_view",
+        )
+        if view == "Overall":
+            st.markdown("**Most dominant overall song performances**")
+            st.caption("Sums each song's dominance score across its full chart run within the current filters.")
+            summary = _build_chart_dominance_summary(filtered, [])
+            summary = summary.loc[summary["chart_weeks"] >= min_chart_weeks].copy()
+            summary = _apply_chart_dominance_peak_filter(summary, peak_filter)
+            table = _chart_dominance_display_table(summary, None, top_n, entity="song")
+            _display_df(table)
+
+        elif view == "Monthly":
+            mode = control_cols[3].radio(
+                "Monthly mode",
+                ["Best monthly performances all-time", "Selected calendar month"],
+                key="chart_dominance_month_mode",
+            )
+            months = sorted(filtered["calendar_month"].dropna().unique().tolist(), reverse=True)
+            if mode == "Selected calendar month":
+                selected_month = st.selectbox("Calendar month", months, key="chart_dominance_selected_month")
+                month_df = filtered.loc[filtered["calendar_month"] == selected_month].copy()
+                summary = _build_chart_dominance_summary(month_df, ["calendar_month"])
+                st.markdown(f"**Most dominant song performances for {selected_month}**")
+            else:
+                summary = _build_chart_dominance_summary(filtered, ["calendar_month"])
+                st.markdown("**Best calendar-month song performances all-time**")
+            summary = summary.loc[summary["chart_weeks"] >= min_chart_weeks].copy()
+            summary = _apply_chart_dominance_peak_filter(summary, peak_filter)
+            st.caption("Monthly performances are grouped by the actual calendar month of each chart date.")
+            table = _chart_dominance_display_table(summary, "calendar_month", top_n, entity="song")
+            _display_df(table)
+
+        else:
+            mode = control_cols[3].radio(
+                "Yearly mode",
+                ["Best yearly performances all-time", "Selected year"],
+                key="chart_dominance_year_mode",
+            )
+            years = sorted([int(y) for y in filtered["calendar_year"].dropna().unique().tolist()], reverse=True)
+            if mode == "Selected year":
+                selected_year = st.selectbox("Year", years, key="chart_dominance_selected_year")
+                year_df = filtered.loc[filtered["calendar_year"] == selected_year].copy()
+                summary = _build_chart_dominance_summary(year_df, ["calendar_year"])
+                st.markdown(f"**Most dominant song performances for {selected_year}**")
+            else:
+                summary = _build_chart_dominance_summary(filtered, ["calendar_year"])
+                st.markdown("**Best calendar-year song performances all-time**")
+            summary = summary.loc[summary["chart_weeks"] >= min_chart_weeks].copy()
+            summary = _apply_chart_dominance_peak_filter(summary, peak_filter)
+            table = _chart_dominance_display_table(summary, "calendar_year", top_n, entity="song")
+            _display_df(table)
+
+    elif section == "Artists":
+        credit_mode = control_cols[3].selectbox(
+            "Artist credit mode",
+            ["Lead artists only", "Lead + featured artists", "Featured artists only"],
+            key="chart_dominance_artist_credit_mode",
+        )
+        view = st.radio(
+            "Artist dominance view",
+            ["Overall", "Monthly", "Yearly"],
+            horizontal=True,
+            key="chart_dominance_artist_view",
+        )
+        if view == "Overall":
+            st.markdown("**Most dominant overall artist performances**")
+            summary = _build_artist_dominance_summary(filtered, [], credit_mode)
+            period_col = None
+        elif view == "Monthly":
+            mode = st.radio(
+                "Monthly artist mode",
+                ["Best monthly artist performances all-time", "Selected calendar month"],
+                horizontal=True,
+                key="chart_dominance_artist_month_mode",
+            )
+            months = sorted(filtered["calendar_month"].dropna().unique().tolist(), reverse=True)
+            if mode == "Selected calendar month":
+                selected_month = st.selectbox("Calendar month", months, key="chart_dominance_artist_selected_month")
+                work = filtered.loc[filtered["calendar_month"] == selected_month].copy()
+                st.markdown(f"**Most dominant artists for {selected_month}**")
+            else:
+                work = filtered
+                st.markdown("**Best calendar-month artist performances all-time**")
+            summary = _build_artist_dominance_summary(work, ["calendar_month"], credit_mode)
+            period_col = "calendar_month"
+        else:
+            mode = st.radio(
+                "Yearly artist mode",
+                ["Best yearly artist performances all-time", "Selected year"],
+                horizontal=True,
+                key="chart_dominance_artist_year_mode",
+            )
+            years = sorted([int(y) for y in filtered["calendar_year"].dropna().unique().tolist()], reverse=True)
+            if mode == "Selected year":
+                selected_year = st.selectbox("Year", years, key="chart_dominance_artist_selected_year")
+                work = filtered.loc[filtered["calendar_year"] == selected_year].copy()
+                st.markdown(f"**Most dominant artists for {selected_year}**")
+            else:
+                work = filtered
+                st.markdown("**Best calendar-year artist performances all-time**")
+            summary = _build_artist_dominance_summary(work, ["calendar_year"], credit_mode)
+            period_col = "calendar_year"
+
+        if summary.empty:
+            st.info("No artist dominance rows match the current filters.")
+        else:
+            summary = summary.loc[summary["chart_weeks"] >= min_chart_weeks].copy()
+            summary = _apply_chart_dominance_peak_filter(summary, peak_filter)
+            table = _chart_dominance_display_table(summary, period_col, top_n, entity="artist")
+            _display_df(table)
+
+    elif section == "Blowouts":
+        blowout_period = control_cols[3].radio(
+            "Blowout period",
+            ["Monthly", "Yearly"],
+            key="chart_dominance_blowout_period",
+        )
+        period_col = "calendar_month" if blowout_period == "Monthly" else "calendar_year"
+        summary = _build_chart_dominance_summary(filtered, [period_col])
+        summary = summary.loc[summary["chart_weeks"] >= min_chart_weeks].copy()
+        summary = _apply_chart_dominance_peak_filter(summary, peak_filter)
+        blowouts = _build_dominance_blowouts(summary, period_col)
+        st.markdown(f"**Biggest {blowout_period.lower()} song-dominance blowouts**")
+        st.caption("Ranks periods by the margin between the #1 and #2 song dominance scores after the current filters are applied.")
+        table = _chart_dominance_blowout_display_table(blowouts, period_col, top_n)
+        _display_df(table)
+
+    else:
+        control_cols[3].caption("Overall song runs only")
+        peak_mode = st.selectbox(
+            "Non-#1 peak group",
+            ["All non-#1 peaks", "Peak exactly #2", "Top 3 but not #1", "Top 5 but not #1", "Top 10 but not #1", "Did not reach Top 10"],
+            key="chart_dominance_non_num1_peak_mode",
+        )
+        summary = _build_chart_dominance_summary(filtered, [])
+        summary = summary.loc[summary["chart_weeks"] >= min_chart_weeks].copy()
+        summary = _dominant_without_num1_filter(summary, peak_mode)
+        st.markdown("**Most dominant songs that never reached #1**")
+        st.caption("Overall song runs only. This is meant to surface big hits that were blocked from the top spot.")
+        table = _chart_dominance_display_table(summary, None, top_n, entity="song")
+        _display_df(table)
+
+
 def render_forecast_lab_tab() -> None:
     st.subheader("Forecast Lab")
     st.caption("Choose between the historical neighbor forecast, the imported Last.fm play-data view, and the composite model.")
@@ -8290,6 +8759,7 @@ def main() -> None:
             "Quick tables",
             "Analytics",
             "Weekly Top Artists",
+            "Chart Dominance",
             "Momentum Index",
             "Forecast Lab",
             "Forecast Lab Scorecard",
@@ -8333,6 +8803,8 @@ def main() -> None:
         render_analytics_tab()
     elif main_section == "Weekly Top Artists":
         render_weekly_top_artists_tab()
+    elif main_section == "Chart Dominance":
+        render_chart_dominance_tab()
     elif main_section == "Momentum Index":
         render_momentum_index_tab()
     elif main_section == "Forecast Lab":
