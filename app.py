@@ -4,6 +4,7 @@ import datetime as dt
 import sqlite3
 import re
 import math
+import html
 from pathlib import Path
 from typing import Iterable
 
@@ -851,6 +852,114 @@ def render_kpis(items: Iterable[tuple[str, object]]) -> None:
     for col, (label, value) in zip(cols, items):
         col.metric(label, value)
 
+
+def _format_chart_date_for_display(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except Exception:
+        text = "" if value is None else str(value).strip()
+        return text[:10] if text else "—"
+
+
+def _metric_html(label: str, value: object, subtext: str | None = None, value_font: str = "1.7rem") -> str:
+    value_text = html.escape("—" if value is None else str(value))
+    subtext_html = ""
+    if subtext:
+        subtext_text = str(subtext)
+        # Streak metrics use subtext like "(2025-10-07 - 2025-10-28) / 12".
+        # Keep the date range small, but render the slash + total at the same size
+        # as the main streak number so the total figure reads as part of the metric.
+        if ") / " in subtext_text:
+            date_text, total_text = subtext_text.split(") / ", 1)
+            date_text = date_text + ")"
+            subtext_html = (
+                '<span style="font-size:0.72rem; color:rgba(49,51,63,0.68); '
+                'font-weight:400; margin-left:0.18rem; white-space:normal;">'
+                f'{html.escape(date_text)}</span>'
+                f'<span style="font-size:{value_font}; color:inherit; font-weight:400; margin-left:0.18rem;">'
+                f'/ {html.escape(total_text)}</span>'
+            )
+        elif subtext_text.startswith("/ "):
+            subtext_html = (
+                f'<span style="font-size:{value_font}; color:inherit; font-weight:400; margin-left:0.18rem;">'
+                f'{html.escape(subtext_text)}</span>'
+            )
+        else:
+            subtext_html = (
+                '<span style="font-size:0.72rem; color:rgba(49,51,63,0.68); '
+                'font-weight:400; margin-left:0.18rem; white-space:normal;">'
+                f'{html.escape(subtext_text)}</span>'
+            )
+    return (
+        '<div style="line-height:1.15; padding-top:0.1rem; min-height:4.2rem;">'
+        f'<div style="font-size:0.82rem; color:rgba(49,51,63,0.72); margin-bottom:0.32rem; white-space:normal;">{html.escape(label)}</div>'
+        f'<div style="font-size:{value_font}; font-weight:400; white-space:normal; overflow-wrap:anywhere;">{value_text}{subtext_html}</div>'
+        '</div>'
+    )
+
+
+def _top_streak_summary(history: pd.DataFrame, max_position: int) -> dict[str, object]:
+    if history.empty or "chart_date" not in history.columns or "position" not in history.columns:
+        return {"longest": 0, "total": 0, "start": None, "end": None}
+
+    df = history[["chart_date", "position"]].copy()
+    df["chart_date"] = pd.to_datetime(df["chart_date"], errors="coerce")
+    df["position"] = pd.to_numeric(df["position"], errors="coerce")
+    df = df.dropna(subset=["chart_date", "position"]).sort_values("chart_date").reset_index(drop=True)
+    if df.empty:
+        return {"longest": 0, "total": 0, "start": None, "end": None}
+
+    all_dates = pd.to_datetime(pd.Series(load_chart_dates()), errors="coerce").dropna().sort_values().tolist()
+    prev_available = {all_dates[i]: all_dates[i - 1] for i in range(1, len(all_dates))}
+
+    longest = 0
+    longest_start = None
+    longest_end = None
+    current = 0
+    current_start = None
+    previous_song_date = None
+    total = int(df["position"].le(max_position).sum())
+
+    for row in df.itertuples(index=False):
+        chart_dt = row.chart_date
+        qualifies = float(row.position) <= max_position
+        follows_previous_chart = (
+            previous_song_date is not None
+            and prev_available.get(chart_dt) == previous_song_date
+        )
+        if qualifies:
+            if current > 0 and follows_previous_chart:
+                current += 1
+            else:
+                current = 1
+                current_start = chart_dt
+            if current > longest:
+                longest = current
+                longest_start = current_start
+                longest_end = chart_dt
+        else:
+            current = 0
+            current_start = None
+        previous_song_date = chart_dt
+
+    return {
+        "longest": int(longest),
+        "total": int(total),
+        "start": longest_start,
+        "end": longest_end,
+    }
+
+
+def _streak_metric_parts(streak: dict[str, object]) -> tuple[str, str | None]:
+    longest = int(streak.get("longest") or 0)
+    total = int(streak.get("total") or 0)
+    if longest <= 0:
+        return "0", f"/ {total}"
+    start = _format_chart_date_for_display(streak.get("start"))
+    end = _format_chart_date_for_display(streak.get("end"))
+    return str(longest), f"({start} - {end}) / {total}"
 
 
 
@@ -6938,12 +7047,19 @@ def render_song_history_tab() -> None:
             selected_song_id = display_options[selected_label]
             history, stats, aliases = canonical_song_history(selected_song_id)
             if stats:
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Peak", f"#{int(stats['peak'])}")
-                c2.metric("Chart weeks", int(stats["chart_weeks"]))
-                c3.metric("Avg position", f"{float(stats.get('avg_position') or 0):.2f}")
-                c4.metric("First week", stats["first_date"])
-                c5.metric("Last week", stats["last_date"])
+                num1_streak = _top_streak_summary(history, 1)
+                top10_streak = _top_streak_summary(history, 10)
+                num1_value, num1_subtext = _streak_metric_parts(num1_streak)
+                top10_value, top10_subtext = _streak_metric_parts(top10_streak)
+
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([0.7, 0.9, 0.9, 1.15, 1.15, 1.45, 1.55])
+                c1.markdown(_metric_html("Peak", f"#{int(stats['peak'])}"), unsafe_allow_html=True)
+                c2.markdown(_metric_html("Chart weeks", int(stats["chart_weeks"])), unsafe_allow_html=True)
+                c3.markdown(_metric_html("Avg position", f"{float(stats.get('avg_position') or 0):.2f}"), unsafe_allow_html=True)
+                c4.markdown(_metric_html("First week", stats["first_date"], value_font="1.05rem"), unsafe_allow_html=True)
+                c5.markdown(_metric_html("Last week", stats["last_date"], value_font="1.05rem"), unsafe_allow_html=True)
+                c6.markdown(_metric_html("Longest #1 / total", num1_value, num1_subtext, value_font="1.35rem"), unsafe_allow_html=True)
+                c7.markdown(_metric_html("Longest Top 10 / total", top10_value, top10_subtext, value_font="1.35rem"), unsafe_allow_html=True)
                 full_credit = _escape_streamlit_caption_text(stats['artist'])
                 lead_credit = _escape_streamlit_caption_text(stats['lead_artist'])
                 featured_credit = _escape_streamlit_caption_text(stats['featured_artist'] or '—')
@@ -6966,7 +7082,11 @@ def render_song_history_tab() -> None:
                     st.line_chart((-chart_df).rename("inverted_position"))
                     st.caption("Line chart uses inverted positions so higher placements plot higher.")
                     st.markdown("**Week-by-week history**")
-                    _display_df(history)
+                    history_display = history.drop(
+                        columns=["lead_artist", "featured_artist", "row_count", "source_file"],
+                        errors="ignore",
+                    )
+                    _display_df(history_display)
                     st.markdown("**Alias variants in this canonical song**")
                     _display_df(aliases)
                 else:
@@ -6980,7 +7100,11 @@ def render_song_history_tab() -> None:
                     chart_line["position"] = pd.to_numeric(chart_line["position"], errors="coerce")
                     st.line_chart(chart_line.set_index("chart_date")[["position"]], width="stretch")
                     st.markdown("**Full history**")
-                    _display_df(history)
+                    history_display = history.drop(
+                        columns=["lead_artist", "featured_artist", "row_count", "source_file"],
+                        errors="ignore",
+                    )
+                    _display_df(history_display)
                     if not aliases.empty:
                         with st.expander("Aliases / source variants"):
                             _display_df(aliases)
