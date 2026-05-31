@@ -1339,7 +1339,7 @@ def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
     df["hold_bonus"] = df.apply(lambda r: _momentum_hold_bonus(r.get("position"), r.get("move")), axis=1)
     df["drop_penalty"] = df.apply(_momentum_drop_penalty, axis=1)
     df["fatigue_penalty"] = df.apply(_momentum_fatigue_penalty, axis=1)
-    df["raw_momentum_index"] = (
+    df["raw_momentum_index_unclipped"] = (
         0.45 * df["position_score"]
         + 2.0 * df["movement_weighted"]
         + 1.5 * df["trend_clamped"]
@@ -1349,7 +1349,10 @@ def _add_momentum_columns(chart: pd.DataFrame) -> pd.DataFrame:
         + df["slow_burn_bonus"]
         - df["drop_penalty"]
         - df["fatigue_penalty"]
-    ).clip(lower=0).round(2)
+    ).round(2)
+    # Keep the existing weekly Momentum Index behavior clipped at zero, while
+    # preserving the unclipped diagnostic score for cumulative/net momentum views.
+    df["raw_momentum_index"] = df["raw_momentum_index_unclipped"].clip(lower=0).round(2)
     df["momentum_type"] = df.apply(_momentum_type, axis=1)
 
     df = df.sort_values(["song_key", "chart_date", "position", "entry_id"]).reset_index(drop=True)
@@ -1610,6 +1613,154 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _momentum_cumulative_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate song-level Cumulative Momentum Index from unclipped raw scores."""
+    if df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    if "raw_momentum_index_unclipped" not in work.columns:
+        # Older cached frames should be rare after code edits, but this fallback keeps
+        # the view usable by treating the clipped raw score as the best available score.
+        work["raw_momentum_index_unclipped"] = pd.to_numeric(work.get("raw_momentum_index"), errors="coerce").fillna(0.0)
+    work["raw_momentum_index_unclipped"] = pd.to_numeric(work["raw_momentum_index_unclipped"], errors="coerce").fillna(0.0)
+    work["position"] = pd.to_numeric(work.get("position"), errors="coerce")
+    work["chart_date"] = pd.to_datetime(work["chart_date"], errors="coerce")
+    work["positive_momentum_week"] = work["raw_momentum_index_unclipped"] > 0
+    work["negative_momentum_week"] = work["raw_momentum_index_unclipped"] < 0
+    work["momentum_impact_week"] = work.get("momentum_award", "").astype(str).str.contains("MOMENTUM IMPACT", na=False)
+    work["greatest_gainer_week"] = work.get("momentum_award", "").astype(str).str.contains("GREATEST GAINER", na=False)
+
+    grouped = (
+        work.groupby("song_key", dropna=False)
+        .agg(
+            Song=("title", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+            Artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+            **{
+                "Cumulative Momentum Index": ("raw_momentum_index_unclipped", "sum"),
+                "Weeks Counted": ("entry_id", "nunique"),
+                "Avg Momentum": ("raw_momentum_index_unclipped", "mean"),
+                "Peak Raw Momentum": ("raw_momentum_index_unclipped", "max"),
+                "Lowest Raw Momentum": ("raw_momentum_index_unclipped", "min"),
+                "Positive Weeks": ("positive_momentum_week", "sum"),
+                "Negative Weeks": ("negative_momentum_week", "sum"),
+                "Momentum Impact Weeks": ("momentum_impact_week", "sum"),
+                "Greatest Gainer Weeks": ("greatest_gainer_week", "sum"),
+                "Peak Position": ("position", "min"),
+                "First Week": ("chart_date", "min"),
+                "Last Week": ("chart_date", "max"),
+            },
+        )
+        .reset_index(drop=True)
+    )
+    grouped = grouped.sort_values(
+        ["Cumulative Momentum Index", "Peak Raw Momentum", "Peak Position", "Last Week", "Song"],
+        ascending=[False, False, True, False, True],
+    ).reset_index(drop=True)
+    grouped.insert(0, "Rank", range(1, len(grouped) + 1))
+    numeric_cols = [
+        "Cumulative Momentum Index",
+        "Avg Momentum",
+        "Peak Raw Momentum",
+        "Lowest Raw Momentum",
+    ]
+    for col in numeric_cols:
+        grouped[col] = pd.to_numeric(grouped[col], errors="coerce").round(1)
+    for col in ["Weeks Counted", "Positive Weeks", "Negative Weeks", "Momentum Impact Weeks", "Greatest Gainer Weeks", "Peak Position"]:
+        grouped[col] = pd.to_numeric(grouped[col], errors="coerce").fillna(0).astype(int)
+    return grouped
+
+
+def _render_cumulative_momentum_view(momentum: pd.DataFrame) -> None:
+    st.markdown("**Cumulative Momentum**")
+    st.caption(
+        "Cumulative Momentum Index sums each song's unclipped Raw Momentum Index Score "
+        "from the Weekly Momentum raw data points, including negative weeks."
+    )
+
+    work = momentum.copy()
+    work["chart_date"] = pd.to_datetime(work["chart_date"], errors="coerce")
+    work = work.dropna(subset=["chart_date"]).copy()
+    work["year"] = work["chart_date"].dt.year
+
+    scope_mode = st.radio(
+        "Cumulative view",
+        ["By chart date", "By year"],
+        horizontal=True,
+        key="momentum_cumulative_scope_mode",
+        help="By chart date shows the running cumulative leaderboard through the selected chart week. By year limits the totals to a selected calendar year or all years.",
+    )
+
+    if scope_mode == "By chart date":
+        chart_date_options = sorted(work["chart_date"].dt.strftime("%Y-%m-%d").dropna().unique(), reverse=True)
+        controls = st.columns([1.25, 1.0, 1.2, 1.0])
+        selected_chart_date = controls[0].selectbox(
+            "Chart date",
+            chart_date_options,
+            key="momentum_cumulative_chart_date",
+        )
+        min_weeks = controls[1].slider("Minimum weeks", 1, 52, 1, 1, key="momentum_cumulative_min_weeks_chart_date")
+        peak_filter = controls[2].selectbox(
+            "Peak filter",
+            ["All", "#1", "Top 5", "Top 10", "Top 20", "Never #1", "Never Top 10"],
+            key="momentum_cumulative_peak_filter_chart_date",
+        )
+        rows = controls[3].slider("Rows", 10, 200, 50, 10, key="momentum_cumulative_rows_chart_date")
+        selected_ts = pd.to_datetime(selected_chart_date)
+        work = work.loc[work["chart_date"].le(selected_ts)].copy()
+        st.caption(f"Showing cumulative totals through {selected_chart_date}.")
+    else:
+        year_options = ["All years"] + [str(y) for y in sorted(work["year"].dropna().astype(int).unique(), reverse=True)]
+        controls = st.columns([1.1, 1.0, 1.2, 1.0])
+        selected_year = controls[0].selectbox("Year", year_options, key="momentum_cumulative_year")
+        min_weeks = controls[1].slider("Minimum weeks", 1, 52, 1, 1, key="momentum_cumulative_min_weeks_year")
+        peak_filter = controls[2].selectbox(
+            "Peak filter",
+            ["All", "#1", "Top 5", "Top 10", "Top 20", "Never #1", "Never Top 10"],
+            key="momentum_cumulative_peak_filter_year",
+        )
+        rows = controls[3].slider("Rows", 10, 200, 50, 10, key="momentum_cumulative_rows_year")
+        if selected_year != "All years":
+            work = work.loc[work["year"].eq(int(selected_year))].copy()
+        st.caption(
+            "Showing cumulative totals within "
+            + ("all chart years." if selected_year == "All years" else f"{selected_year}.")
+        )
+
+    if work.empty:
+        st.info("No momentum rows are available for this selection.")
+        return
+
+    table = _momentum_cumulative_table(work)
+    if table.empty:
+        st.info("No cumulative momentum rows are available for this selection.")
+        return
+    table = table.loc[table["Weeks Counted"].ge(min_weeks)].copy()
+    if peak_filter == "#1":
+        table = table.loc[table["Peak Position"].eq(1)].copy()
+    elif peak_filter == "Top 5":
+        table = table.loc[table["Peak Position"].le(5)].copy()
+    elif peak_filter == "Top 10":
+        table = table.loc[table["Peak Position"].le(10)].copy()
+    elif peak_filter == "Top 20":
+        table = table.loc[table["Peak Position"].le(20)].copy()
+    elif peak_filter == "Never #1":
+        table = table.loc[table["Peak Position"].gt(1)].copy()
+    elif peak_filter == "Never Top 10":
+        table = table.loc[table["Peak Position"].gt(10)].copy()
+
+    if table.empty:
+        st.info("No cumulative momentum rows match these filters.")
+        return
+
+    table = table.sort_values(
+        ["Cumulative Momentum Index", "Peak Raw Momentum", "Peak Position", "Last Week", "Song"],
+        ascending=[False, False, True, False, True],
+    ).reset_index(drop=True)
+    table["Rank"] = range(1, len(table) + 1)
+    st.caption(f"Showing {min(len(table), rows):,} of {len(table):,} cumulative song row(s).")
+    _display_df(table.head(rows))
+
+
 def render_momentum_index_tab() -> None:
     st.subheader("Momentum Index")
     st.caption("Measures weekly chart energy from rank strength, movement, recent trend, debut/re-entry status, strong holds, and cooling/fatigue penalties. Momentum Impact uses the highest raw score; Greatest Gainer uses the largest percentage gain in raw score from the previous available chart week.")
@@ -1759,7 +1910,7 @@ This makes each week easier to scan, but awards are based on the raw score.
 
     view = st.radio(
         "Momentum view",
-        ["Weekly Momentum", "#1 Songs", "Song Momentum History"],
+        ["Weekly Momentum", "#1 Songs", "Cumulative Momentum", "Song Momentum History"],
         horizontal=True,
         key="momentum_view",
     )
@@ -1816,6 +1967,10 @@ This makes each week easier to scan, but awards are based on the raw score.
             leaders = leaders.loc[leaders["year"].eq(int(selected_year))].copy()
         st.caption(f"Showing {len(leaders):,} weekly Momentum Index #1 song row(s).")
         _display_df(_momentum_num1_songs_display_table(leaders, earliest_to_latest=earliest_to_latest))
+        return
+
+    if view == "Cumulative Momentum":
+        _render_cumulative_momentum_view(momentum)
         return
 
     st.markdown("**Song Momentum History**")
