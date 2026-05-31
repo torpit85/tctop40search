@@ -1613,15 +1613,50 @@ def _momentum_raw_points_display_table(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _recompute_unclipped_raw_momentum(work: pd.DataFrame) -> pd.Series:
+    """Rebuild the unclipped Raw MI score from the scoring inputs.
+
+    This prevents Cumulative Momentum from silently falling back to the clipped
+    weekly raw_momentum_index when Streamlit is holding an older cached
+    load_momentum_index_base() frame.
+    """
+    def _numeric_series(col: str, default: float = 0.0) -> pd.Series:
+        if col in work.columns:
+            return pd.to_numeric(work[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=work.index, dtype="float64")
+
+    if "movement_weighted" in work.columns:
+        weighted_move = _numeric_series("movement_weighted")
+    else:
+        movement_clamped = _numeric_series("movement_clamped")
+        if "chart_zone_movement_weight" in work.columns:
+            zone_weight = _numeric_series("chart_zone_movement_weight", default=1.0)
+        else:
+            zone_weight = work.get("position", pd.Series(index=work.index)).map(_momentum_chart_zone_weight).fillna(1.0)
+        weighted_move = movement_clamped.where(movement_clamped <= 0, movement_clamped * zone_weight)
+
+    return (
+        0.45 * _numeric_series("position_score")
+        + 2.0 * weighted_move
+        + 1.5 * _numeric_series("trend_clamped")
+        + _numeric_series("debut_reentry_bonus")
+        + _numeric_series("num1_debut_context_bonus")
+        + _numeric_series("hold_bonus")
+        + _numeric_series("slow_burn_bonus")
+        - _numeric_series("drop_penalty")
+        - _numeric_series("fatigue_penalty")
+    ).round(2)
+
+
 def _momentum_cumulative_table(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate song-level Cumulative Momentum Index from unclipped raw scores."""
     if df.empty:
         return pd.DataFrame()
     work = df.copy()
-    if "raw_momentum_index_unclipped" not in work.columns:
-        # Older cached frames should be rare after code edits, but this fallback keeps
-        # the view usable by treating the clipped raw score as the best available score.
-        work["raw_momentum_index_unclipped"] = pd.to_numeric(work.get("raw_momentum_index"), errors="coerce").fillna(0.0)
+    # Always rebuild this from the raw scoring inputs for this view. That avoids
+    # stale Streamlit cache frames falling back to clipped raw_momentum_index,
+    # which would make Low Raw and -Wks incorrectly show 0.
+    work["raw_momentum_index_unclipped"] = _recompute_unclipped_raw_momentum(work)
     work["raw_momentum_index_unclipped"] = pd.to_numeric(work["raw_momentum_index_unclipped"], errors="coerce").fillna(0.0)
     work["position"] = pd.to_numeric(work.get("position"), errors="coerce")
     work["chart_date"] = pd.to_datetime(work["chart_date"], errors="coerce")
