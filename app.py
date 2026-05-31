@@ -1682,10 +1682,12 @@ def _render_cumulative_momentum_view(momentum: pd.DataFrame) -> None:
     work = work.dropna(subset=["chart_date"]).copy()
     work["year"] = work["chart_date"].dt.year
 
+    st.markdown("**View controls**")
     scope_mode = st.radio(
         "Cumulative view",
         ["By chart date", "By year"],
         horizontal=True,
+        index=0,
         key="momentum_cumulative_scope_mode",
         help="By chart date shows the running cumulative leaderboard through the selected chart week. By year limits the totals to a selected calendar year or all years.",
     )
@@ -2639,6 +2641,132 @@ def _analytics_pkg_for_section(section: str, start_date: dt.date, end_date: dt.d
     return pkg
 
 
+DISPLAY_COLUMN_SHORT_NAMES = {
+    # Common chart columns
+    "chart_date": "Date",
+    "Chart Date": "Date",
+    "first_date": "First",
+    "First Date": "First",
+    "last_date": "Last",
+    "Last Date": "Last",
+    "First Week": "First",
+    "Last Week": "Last",
+    "position": "Pos",
+    "Position": "Pos",
+    "Chart Rank": "Pos",
+    "last_week_position": "LW",
+    "Last Week Position": "LW",
+    "Last Week": "LW",
+    "weeks_on_chart": "Wks",
+    "Weeks on Chart": "Wks",
+    "Weeks Counted": "Wks",
+    "chart_weeks": "Wks",
+    "Chart Weeks": "Wks",
+    "total_chart_weeks": "Total Wks",
+    "Total Chart Weeks": "Total Wks",
+    "movement": "Move",
+    "Movement": "Move",
+    "improvement": "Gain",
+    "Improvement": "Gain",
+    "peak": "Peak",
+    "Peak Position": "Peak",
+    "best_peak": "Best Peak",
+    "week_hit_peak": "Hit Peak",
+    "Week Hit Peak": "Hit Peak",
+    "derived_marker": "Marker",
+    "derived_marker_with_momentum": "Marker",
+
+    # Song/artist helper columns
+    "canonical_song_id": "Song ID",
+    "canonical_title": "Song",
+    "canonical_artist": "Artist",
+    "canonical_lead_artist": "Lead",
+    "canonical_featured_artist": "Feat",
+    "lead_artist": "Lead",
+    "Lead Artist": "Lead",
+    "featured_artist": "Feat",
+    "Featured Artist": "Feat",
+    "full_artist": "Artist",
+    "display_artist": "Artist",
+    "normalized_artist": "Artist Key",
+    "distinct_songs": "Songs",
+    "Distinct Songs": "Songs",
+    "alias_count": "Aliases",
+
+    # Momentum columns
+    "Momentum Rank": "Mom Rank",
+    "Raw Momentum Index": "Raw MI",
+    "Raw Momentum Score": "Raw MI",
+    "Raw Momentum Index Score": "Raw MI Score",
+    "Normalized Index": "Norm",
+    "Last Raw Index": "Last Raw",
+    "Raw Change": "Δ Raw",
+    "% Change": "% Chg",
+    "% Gain": "% Gain",
+    "Momentum Type": "Type",
+    "Cumulative Momentum Index": "CMI",
+    "Avg Momentum": "Avg Mom",
+    "Peak Raw Momentum": "Peak Raw",
+    "Lowest Raw Momentum": "Low Raw",
+    "Positive Weeks": "+Wks",
+    "Negative Weeks": "-Wks",
+    "Momentum Impact Weeks": "Impact Wks",
+    "Greatest Gainer Weeks": "Gainer Wks",
+
+    # Raw Momentum expander columns
+    "Raw Position Score": "Pos Score",
+    "Raw Clamped Movement": "Move Clamp",
+    "Raw Chart-Zone Movement Weight": "Zone Wt",
+    "Raw Weighted Movement": "Wt Move",
+    "Raw Clamped Recent Trend": "Trend",
+    "Raw Debut/Re-Entry bonus": "Debut/RE",
+    "Raw #1 Debut Only Top 10 Debut Bonus": "Solo T10 #1",
+    "Raw #1 Debut Artist First #1 Bonus": "First #1",
+    "Raw #1 Debut Displacement Bonus": "Displace",
+    "Raw #1 Debut Context Bonus": "#1 Context",
+    "Raw Hold Bonus": "Hold",
+    "Raw Slow Burn Bonus": "Slow Burn",
+    "Raw Drop Penalty": "Drop Pen",
+    "Raw Fatigue Penalty": "Fatigue",
+
+    # Analytics / quick-table common names
+    "top_10_weeks": "T10 Wks",
+    "Top 10 Weeks": "T10 Wks",
+    "top_5_weeks": "T5 Wks",
+    "Top 5 Weeks": "T5 Wks",
+    "num1_weeks": "#1 Wks",
+    "#1 Weeks": "#1 Wks",
+    "num1_songs": "#1 Songs",
+    "top10_songs": "T10 Songs",
+    "Top 10 Songs": "T10 Songs",
+    "average_position": "Avg Pos",
+    "avg_position": "Avg Pos",
+    "Avg Position": "Avg Pos",
+    "Avg position": "Avg Pos",
+    "source_file": "Source",
+    "row_count": "Rows",
+}
+
+
+def _shorten_display_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply compact table headers for Streamlit display without touching logic."""
+    if df.empty:
+        return df
+    rename: dict[object, str] = {}
+    used: set[str] = set()
+    for col in df.columns:
+        short = DISPLAY_COLUMN_SHORT_NAMES.get(str(col), str(col))
+        base = short
+        suffix = 2
+        while short in used:
+            short = f"{base} {suffix}"
+            suffix += 1
+        used.add(short)
+        if short != col:
+            rename[col] = short
+    return df.rename(columns=rename) if rename else df
+
+
 def _display_df(df: pd.DataFrame, columns: list[str] | None = None, hide_index: bool = True):
     if columns is not None and not df.empty:
         cols = [c for c in columns if c in df.columns]
@@ -2649,6 +2777,7 @@ def _display_df(df: pd.DataFrame, columns: list[str] | None = None, hide_index: 
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             df[col] = df[col].dt.strftime("%Y-%m-%d")
 
+    df = _shorten_display_column_names(df)
     st.dataframe(df, width="stretch", hide_index=hide_index)
 
 
@@ -8258,7 +8387,7 @@ def render_data_health_tab() -> None:
             status = f"Review {issue_count:,} row(s)"
         overview_rows.append({"Check": title, "Status": status})
     st.markdown("**QA summary**")
-    st.dataframe(pd.DataFrame(overview_rows), width="stretch", hide_index=True)
+    _display_df(pd.DataFrame(overview_rows))
 
     for title, help_text, df in checks:
         with st.expander(title, expanded=not df.empty and "error" not in df.columns):
