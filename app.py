@@ -8096,13 +8096,22 @@ def build_quick_artist_exclusive_top25(limit: int = 100) -> pd.DataFrame:
         g = g.copy()
         pos_to_keys: dict[int, set[str]] = {}
         pos_to_title: dict[int, str] = {}
+        artist_display_by_key: dict[str, str] = {}
         for _, row in g.iterrows():
             pos = _safe_int(row.get("position"))
             if pos is None or pos < 1 or pos > 5:
                 continue
             pairs = _split_credit_people(row.get("normalized_lead_artist"), row.get("lead_artist"))
             pairs.extend(_split_credit_people(row.get("normalized_featured_artist"), row.get("featured_artist")))
-            entry_keys = {normalize_search_text(k) for k, _ in pairs if k}
+            entry_keys: set[str] = set()
+            for raw_key, raw_display in pairs:
+                if not raw_key:
+                    continue
+                key = normalize_search_text(raw_key)
+                if not key:
+                    continue
+                entry_keys.add(key)
+                artist_display_by_key.setdefault(key, preferred_artist_display(key, raw_display or key))
             pos_to_keys[pos] = entry_keys
             pos_to_title[pos] = str(row.get("title", "") or "")
 
@@ -8135,7 +8144,7 @@ def build_quick_artist_exclusive_top25(limit: int = 100) -> pd.DataFrame:
         for artist_key in sorted(exclusive_artists):
             rows.append({
                 "Chart date": str(pd.to_datetime(chart_date).date()),
-                "Artist": preferred_artist_display(artist_key, artist_key),
+                "Artist": preferred_artist_display(artist_key, artist_display_by_key.get(artist_key, artist_key)),
                 "Exclusive tier": f"Top {exclusive_tier}",
                 "Songs": " | ".join(songs),
             })
@@ -9032,7 +9041,7 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         if out.empty: return out
         return out.sort_values(["New Peak", "Chart Date", "Song"], ascending=[True, False, True]).head(limit)
 
-    if feat_view in {"Most weeks in Top 10 without reaching #1", "Most weeks in Top 5 without reaching #1", "Most weeks at #2 without reaching #1", "Most weeks in Top 10 without reaching Top 5", "Longest-running songs that never reached Top 20"}:
+    if feat_view in {"Most weeks in Top 10 without reaching #1", "Most weeks in Top 5 without reaching #1", "Most weeks at #2 without reaching #1", "Most consecutive weeks at #2 without reaching #1", "Most weeks in Top 10 without reaching Top 5", "Longest-running songs that never reached Top 20"}:
         out=songs.copy()
         if feat_view == "Most weeks in Top 10 without reaching #1":
             out=out.loc[(out["peak_position"]>1)&(out["top10_weeks"]>0)].sort_values(["top10_weeks","peak_position","last_chart_date"], ascending=[False, True, False])
@@ -9040,10 +9049,24 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         elif feat_view == "Most weeks in Top 5 without reaching #1":
             out=out.loc[(out["peak_position"]>1)&(out["top5_weeks"]>0)].sort_values(["top5_weeks","peak_position","last_chart_date"], ascending=[False, True, False])
             cols={"top5_weeks":"Top 5 Weeks"}
-        elif feat_view == "Most weeks at #2 without reaching #1":
-            pos2=chart.loc[chart["position"].eq(2)].groupby("song_key").size().reset_index(name="Weeks at #2")
-            out=out.loc[out["peak_position"]>1].merge(pos2,on="song_key",how="left").fillna({"Weeks at #2":0})
-            out=out.loc[out["Weeks at #2"]>0].sort_values(["Weeks at #2","total_chart_weeks","last_chart_date"], ascending=[False, False, False])
+        elif feat_view in {"Most weeks at #2 without reaching #1", "Most consecutive weeks at #2 without reaching #1"}:
+            out=out.loc[out["peak_position"]>1].copy()
+            if feat_view == "Most consecutive weeks at #2 without reaching #1":
+                rows=[]
+                non_num1_keys=set(out["song_key"])
+                for song_key, g in chart.loc[chart["song_key"].isin(non_num1_keys)].groupby("song_key", sort=False):
+                    best,start,end=_longest_true_streak_for_song(g, g["position"].eq(2), date_index)
+                    if best>0:
+                        rows.append({"song_key": song_key, "Consecutive Weeks at #2": best, "#2 Streak Start": start, "#2 Streak End": end})
+                pos2=pd.DataFrame(rows)
+                if pos2.empty:
+                    return pd.DataFrame()
+                out=out.merge(pos2,on="song_key",how="inner")
+                out=out.sort_values(["Consecutive Weeks at #2","total_chart_weeks","last_chart_date"], ascending=[False, False, False])
+            else:
+                pos2=chart.loc[chart["position"].eq(2)].groupby("song_key").size().reset_index(name="Weeks at #2")
+                out=out.merge(pos2,on="song_key",how="left").fillna({"Weeks at #2":0})
+                out=out.loc[out["Weeks at #2"]>0].sort_values(["Weeks at #2","total_chart_weeks","last_chart_date"], ascending=[False, False, False])
             cols={}
         elif feat_view == "Most weeks in Top 10 without reaching Top 5":
             out=out.loc[(out["peak_position"]>5)&(out["top10_weeks"]>0)].sort_values(["top10_weeks","peak_position","last_chart_date"], ascending=[False, True, False])
@@ -9056,6 +9079,9 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         if "Top 10 Weeks" in out.columns: display_cols.insert(3,"Top 10 Weeks")
         if "Top 5 Weeks" in out.columns: display_cols.insert(3,"Top 5 Weeks")
         if "Weeks at #2" in out.columns: display_cols.insert(3,"Weeks at #2")
+        if "Consecutive Weeks at #2" in out.columns:
+            display_cols.insert(3,"Consecutive Weeks at #2")
+            display_cols.extend(["#2 Streak Start", "#2 Streak End"])
         return out[[c for c in display_cols if c in out.columns]]
 
     if feat_view in {"Songs with most separate Top 10 runs", "Most separate #1 runs", "Songs that returned to #1 after losing it"}:
@@ -9093,20 +9119,63 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         if out.empty: return out
         return out.sort_values(["Gap Weeks","Return Appearance","Song"], ascending=[False, False, True]).head(limit)
 
-    if feat_view in {"Most consecutive gaining weeks", "Most consecutive holding weeks"}:
+    if feat_view in {"Most consecutive gaining weeks", "Most consecutive gaining weeks before ultimate peak", "Most consecutive holding weeks", "Most consecutive non-#1 holding weeks"}:
         rows=[]
-        want_gain = feat_view == "Most consecutive gaining weeks"
+        want_gain = feat_view in {"Most consecutive gaining weeks", "Most consecutive gaining weeks before ultimate peak"}
         for song_key,g in chart.groupby("song_key", sort=False):
-            mask = g["move"].gt(0) if want_gain else g["move"].eq(0)
+            g=g.sort_values(["chart_date","position","entry_id"])
+            if feat_view == "Most consecutive gaining weeks before ultimate peak":
+                peak_pos = int(g["position"].min())
+                peak_date = pd.to_datetime(g.loc[g["position"].eq(peak_pos), "chart_date"].iloc[0])
+                mask = g["move"].gt(0) & (pd.to_datetime(g["chart_date"]) <= peak_date)
+            elif feat_view == "Most consecutive non-#1 holding weeks":
+                mask = g["move"].eq(0) & ~g["position"].eq(1)
+            else:
+                mask = g["move"].gt(0) if want_gain else g["move"].eq(0)
             best,start,end=_longest_true_streak_for_song(g, mask, date_index)
             if best>0:
-                rows.append({"Song": g["title"].iloc[0], "Artist": g["artist"].iloc[0], "Streak Weeks": best, "Start": start, "End": end, "Chart Weeks": int(len(g))})
+                row={"Song": g["title"].iloc[0], "Artist": g["artist"].iloc[0], "Streak Weeks": best, "Start": start, "End": end, "Chart Weeks": int(len(g)), "Peak": int(g["position"].min())}
+                if feat_view == "Most consecutive gaining weeks before ultimate peak":
+                    row["Ultimate Peak Date"] = peak_date
+                rows.append(row)
         out=pd.DataFrame(rows)
         if out.empty: return out
-        return out.sort_values(["Streak Weeks","End","Song"], ascending=[False, False, True]).head(limit)
+        cols=["Song","Artist","Streak Weeks","Start","End","Peak","Chart Weeks"]
+        if "Ultimate Peak Date" in out.columns: cols.insert(5, "Ultimate Peak Date")
+        return out.sort_values(["Streak Weeks","End","Song"], ascending=[False, False, True]).head(limit)[[c for c in cols if c in out.columns]]
 
-    if feat_view in {"Most weeks at same position", "Most total holds", "Most Top 10 holds"}:
-        if feat_view == "Most weeks at same position":
+    if feat_view == "Most consecutive positions held in the Top 10":
+        rows=[]
+        for chart_date,g in chart.groupby("chart_date", sort=False):
+            held = set(int(p) for p in g.loc[g["position"].le(10) & g["move"].eq(0), "position"].dropna())
+            top_n=0
+            for pos in range(1, 11):
+                if pos in held:
+                    top_n=pos
+                else:
+                    break
+            if top_n >= 2:
+                songs=[]
+                for pos in range(1, top_n+1):
+                    row=g.loc[g["position"].eq(pos)].head(1)
+                    if not row.empty:
+                        songs.append(f"#{pos} {row.iloc[0]['title']}")
+                rows.append({"Chart Date": chart_date, "Top Positions Held": f"Top {top_n}", "Consecutive Held Positions": top_n, "Songs": " | ".join(songs)})
+        out=pd.DataFrame(rows)
+        if out.empty: return out
+        return out.sort_values(["Consecutive Held Positions","Chart Date"], ascending=[False, False]).head(limit)
+
+    if feat_view in {"Most weeks at same position", "Most consecutive weeks at same position", "Most total holds", "Most Top 10 holds"}:
+        if feat_view in {"Most weeks at same position", "Most consecutive weeks at same position"}:
+            if feat_view == "Most consecutive weeks at same position":
+                rows=[]
+                for (song_key, position), g in chart.groupby(["song_key","position"], dropna=False, sort=False):
+                    best,start,end=_longest_true_streak_for_song(g, pd.Series(True, index=g.index), date_index)
+                    if best>0:
+                        rows.append({"Song": g["title"].iloc[0], "Artist": g["artist"].iloc[0], "Position": int(position), "Consecutive Weeks": best, "First": start, "Last": end})
+                out=pd.DataFrame(rows)
+                if out.empty: return out
+                return out.sort_values(["Consecutive Weeks","Position","Last"], ascending=[False, True, False]).head(limit)
             out=(chart.groupby(["song_key","position"], dropna=False).agg(Weeks=("entry_id","nunique"), Song=("title",_song_mode_value), Artist=("artist",_song_mode_value), First=("chart_date","min"), Last=("chart_date","max")).reset_index().rename(columns={"position":"Position"}))
             return out.sort_values(["Weeks","Position","Last"], ascending=[False, True, False]).head(limit)[["Song","Artist","Position","Weeks","First","Last"]]
         mask=chart["move"].eq(0)
@@ -9115,6 +9184,33 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         hold=chart.loc[mask].groupby("song_key", dropna=False).agg(Holds=("entry_id","nunique"), Song=("title",_song_mode_value), Artist=("artist",_song_mode_value), Peak=("position","min"), First=("chart_date","min"), Last=("chart_date","max")).reset_index()
         if hold.empty: return pd.DataFrame()
         return hold.sort_values(["Holds","Peak","Last"], ascending=[False, True, False]).head(limit)[["Song","Artist","Holds","Peak","First","Last"]]
+
+    if feat_view == "Most consecutive weeks at #2 before/after a #1 run":
+        rows=[]
+        for song_key,g in chart.groupby("song_key", sort=False):
+            g=g.sort_values(["chart_date","position","entry_id"]).reset_index(drop=True)
+            if not g["position"].eq(1).any():
+                continue
+            i=0
+            while i < len(g):
+                if int(g.loc[i,"position"]) != 2:
+                    i += 1
+                    continue
+                start_i=i
+                while i + 1 < len(g) and int(g.loc[i+1,"position"]) == 2 and date_index.get(pd.to_datetime(g.loc[i+1,"chart_date"])) == date_index.get(pd.to_datetime(g.loc[i,"chart_date"]), -999) + 1:
+                    i += 1
+                end_i=i
+                before_i=start_i-1
+                after_i=end_i+1
+                before_num1 = before_i >= 0 and int(g.loc[before_i,"position"]) == 1 and date_index.get(pd.to_datetime(g.loc[start_i,"chart_date"])) == date_index.get(pd.to_datetime(g.loc[before_i,"chart_date"]), -999) + 1
+                after_num1 = after_i < len(g) and int(g.loc[after_i,"position"]) == 1 and date_index.get(pd.to_datetime(g.loc[after_i,"chart_date"])) == date_index.get(pd.to_datetime(g.loc[end_i,"chart_date"]), -999) + 1
+                if before_num1 or after_num1:
+                    context = "After #1 run" if before_num1 and not after_num1 else "Before #1 run" if after_num1 and not before_num1 else "Between #1 runs"
+                    rows.append({"Song": g.loc[start_i,"title"], "Artist": g.loc[start_i,"artist"], "Consecutive Weeks at #2": end_i-start_i+1, "Context": context, "#2 Streak Start": g.loc[start_i,"chart_date"], "#2 Streak End": g.loc[end_i,"chart_date"], "Chart Weeks": int(len(g))})
+                i += 1
+        out=pd.DataFrame(rows)
+        if out.empty: return out
+        return out.sort_values(["Consecutive Weeks at #2","#2 Streak End","Song"], ascending=[False, False, True]).head(limit)
 
     if feat_view == "Songs blocked at #2 by the same #1 song":
         rows=[]
@@ -9130,6 +9226,61 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         df=df.loc[~df["song_key"].isin(num1_songs)].copy()
         out=df.groupby(["song_key","blocker_key"], dropna=False).agg(**{"Weeks Blocked":("chart_date","nunique"), "Blocked Song":("Blocked Song",_song_mode_value), "Blocked Artist":("Blocked Artist",_song_mode_value), "Blocker Song":("Blocker Song",_song_mode_value), "Blocker Artist":("Blocker Artist",_song_mode_value), "First Blocked Week":("chart_date","min"), "Last Blocked Week":("chart_date","max")}).reset_index()
         return out.sort_values(["Weeks Blocked","Last Blocked Week","Blocked Song"], ascending=[False, False, True]).head(limit)[["Blocked Song","Blocked Artist","Blocker Song","Blocker Artist","Weeks Blocked","First Blocked Week","Last Blocked Week"]]
+
+    if feat_view == "Artists with most songs in the Top 10 in one week":
+        top10 = chart.loc[chart["position"].le(10)].copy()
+        credits = build_artist_credit_rows(top10)
+        if credits.empty: return pd.DataFrame()
+        rows=[]
+        for (chart_date, artist_key), g in credits.groupby(["chart_date","artist_key"], sort=False):
+            song_count = int(g["song_key"].nunique())
+            if song_count >= 2:
+                songs = (g.sort_values(["position","title"])[["position","title"]]
+                           .drop_duplicates()
+                           .apply(lambda r: f"#{int(r['position'])} {r['title']}", axis=1).tolist())
+                rows.append({"Chart Date": chart_date, "Artist": preferred_artist_display(artist_key, g["artist"].iloc[0]), "Top 10 Songs": song_count, "Songs": " | ".join(songs)})
+        out=pd.DataFrame(rows)
+        if out.empty: return out
+        return out.sort_values(["Top 10 Songs","Chart Date","Artist"], ascending=[False, False, True]).head(limit)
+
+    if feat_view == "Artists with #1 and Top Debut in the same week":
+        rows=[]
+        for chart_date,g in chart.groupby("chart_date", sort=False):
+            n1 = g.loc[g["position"].eq(1) & ~g["is_debut"].fillna(False)].copy()
+            debuts = g.loc[g["is_debut"].fillna(False)].copy()
+            if n1.empty or debuts.empty:
+                continue
+            top_debut_pos = debuts["position"].min()
+            top_debuts = debuts.loc[debuts["position"].eq(top_debut_pos)].copy()
+            n1_credits = build_artist_credit_rows(n1)
+            debut_credits = build_artist_credit_rows(top_debuts)
+            if n1_credits.empty or debut_credits.empty:
+                continue
+            common = set(n1_credits["artist_key"]) & set(debut_credits["artist_key"])
+            for artist_key in sorted(common):
+                n1_song = n1_credits.loc[n1_credits["artist_key"].eq(artist_key)].sort_values("position").iloc[0]
+                debut_song = debut_credits.loc[debut_credits["artist_key"].eq(artist_key)].sort_values("position").iloc[0]
+                rows.append({"Chart Date": chart_date, "Artist": preferred_artist_display(artist_key, n1_song["artist"]), "#1 Song": n1_song["title"], "Top Debut": f"#{int(debut_song['position'])} {debut_song['title']}", "Top Debut Position": int(debut_song["position"])})
+        out=pd.DataFrame(rows)
+        if out.empty: return out
+        return out.sort_values(["Chart Date","Top Debut Position","Artist"], ascending=[False, True, True]).head(limit)
+
+    if feat_view == "Artists with lead and featured songs both in the Top 10":
+        top10 = chart.loc[chart["position"].le(10)].copy()
+        credits = build_artist_credit_rows(top10)
+        if credits.empty: return pd.DataFrame()
+        rows=[]
+        for (chart_date, artist_key), g in credits.groupby(["chart_date","artist_key"], sort=False):
+            lead = g.loc[g["artist_role_mode"].eq("Lead")].copy()
+            feat = g.loc[g["artist_role_mode"].eq("Featured")].copy()
+            if lead.empty or feat.empty:
+                continue
+            lead_songs = (lead.sort_values(["position","title"])[["position","title"]].drop_duplicates().apply(lambda r: f"#{int(r['position'])} {r['title']}", axis=1).tolist())
+            feat_songs = (feat.sort_values(["position","title"])[["position","title"]].drop_duplicates().apply(lambda r: f"#{int(r['position'])} {r['title']}", axis=1).tolist())
+            rows.append({"Chart Date": chart_date, "Artist": preferred_artist_display(artist_key, g["artist"].iloc[0]), "Lead Top 10 Songs": int(lead["song_key"].nunique()), "Featured Top 10 Songs": int(feat["song_key"].nunique()), "Lead Songs": " | ".join(lead_songs), "Featured Songs": " | ".join(feat_songs)})
+        out=pd.DataFrame(rows)
+        if out.empty: return out
+        return out.sort_values(["Chart Date","Lead Top 10 Songs","Featured Top 10 Songs","Artist"], ascending=[False, False, False, True]).head(limit)
 
     if feat_view in {"Most debuts in one week", "Most Top 10 debuts in one week", "Weeks with most songs reaching new peaks", "Weeks with most songs gaining", "Weeks with most songs falling", "Weeks with most unchanged songs", "Weeks with largest total movement"}:
         weekly=chart.groupby("chart_date", dropna=False).agg(
@@ -9202,7 +9353,6 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
     "Peak & Debut": [
         "Debuted at #1 and held for multiple weeks",
         "Songs that never fell below their debut position",
-        "Songs that peaked in their debut week",
         "Most weeks before hitting #1",
         "Most weeks before hitting Top 10",
         "Most weeks between debut and peak",
@@ -9221,14 +9371,17 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
         "Most weeks in Top 5 without reaching #1",
         "Songs with most separate Top 10 runs",
         "Most separate #1 runs",
-        "Songs that returned to #1 after losing it",
         "Most weeks at #2 without reaching #1",
+        "Most consecutive weeks at #2 before/after a #1 run",
         "Most weeks in Top 10 without reaching Top 5",
         "Longest-running songs that never reached Top 20",
         "Songs blocked at #2 by the same #1 song",
     ],
     "Artist Feats": [
         "Artist-exclusive Top 2–5",
+        "Artists with most songs in the Top 10 in one week",
+        "Artists with #1 and Top Debut in the same week",
+        "Artists with lead and featured songs both in the Top 10",
     ],
     "Holding & Consistency": [
         "Most consecutive gaining weeks",
@@ -9236,6 +9389,7 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
         "Most weeks at same position",
         "Most total holds",
         "Most Top 10 holds",
+        "Most consecutive positions held in the Top 10",
     ],
     "Weekly Chart Events": [
         "Most debuts in one week",
@@ -9248,6 +9402,40 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
     ],
 }
 
+
+
+def _quick_chart_feat_year_options() -> list[str]:
+    years: set[int] = set()
+    for value in load_chart_dates():
+        try:
+            years.add(int(str(value)[:4]))
+        except Exception:
+            continue
+    return ["All years"] + [str(y) for y in sorted(years, reverse=True)]
+
+
+def _filter_quick_chart_feat_year(df: pd.DataFrame, selected_year: str, date_col: str = "Chart Date") -> pd.DataFrame:
+    if df.empty or date_col not in df.columns:
+        return df
+    out = df.copy()
+    parsed_dates = pd.to_datetime(out[date_col], errors="coerce")
+    if selected_year != "All years":
+        out = out.loc[parsed_dates.dt.year.eq(int(selected_year))].copy()
+        parsed_dates = pd.to_datetime(out[date_col], errors="coerce")
+        out = out.assign(_quick_feat_sort_date=parsed_dates).sort_values(
+            ["_quick_feat_sort_date"],
+            ascending=[True],
+            kind="mergesort",
+        ).drop(columns=["_quick_feat_sort_date"])
+    else:
+        out = out.assign(_quick_feat_sort_date=parsed_dates).sort_values(
+            ["_quick_feat_sort_date"],
+            ascending=[False],
+            kind="mergesort",
+        ).drop(columns=["_quick_feat_sort_date"])
+    if date_col in out.columns:
+        out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+    return out.reset_index(drop=True)
 
 def render_quick_chart_feats() -> None:
     feat_category = st.selectbox(
@@ -9262,10 +9450,45 @@ def render_quick_chart_feats() -> None:
     )
 
     uses_full_history = feat_view == "Most consecutive weeks at #1 by year"
-    if uses_full_history:
+    uses_year_dropdown = feat_view in {
+        "Artists with #1 and Top Debut in the same week",
+        "Artists with lead and featured songs both in the Top 10",
+    }
+
+    same_position_mode = None
+    if feat_view == "Most weeks at same position":
+        same_position_mode = st.radio(
+            "Same-position view",
+            ["Overall weeks", "Most consecutive weeks"],
+            horizontal=True,
+            key="quick_feats_same_position_mode",
+        )
+
+    uses_position_slider = feat_view == "Most weeks at same position" and same_position_mode == "Most consecutive weeks"
+    if uses_full_history or uses_year_dropdown or uses_position_slider:
         limit = 1000000
     else:
         limit = st.slider("Rows", 10, 500, 100, 10, key=f"quick_feats_limit_{feat_category}")
+
+    selected_position = None
+    if uses_position_slider:
+        selected_position = st.slider(
+            "Position",
+            1,
+            40,
+            1,
+            1,
+            key="quick_feats_same_position_position",
+        )
+
+    selected_year = "All years"
+    if uses_year_dropdown:
+        selected_year = st.selectbox(
+            "Year",
+            _quick_chart_feat_year_options(),
+            key=f"quick_feats_year_{feat_view}",
+        )
+        st.caption("All years sorts latest-to-earliest; selected years sort earliest-to-latest.")
 
     if feat_view == "Songs gaining from a selected position to #1":
         start_position = st.slider("Starting position", 2, 40, 2, 1, key="quick_to_num1_start")
@@ -9283,8 +9506,25 @@ def render_quick_chart_feats() -> None:
         st.caption("Top 2 means an artist appears on both #1 and #2; Top 3 means #1–#3 only; Top 4 means #1–#4 only; Top 5 means #1–#5. Lead and featured/GUEST appearances count.")
         _display_df(build_quick_artist_exclusive_top25(limit))
     else:
+        internal_view = feat_view
+        if feat_view == "Most weeks at #2 without reaching #1":
+            mode = st.radio("#2 view", ["Overall weeks", "Most consecutive weeks"], horizontal=True, key="quick_feats_num2_mode")
+            internal_view = "Most consecutive weeks at #2 without reaching #1" if mode == "Most consecutive weeks" else feat_view
+        elif feat_view == "Most consecutive gaining weeks":
+            mode = st.radio("Gaining streak view", ["Overall", "Ahead of ultimate peak"], horizontal=True, key="quick_feats_gain_mode")
+            internal_view = "Most consecutive gaining weeks before ultimate peak" if mode == "Ahead of ultimate peak" else feat_view
+        elif feat_view == "Most consecutive holding weeks":
+            mode = st.radio("Holding streak view", ["Overall", "Non-#1 holding streaks"], horizontal=True, key="quick_feats_hold_mode")
+            internal_view = "Most consecutive non-#1 holding weeks" if mode == "Non-#1 holding streaks" else feat_view
+        elif feat_view == "Most weeks at same position":
+            internal_view = "Most consecutive weeks at same position" if same_position_mode == "Most consecutive weeks" else feat_view
         st.markdown(f"**{feat_view}**")
-        _display_df(build_quick_chart_feat(feat_view, limit))
+        feat_df = build_quick_chart_feat(internal_view, limit)
+        if uses_position_slider and selected_position is not None and "Position" in feat_df.columns:
+            feat_df = feat_df.loc[pd.to_numeric(feat_df["Position"], errors="coerce").eq(selected_position)].copy()
+        if uses_year_dropdown:
+            feat_df = _filter_quick_chart_feat_year(feat_df, selected_year)
+        _display_df(feat_df)
 
 
 
