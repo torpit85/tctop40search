@@ -8885,6 +8885,17 @@ def _song_identity_table(chart: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+
+
+def _credit_role_summary(rows: pd.DataFrame) -> str:
+    if rows.empty or "artist_role_mode" not in rows.columns:
+        return ""
+    roles = []
+    for role in ["Lead", "Featured", "Full"]:
+        if role in set(rows["artist_role_mode"].dropna().astype(str)) and role not in roles:
+            roles.append(role)
+    return " + ".join(roles)
+
 def _available_date_index(chart: pd.DataFrame) -> dict[pd.Timestamp, int]:
     dates = sorted(pd.to_datetime(chart["chart_date"].dropna().unique()))
     return {d: i for i, d in enumerate(dates)}
@@ -9227,6 +9238,52 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         out=df.groupby(["song_key","blocker_key"], dropna=False).agg(**{"Weeks Blocked":("chart_date","nunique"), "Blocked Song":("Blocked Song",_song_mode_value), "Blocked Artist":("Blocked Artist",_song_mode_value), "Blocker Song":("Blocker Song",_song_mode_value), "Blocker Artist":("Blocker Artist",_song_mode_value), "First Blocked Week":("chart_date","min"), "Last Blocked Week":("chart_date","max")}).reset_index()
         return out.sort_values(["Weeks Blocked","Last Blocked Week","Blocked Song"], ascending=[False, False, True]).head(limit)[["Blocked Song","Blocked Artist","Blocker Song","Blocker Artist","Weeks Blocked","First Blocked Week","Last Blocked Week"]]
 
+    if feat_view == "Artists who replaced themselves at #1":
+        num1 = chart.loc[chart["position"].eq(1)].copy().sort_values(["chart_date", "entry_id"])
+        if num1.empty:
+            return pd.DataFrame()
+        # In rare tie/data cases, keep the first #1 row per chart week so the replacement
+        # event compares each available week against the previous available week.
+        num1 = num1.drop_duplicates(subset=["chart_date"], keep="first").reset_index(drop=True)
+        rows = []
+        prev_row = None
+        for row in num1.itertuples(index=False):
+            cur_row = row
+            if prev_row is None:
+                prev_row = cur_row
+                continue
+            cur_song_key = getattr(cur_row, "song_key")
+            prev_song_key = getattr(prev_row, "song_key")
+            if cur_song_key == prev_song_key:
+                prev_row = cur_row
+                continue
+            cur_df = pd.DataFrame([cur_row._asdict()])
+            prev_df = pd.DataFrame([prev_row._asdict()])
+            cur_credits = build_artist_credit_rows(cur_df)
+            prev_credits = build_artist_credit_rows(prev_df)
+            if cur_credits.empty or prev_credits.empty:
+                prev_row = cur_row
+                continue
+            common = set(cur_credits["artist_key"].dropna()) & set(prev_credits["artist_key"].dropna())
+            for artist_key in sorted(common):
+                cur_artist_rows = cur_credits.loc[cur_credits["artist_key"].eq(artist_key)].copy()
+                prev_artist_rows = prev_credits.loc[prev_credits["artist_key"].eq(artist_key)].copy()
+                fallback_artist = cur_artist_rows["artist"].dropna().astype(str).iloc[0] if not cur_artist_rows.empty else ""
+                rows.append({
+                    "Chart Date": getattr(cur_row, "chart_date"),
+                    "Artist": preferred_artist_display(artist_key, fallback_artist),
+                    "New #1 Song": getattr(cur_row, "title"),
+                    "New #1 Role": _credit_role_summary(cur_artist_rows),
+                    "Previous #1 Song": getattr(prev_row, "title"),
+                    "Previous #1 Role": _credit_role_summary(prev_artist_rows),
+                    "Previous #1 Week": getattr(prev_row, "chart_date"),
+                })
+            prev_row = cur_row
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out
+        return out.sort_values(["Chart Date", "Artist"], ascending=[False, True]).head(limit)
+
     if feat_view == "Artists with most songs in the Top 10 in one week":
         top10 = chart.loc[chart["position"].le(10)].copy()
         credits = build_artist_credit_rows(top10)
@@ -9379,6 +9436,7 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
     ],
     "Artist Feats": [
         "Artist-exclusive Top 2–5",
+        "Artists who replaced themselves at #1",
         "Artists with most songs in the Top 10 in one week",
         "Artists with #1 and Top Debut in the same week",
         "Artists with lead and featured songs both in the Top 10",
@@ -9451,6 +9509,7 @@ def render_quick_chart_feats() -> None:
 
     uses_full_history = feat_view == "Most consecutive weeks at #1 by year"
     uses_year_dropdown = feat_view in {
+        "Artists who replaced themselves at #1",
         "Artists with #1 and Top Debut in the same week",
         "Artists with lead and featured songs both in the Top 10",
     }
