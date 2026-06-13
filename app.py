@@ -8947,6 +8947,81 @@ def _longest_true_streak_for_song(g: pd.DataFrame, mask: pd.Series, date_index: 
     return int(best), best_start, best_end
 
 
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> dt.date:
+    """Return the nth weekday in a month. Monday=0, Sunday=6."""
+    first = dt.date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + dt.timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> dt.date:
+    """Return the last weekday in a month. Monday=0, Sunday=6."""
+    if month == 12:
+        cur = dt.date(year + 1, 1, 1) - dt.timedelta(days=1)
+    else:
+        cur = dt.date(year, month + 1, 1) - dt.timedelta(days=1)
+    return cur - dt.timedelta(days=(cur.weekday() - weekday) % 7)
+
+
+def _easter_date(year: int) -> dt.date:
+    """Gregorian Easter date using the Meeus/Jones/Butcher algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return dt.date(year, month, day)
+
+
+def _holiday_dates_for_year(year: int) -> dict[str, dt.date]:
+    """Major fixed and floating U.S. holidays used by the holiday-week #1 table."""
+    return {
+        "New Year's Day": dt.date(year, 1, 1),
+        "Martin Luther King Jr. Day": _nth_weekday_of_month(year, 1, 0, 3),
+        "Valentine's Day": dt.date(year, 2, 14),
+        "Presidents' Day": _nth_weekday_of_month(year, 2, 0, 3),
+        "Easter": _easter_date(year),
+        "Mother's Day": _nth_weekday_of_month(year, 5, 6, 2),
+        "Memorial Day": _last_weekday_of_month(year, 5, 0),
+        "Juneteenth": dt.date(year, 6, 19),
+        "Father's Day": _nth_weekday_of_month(year, 6, 6, 3),
+        "Independence Day": dt.date(year, 7, 4),
+        "Labor Day": _nth_weekday_of_month(year, 9, 0, 1),
+        "Halloween": dt.date(year, 10, 31),
+        "Veterans Day": dt.date(year, 11, 11),
+        "Thanksgiving": _nth_weekday_of_month(year, 11, 3, 4),
+        "Christmas Eve": dt.date(year, 12, 24),
+        "Christmas Day": dt.date(year, 12, 25),
+        "New Year's Eve": dt.date(year, 12, 31),
+    }
+
+
+def _holidays_in_chart_week(chart_date: object) -> list[tuple[str, dt.date]]:
+    """Return tracked holidays that fall in the Monday-Sunday week containing chart_date."""
+    try:
+        chart_day = pd.to_datetime(chart_date).date()
+    except Exception:
+        return []
+    week_start = chart_day - dt.timedelta(days=chart_day.weekday())
+    week_end = week_start + dt.timedelta(days=6)
+    matches: list[tuple[str, dt.date]] = []
+    for year in range(week_start.year - 1, week_end.year + 2):
+        for holiday, holiday_date in _holiday_dates_for_year(year).items():
+            if week_start <= holiday_date <= week_end:
+                matches.append((holiday, holiday_date))
+    matches.sort(key=lambda item: (item[1], item[0]))
+    return matches
+
+
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
     chart = load_analytics_base()
@@ -8982,6 +9057,41 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         out=pd.DataFrame(rows)
         if out.empty: return out
         return out.sort_values(["Chart Weeks", "Debut Date", "Song"], ascending=[False, False, True]).head(limit)
+
+    if feat_view == "Longest initial chart runs":
+        rows=[]
+        for song_key, g in chart.groupby("song_key", sort=False):
+            g=g.sort_values(["chart_date","position","entry_id"]).reset_index(drop=True)
+            if g.empty:
+                continue
+            initial_rows=[]
+            prev_date=None
+            for row in g.itertuples(index=False):
+                cur_date=pd.to_datetime(row.chart_date)
+                follows_previous = prev_date is not None and date_index.get(cur_date) == date_index.get(prev_date, -999) + 1
+                if initial_rows and (bool(getattr(row, "is_reentry", False)) or not follows_previous):
+                    break
+                initial_rows.append(row._asdict())
+                prev_date=cur_date
+            if not initial_rows:
+                continue
+            initial=pd.DataFrame(initial_rows)
+            initial_peak=int(pd.to_numeric(initial["position"], errors="coerce").min())
+            rows.append({
+                "Song": initial["title"].iloc[0],
+                "Artist": initial["artist"].iloc[0],
+                "Initial Run Weeks": int(len(initial)),
+                "Initial Run Start": pd.to_datetime(initial["chart_date"].iloc[0]),
+                "Initial Run End": pd.to_datetime(initial["chart_date"].iloc[-1]),
+                "Initial Peak": initial_peak,
+                "Debut Position": int(pd.to_numeric(initial["position"], errors="coerce").iloc[0]),
+                "Total Chart Weeks": int(len(g)),
+                "Re-entry Count": int(g["is_reentry"].fillna(False).sum()),
+                "Returned After Initial Run": "Yes" if len(g) > len(initial) else "No",
+            })
+        out=pd.DataFrame(rows)
+        if out.empty: return out
+        return out.sort_values(["Initial Run Weeks","Initial Run End","Initial Peak","Song"], ascending=[False, False, True, True]).head(limit)
 
     if feat_view == "Songs that peaked in their debut week":
         out = songs.loc[songs["peaked_on_debut"].fillna(False)].copy()
@@ -9238,6 +9348,35 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         out=df.groupby(["song_key","blocker_key"], dropna=False).agg(**{"Weeks Blocked":("chart_date","nunique"), "Blocked Song":("Blocked Song",_song_mode_value), "Blocked Artist":("Blocked Artist",_song_mode_value), "Blocker Song":("Blocker Song",_song_mode_value), "Blocker Artist":("Blocker Artist",_song_mode_value), "First Blocked Week":("chart_date","min"), "Last Blocked Week":("chart_date","max")}).reset_index()
         return out.sort_values(["Weeks Blocked","Last Blocked Week","Blocked Song"], ascending=[False, False, True]).head(limit)[["Blocked Song","Blocked Artist","Blocker Song","Blocker Artist","Weeks Blocked","First Blocked Week","Last Blocked Week"]]
 
+
+    if feat_view == "#1 songs during holiday weeks":
+        num1 = chart.loc[chart["position"].eq(1)].copy().sort_values(["chart_date", "entry_id"])
+        if num1.empty:
+            return pd.DataFrame()
+        rows=[]
+        for row in num1.itertuples(index=False):
+            holidays = _holidays_in_chart_week(getattr(row, "chart_date"))
+            if not holidays:
+                continue
+            chart_day = pd.to_datetime(getattr(row, "chart_date")).date()
+            week_start = chart_day - dt.timedelta(days=chart_day.weekday())
+            week_end = week_start + dt.timedelta(days=6)
+            rows.append({
+                "Chart Date": getattr(row, "chart_date"),
+                "Holiday(s)": " | ".join(name for name, _ in holidays),
+                "Holiday Date(s)": " | ".join(day.isoformat() for _, day in holidays),
+                "Holiday Week Start": week_start.isoformat(),
+                "Holiday Week End": week_end.isoformat(),
+                "Song": getattr(row, "title"),
+                "Artist": getattr(row, "artist"),
+                "Last Week": getattr(row, "last_week_position"),
+                "Weeks": getattr(row, "weeks_on_chart"),
+                "Marker": getattr(row, "derived_marker"),
+            })
+        out=pd.DataFrame(rows)
+        if out.empty: return out
+        return out.sort_values(["Chart Date", "Holiday(s)", "Song"], ascending=[False, True, True]).head(limit)
+
     if feat_view == "Artists who replaced themselves at #1":
         num1 = chart.loc[chart["position"].eq(1)].copy().sort_values(["chart_date", "entry_id"])
         if num1.empty:
@@ -9410,6 +9549,7 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
     "Peak & Debut": [
         "Debuted at #1 and held for multiple weeks",
         "Songs that never fell below their debut position",
+        "Longest initial chart runs",
         "Most weeks before hitting #1",
         "Most weeks before hitting Top 10",
         "Most weeks between debut and peak",
@@ -9424,6 +9564,7 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
     "#1 / Top 5 / Top 10": [
         "Songs gaining from a selected position to #1",
         "Most consecutive weeks at #1 by year",
+        "#1 songs during holiday weeks",
         "Most weeks in Top 10 without reaching #1",
         "Most weeks in Top 5 without reaching #1",
         "Songs with most separate Top 10 runs",
@@ -9509,6 +9650,7 @@ def render_quick_chart_feats() -> None:
 
     uses_full_history = feat_view == "Most consecutive weeks at #1 by year"
     uses_year_dropdown = feat_view in {
+        "#1 songs during holiday weeks",
         "Artists who replaced themselves at #1",
         "Artists with #1 and Top Debut in the same week",
         "Artists with lead and featured songs both in the Top 10",
@@ -9583,6 +9725,8 @@ def render_quick_chart_feats() -> None:
             feat_df = feat_df.loc[pd.to_numeric(feat_df["Position"], errors="coerce").eq(selected_position)].copy()
         if uses_year_dropdown:
             feat_df = _filter_quick_chart_feat_year(feat_df, selected_year)
+        if feat_view == "#1 songs during holiday weeks":
+            st.caption("Holiday week = the Monday-Sunday calendar week containing one or more tracked major U.S. holidays.")
         _display_df(feat_df)
 
 
