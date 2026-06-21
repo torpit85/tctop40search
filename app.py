@@ -5460,7 +5460,24 @@ def admin_split_canonical_song(source_canonical_song_id: int, entry_ids: list[in
         title_key, artist_key, group_key = _song_key_parts(new_title, new_artist)
 
         cur.execute("BEGIN")
-        new_canonical_song_id = _create_canonical_song_row(cur, new_title, new_artist)
+
+        existing_target = cur.execute(
+            """
+            SELECT canonical_song_id, canonical_title, COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist
+            FROM canonical_song
+            WHERE canonical_group_key = ?
+            """,
+            (group_key,),
+        ).fetchone()
+        created_new_canonical = False
+        if existing_target is not None:
+            new_canonical_song_id = int(existing_target["canonical_song_id"])
+            if new_canonical_song_id == int(source_canonical_song_id):
+                conn.rollback()
+                return False, "The requested split title/artist resolves to the same canonical song. Use a different title or artist, or leave these entries in the source song."
+        else:
+            new_canonical_song_id = _create_canonical_song_row(cur, new_title, new_artist)
+            created_new_canonical = True
 
         cur.execute(
             f"""
@@ -5499,7 +5516,8 @@ def admin_split_canonical_song(source_canonical_song_id: int, entry_ids: list[in
 
         conn.commit()
         _reset_app_caches()
-        return True, f'Split {len(selected)} chart entr{"y" if len(selected) == 1 else "ies"} from "{src["canonical_title"]}" into new canonical song "{new_title}".'
+        target_phrase = "new canonical song" if created_new_canonical else "existing canonical song"
+        return True, f'Split {len(selected)} chart entr{"y" if len(selected) == 1 else "ies"} from "{src["canonical_title"]}" into {target_phrase} "{new_title}".'
     except Exception as exc:
         conn.rollback()
         return False, f"Song split failed: {exc}"
