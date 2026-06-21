@@ -787,6 +787,57 @@ def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
         """
         return pd.read_sql_query(sql, conn, params=(limit,))
 
+    if kind == "Biggest drops off the chart":
+        chart = load_analytics_base()
+        if chart.empty or "dropped_out_next_week" not in chart.columns:
+            return pd.DataFrame(columns=[
+                "Final Chart Week", "Next Chart Week", "Last Position", "Off-Chart Position",
+                "Drop", "Song", "Artist", "Lead Artist", "Featured Artist", "Weeks On Chart", "Marker"
+            ])
+        dropouts = chart.loc[chart["dropped_out_next_week"].fillna(False)].copy()
+        if dropouts.empty:
+            return pd.DataFrame(columns=[
+                "Final Chart Week", "Next Chart Week", "Last Position", "Off-Chart Position",
+                "Drop", "Song", "Artist", "Lead Artist", "Featured Artist", "Weeks On Chart", "Marker"
+            ])
+
+        chart_size_by_week = (
+            chart.groupby("chart_date", dropna=False)["position"]
+            .max()
+            .rename("chart_size")
+        )
+        dropouts["chart_size"] = pd.to_numeric(dropouts["chart_date"].map(chart_size_by_week), errors="coerce")
+        dropouts["off_chart_position"] = dropouts["chart_size"] + 1
+        dropouts["drop"] = dropouts["off_chart_position"] - pd.to_numeric(dropouts["position"], errors="coerce")
+        for col in ["position", "off_chart_position", "drop", "weeks_on_chart"]:
+            if col in dropouts.columns:
+                dropouts[col] = pd.to_numeric(dropouts[col], errors="coerce").round(0).astype("Int64")
+
+        out = dropouts.sort_values(
+            ["drop", "chart_date", "position", "title"],
+            ascending=[False, False, True, True],
+        ).head(limit).copy()
+        out["chart_date"] = pd.to_datetime(out["chart_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        out["next_chart_date"] = pd.to_datetime(out["next_chart_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        out = out.rename(columns={
+            "chart_date": "Final Chart Week",
+            "next_chart_date": "Next Chart Week",
+            "position": "Last Position",
+            "off_chart_position": "Off-Chart Position",
+            "drop": "Drop",
+            "title": "Song",
+            "artist": "Artist",
+            "lead_artist": "Lead Artist",
+            "featured_artist": "Featured Artist",
+            "weeks_on_chart": "Weeks On Chart",
+            "derived_marker": "Marker",
+        })
+        cols = [
+            "Final Chart Week", "Next Chart Week", "Last Position", "Off-Chart Position",
+            "Drop", "Song", "Artist", "Lead Artist", "Featured Artist", "Weeks On Chart", "Marker"
+        ]
+        return out[[c for c in cols if c in out.columns]]
+
     if kind == "Artists with most Top 10 weeks":
         chart = load_analytics_base()
         credits = build_artist_credit_rows(chart)
@@ -9665,8 +9716,9 @@ def render_quick_chart_feats() -> None:
             key="quick_feats_same_position_mode",
         )
 
-    uses_position_slider = feat_view == "Most weeks at same position" and same_position_mode == "Most consecutive weeks"
-    if uses_full_history or uses_year_dropdown or uses_position_slider:
+    uses_position_slider = feat_view == "Most weeks at same position"
+    uses_no_rows_slider = feat_view == "Songs gaining from a selected position to #1"
+    if uses_full_history or uses_year_dropdown or uses_position_slider or uses_no_rows_slider:
         limit = 1000000
     else:
         limit = st.slider("Rows", 10, 500, 100, 10, key=f"quick_feats_limit_{feat_category}")
@@ -9929,7 +9981,7 @@ def render_special_tables_tab() -> None:
     elif subsection == "Movement":
         table_kind = st.selectbox(
             "View",
-            ["Biggest climbers", "Biggest gains to #1", "Biggest falls from #1"],
+            ["Biggest climbers", "Biggest gains to #1", "Biggest falls from #1", "Biggest drops off the chart"],
             key="quick_movement_view",
         )
         limit = st.slider("Rows", 10, 500, 100, 10, key="quick_movement_limit")
@@ -9939,6 +9991,10 @@ def render_special_tables_tab() -> None:
         elif table_kind == "Biggest falls from #1":
             st.markdown("**Biggest falls from #1**")
             _display_df(build_quick_num1_falls(limit))
+        elif table_kind == "Biggest drops off the chart":
+            st.markdown("**Biggest drops off the chart**")
+            st.caption("Drop is scored as the chart size plus one, minus the song's final on-chart position before it disappeared the next week.")
+            _display_df(load_special_entries(table_kind, limit))
         else:
             st.markdown("**Biggest Climbers**")
             _display_df(load_special_entries(table_kind, limit))
