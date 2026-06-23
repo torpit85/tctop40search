@@ -761,7 +761,7 @@ def artist_history(normalized_artist: str, role_mode: str) -> tuple[pd.DataFrame
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
-def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
+def load_special_entries(kind: str, limit: int, artist_credit_mode: str = "Lead") -> pd.DataFrame:
     conn = get_connection()
 
     if kind == "Biggest climbers":
@@ -839,17 +839,34 @@ def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
         return out[[c for c in cols if c in out.columns]]
 
     if kind == "Artists with most Top 10 weeks":
+        result_columns = [
+            "Artist", "Credit Mode", "Top 10 Weeks", "Distinct Songs", "First Date", "Last Date", "Best Peak"
+        ]
         chart = load_analytics_base()
         credits = build_artist_credit_rows(chart)
         if credits.empty:
-            return pd.DataFrame(columns=["lead_artist", "top_10_weeks", "distinct_songs", "first_date", "last_date", "best_peak"])
-        top10 = credits.loc[(credits["artist_role_mode"] == "Lead") & (credits["position"] <= 10)].copy()
+            return pd.DataFrame(columns=result_columns)
+
+        credit_mode = artist_credit_mode if artist_credit_mode in {"All", "Lead", "Featured"} else "Lead"
+        top10 = credits.loc[pd.to_numeric(credits["position"], errors="coerce") <= 10].copy()
+        if credit_mode in {"Lead", "Featured"}:
+            top10 = top10.loc[top10["artist_role_mode"] == credit_mode].copy()
+
         if top10.empty:
-            return pd.DataFrame(columns=["lead_artist", "top_10_weeks", "distinct_songs", "first_date", "last_date", "best_peak"])
+            return pd.DataFrame(columns=result_columns)
+
+        def _credit_mode_summary(values: pd.Series) -> str:
+            roles = [str(v) for v in values.dropna().unique().tolist() if str(v).strip()]
+            if not roles:
+                return credit_mode
+            roles = sorted(set(roles), key=lambda role: {"Lead": 0, "Featured": 1}.get(role, 99))
+            return " + ".join(roles)
+
         out = (
             top10.groupby("artist_key", dropna=True)
             .agg(
-                lead_artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+                artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+                credit_mode=("artist_role_mode", _credit_mode_summary),
                 top_10_weeks=("entry_id", "nunique"),
                 distinct_songs=("song_key", "nunique"),
                 first_date=("chart_date", "min"),
@@ -858,13 +875,22 @@ def load_special_entries(kind: str, limit: int) -> pd.DataFrame:
             )
             .reset_index()
         )
-        out["lead_artist"] = out.apply(lambda r: preferred_artist_display(r["artist_key"], r["lead_artist"]), axis=1)
+        out["artist"] = out.apply(lambda r: preferred_artist_display(r["artist_key"], r["artist"]), axis=1)
         out = (
             out.drop(columns=["artist_key"])
-            .sort_values(["top_10_weeks", "best_peak", "last_date", "lead_artist"], ascending=[False, True, False, True])
+            .sort_values(["top_10_weeks", "best_peak", "last_date", "artist"], ascending=[False, True, False, True])
             .head(limit)
+            .rename(columns={
+                "artist": "Artist",
+                "credit_mode": "Credit Mode",
+                "top_10_weeks": "Top 10 Weeks",
+                "distinct_songs": "Distinct Songs",
+                "first_date": "First Date",
+                "last_date": "Last Date",
+                "best_peak": "Best Peak",
+            })
         )
-        return out
+        return out[[c for c in result_columns if c in out.columns]]
 
     conditions = {
         "#1 hits": "e.position = 1",
@@ -10030,9 +10056,21 @@ def render_special_tables_tab() -> None:
         )
 
         if table_kind == "Artists with most Top 10 weeks":
+            credit_mode = st.radio(
+                "Credit mode",
+                ["All", "Lead", "Featured"],
+                index=1,
+                horizontal=True,
+                key="quick_artists_top10_credit_mode",
+            )
             limit = st.slider("Rows", 10, 500, 100, 10, key="quick_artists_limit")
-            st.markdown("**Artists with most Top 10 weeks**")
-            _display_df(load_special_entries(table_kind, limit))
+            title_suffix = {
+                "All": "all credits",
+                "Lead": "lead artists only",
+                "Featured": "featured appearances only",
+            }.get(credit_mode, "lead artists only")
+            st.markdown(f"**Artists with most Top 10 weeks ({title_suffix})**")
+            _display_df(load_special_entries(table_kind, limit, credit_mode))
         elif table_kind == "Artists reaching #1 in the same chart week in consecutive years":
             st.markdown("**Artists reaching #1 in the same chart week in consecutive years**")
             st.caption("Uses the sequential chart-week number within each calendar year, so Chart Week #1 is the first chart published that year, Chart Week #2 is the second, and so on. Lead and featured artists both count.")
