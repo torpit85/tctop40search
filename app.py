@@ -7679,6 +7679,30 @@ def build_quick_from_position_to_num1(start_position: int, limit: int = 100) -> 
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_quick_from_num1_to_position(target_position: int, limit: int = 100) -> pd.DataFrame:
+    chart = load_analytics_base()
+    display_columns = ["Chart date", "Song", "Artist", "Weeks"]
+    if chart.empty:
+        return pd.DataFrame(columns=display_columns)
+    out = chart.loc[
+        chart["last_week_position"].eq(1)
+        & chart["position"].eq(target_position)
+        & ~chart["is_debut"]
+        & ~chart["is_reentry"]
+    , ["chart_date", "title", "artist", "weeks_on_chart"]].copy()
+    if out.empty:
+        return pd.DataFrame(columns=display_columns)
+    out = out.sort_values(["chart_date", "title"], ascending=[False, True]).head(limit)
+    out = out.rename(columns={
+        "chart_date": "Chart date",
+        "title": "Song",
+        "artist": "Artist",
+        "weeks_on_chart": "Weeks",
+    })
+    return out[display_columns]
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_quick_debut_position_to_num1(start_position: int, limit: int = 100) -> pd.DataFrame:
     songs = build_song_summary(load_analytics_base())
     if songs.empty:
@@ -9472,6 +9496,176 @@ def build_quick_chart_feat(feat_view: str, limit: int = 100) -> pd.DataFrame:
         if out.empty: return out
         return out.sort_values(["Chart Date", "Holiday(s)", "Song"], ascending=[False, True, True]).head(limit)
 
+    if feat_view in {"Artists with the most consecutive week reigns at #1", "Artists with the most 2+ week reigns at #1"}:
+        num1 = chart.loc[chart["position"].eq(1)].copy()
+        credits = build_artist_credit_rows(num1)
+        if credits.empty:
+            return pd.DataFrame()
+
+        credits["chart_date"] = pd.to_datetime(credits["chart_date"], errors="coerce")
+        credits = credits.dropna(subset=["chart_date", "artist_key"]).copy()
+        if credits.empty:
+            return pd.DataFrame()
+
+        def _role_mode_summary(values: pd.Series) -> str:
+            present = set(values.dropna().astype(str))
+            roles = [role for role in ["Lead", "Featured", "Full"] if role in present]
+            return " + ".join(roles)
+
+        weekly_artist = (
+            credits.groupby(["artist_key", "chart_date"], dropna=True)
+            .agg(
+                artist=("artist", _song_mode_value),
+                songs=("title", _quick_join_unique),
+                credit_roles=("artist_role_mode", _role_mode_summary),
+            )
+            .reset_index()
+            .sort_values(["artist_key", "chart_date"])
+        )
+        if weekly_artist.empty:
+            return pd.DataFrame()
+
+        total_weeks_by_artist = weekly_artist.groupby("artist_key", dropna=True).size().to_dict()
+        total_songs_by_artist = credits.groupby("artist_key", dropna=True)["song_key"].nunique().to_dict()
+
+        def _split_unique_pipes(values: list[object]) -> str:
+            parts: list[str] = []
+            for value in values:
+                for part in str(value or "").split(" | "):
+                    part = part.strip()
+                    if part and part not in parts:
+                        parts.append(part)
+            return " | ".join(parts)
+
+        def _split_unique_roles(values: list[object]) -> str:
+            parts: list[str] = []
+            for value in values:
+                for part in re.split(r"\s*\+\s*|\s*\|\s*", str(value or "")):
+                    part = part.strip()
+                    if part and part not in parts:
+                        parts.append(part)
+            roles = [role for role in ["Lead", "Featured", "Full"] if role in parts]
+            extras = sorted([role for role in parts if role not in roles])
+            return " + ".join(roles + extras)
+
+        def _format_reign_dates(start_value: object, end_value: object) -> str:
+            start_text = _format_chart_date_for_display(start_value)
+            end_text = _format_chart_date_for_display(end_value)
+            return start_text if start_text == end_text else f"{start_text} - {end_text}"
+
+        def _flush_artist_run(artist_key: object, run_rows: list[object], rows: list[dict[str, object]]) -> None:
+            if not run_rows:
+                return
+            fallback_artist = getattr(run_rows[0], "artist", "")
+            role_values = [getattr(r, "credit_roles", "") for r in run_rows]
+            rows.append({
+                "artist_key": artist_key,
+                "Artist": preferred_artist_display(artist_key, fallback_artist),
+                "Consecutive #1 Weeks": int(len(run_rows)),
+                "First #1 Week": pd.to_datetime(getattr(run_rows[0], "chart_date")),
+                "Last #1 Week": pd.to_datetime(getattr(run_rows[-1], "chart_date")),
+                "#1 Songs in Reign": _split_unique_pipes([getattr(r, "songs", "") for r in run_rows]),
+                "Credit Roles in Reign": _split_unique_roles(role_values),
+                "Total #1 Weeks": int(total_weeks_by_artist.get(artist_key, 0)),
+                "Total #1 Songs": int(total_songs_by_artist.get(artist_key, 0)),
+            })
+
+        rows: list[dict[str, object]] = []
+        for artist_key, g in weekly_artist.groupby("artist_key", sort=False):
+            run_rows: list[object] = []
+            prev_date = None
+            for row in g.itertuples(index=False):
+                cur_date = pd.to_datetime(getattr(row, "chart_date"))
+                consecutive = (
+                    prev_date is not None
+                    and date_index.get(cur_date) == date_index.get(prev_date, -999) + 1
+                )
+                if run_rows and not consecutive:
+                    _flush_artist_run(artist_key, run_rows, rows)
+                    run_rows = []
+                run_rows.append(row)
+                prev_date = cur_date
+            _flush_artist_run(artist_key, run_rows, rows)
+
+        runs = pd.DataFrame(rows)
+        if runs.empty:
+            return runs
+
+        if feat_view == "Artists with the most 2+ week reigns at #1":
+            long_runs = runs.loc[pd.to_numeric(runs["Consecutive #1 Weeks"], errors="coerce").ge(2)].copy()
+            if long_runs.empty:
+                return pd.DataFrame(columns=[
+                    "Artist", "2+ Week #1 Reigns", "Longest #1 Reign", "Total Weeks in 2+ Week Reigns",
+                    "First 2+ Week Reign", "Latest 2+ Week Reign", "#1 Songs in 2+ Week Reigns",
+                    "Credit Roles in 2+ Week Reigns", "Total #1 Weeks", "Total #1 Songs"
+                ])
+
+            latest_runs = (
+                long_runs.sort_values(["artist_key", "Last #1 Week", "Consecutive #1 Weeks"], ascending=[True, False, False])
+                .drop_duplicates(subset=["artist_key"], keep="first")
+                [["artist_key", "First #1 Week", "Last #1 Week", "#1 Songs in Reign", "Credit Roles in Reign"]]
+                .rename(columns={
+                    "First #1 Week": "Latest Reign Start",
+                    "Last #1 Week": "Latest Reign End",
+                    "#1 Songs in Reign": "Latest Reign Songs",
+                    "Credit Roles in Reign": "Latest Reign Credit Roles",
+                })
+            )
+
+            summary = (
+                long_runs.groupby("artist_key", dropna=True)
+                .agg(
+                    Artist=("Artist", _song_mode_value),
+                    **{
+                        "2+ Week #1 Reigns": ("Consecutive #1 Weeks", "size"),
+                        "Longest #1 Reign": ("Consecutive #1 Weeks", "max"),
+                        "Total Weeks in 2+ Week Reigns": ("Consecutive #1 Weeks", "sum"),
+                        "First 2+ Week Reign Start": ("First #1 Week", "min"),
+                        "First 2+ Week Reign End": ("Last #1 Week", "min"),
+                        "#1 Songs in 2+ Week Reigns": ("#1 Songs in Reign", lambda s: _split_unique_pipes(list(s))),
+                        "Credit Roles in 2+ Week Reigns": ("Credit Roles in Reign", lambda s: _split_unique_roles(list(s))),
+                        "Total #1 Weeks": ("Total #1 Weeks", "max"),
+                        "Total #1 Songs": ("Total #1 Songs", "max"),
+                    }
+                )
+                .reset_index()
+                .merge(latest_runs, on="artist_key", how="left")
+            )
+            summary["Artist"] = summary.apply(lambda r: preferred_artist_display(r["artist_key"], r["Artist"]), axis=1)
+            summary["First 2+ Week Reign"] = summary.apply(
+                lambda r: _format_reign_dates(r.get("First 2+ Week Reign Start"), r.get("First 2+ Week Reign End")),
+                axis=1,
+            )
+            summary["Latest 2+ Week Reign"] = summary.apply(
+                lambda r: _format_reign_dates(r.get("Latest Reign Start"), r.get("Latest Reign End")),
+                axis=1,
+            )
+            summary = (
+                summary.sort_values(
+                    ["2+ Week #1 Reigns", "Longest #1 Reign", "Total Weeks in 2+ Week Reigns", "Latest Reign End", "Artist"],
+                    ascending=[False, False, False, False, True],
+                )
+                .head(limit)
+            )
+            return summary[[
+                "Artist", "2+ Week #1 Reigns", "Longest #1 Reign", "Total Weeks in 2+ Week Reigns",
+                "First 2+ Week Reign", "Latest 2+ Week Reign", "#1 Songs in 2+ Week Reigns",
+                "Credit Roles in 2+ Week Reigns", "Total #1 Weeks", "Total #1 Songs"
+            ]]
+
+        out = (
+            runs.sort_values(
+                ["Consecutive #1 Weeks", "Total #1 Weeks", "Last #1 Week", "Artist"],
+                ascending=[False, False, False, True],
+            )
+            .drop_duplicates(subset=["artist_key"], keep="first")
+            .head(limit)
+        )
+        return out[[
+            "Artist", "Consecutive #1 Weeks", "First #1 Week", "Last #1 Week",
+            "#1 Songs in Reign", "Credit Roles in Reign", "Total #1 Weeks", "Total #1 Songs"
+        ]]
+
     if feat_view == "Artists who replaced themselves at #1":
         num1 = chart.loc[chart["position"].eq(1)].copy().sort_values(["chart_date", "entry_id"])
         if num1.empty:
@@ -9658,6 +9852,7 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
     ],
     "#1 / Top 5 / Top 10": [
         "Songs gaining from a selected position to #1",
+        "Songs falling from #1 to a selected position",
         "Most consecutive weeks at #1 by year",
         "#1 songs during holiday weeks",
         "Most weeks in Top 10 without reaching #1",
@@ -9673,13 +9868,13 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
     "Artist Feats": [
         "Artist-exclusive Top 2–5",
         "Artists who replaced themselves at #1",
+        "Artists with the most consecutive week reigns at #1",
         "Artists with most songs in the Top 10 in one week",
         "Artists with #1 and Top Debut in the same week",
         "Artists with lead and featured songs both in the Top 10",
     ],
     "Holding & Consistency": [
         "Most consecutive gaining weeks",
-        "Most consecutive holding weeks",
         "Most weeks at same position",
         "Most total holds",
         "Most Top 10 holds",
@@ -9761,7 +9956,10 @@ def render_quick_chart_feats() -> None:
         )
 
     uses_position_slider = feat_view == "Most weeks at same position"
-    uses_no_rows_slider = feat_view == "Songs gaining from a selected position to #1"
+    uses_no_rows_slider = feat_view in {
+        "Songs gaining from a selected position to #1",
+        "Songs falling from #1 to a selected position",
+    }
     if uses_full_history or uses_year_dropdown or uses_position_slider or uses_no_rows_slider:
         limit = 1000000
     else:
@@ -9791,6 +9989,10 @@ def render_quick_chart_feats() -> None:
         start_position = st.slider("Starting position", 2, 40, 2, 1, key="quick_to_num1_start")
         st.markdown(f"**Songs gaining from #{start_position} to #1**")
         _display_df(build_quick_from_position_to_num1(start_position, limit))
+    elif feat_view == "Songs falling from #1 to a selected position":
+        target_position = st.slider("Ending position", 2, 40, 2, 1, key="quick_from_num1_end")
+        st.markdown(f"**Songs falling from #1 to #{target_position}**")
+        _display_df(build_quick_from_num1_to_position(target_position, limit))
     elif feat_view == "Most consecutive weeks at #1 by year":
         st.markdown("**Most consecutive weeks at #1 by year**")
         _display_df(build_quick_num1_runs_by_year())
@@ -9813,6 +10015,14 @@ def render_quick_chart_feats() -> None:
         elif feat_view == "Most consecutive holding weeks":
             mode = st.radio("Holding streak view", ["Overall", "Non-#1 holding streaks"], horizontal=True, key="quick_feats_hold_mode")
             internal_view = "Most consecutive non-#1 holding weeks" if mode == "Non-#1 holding streaks" else feat_view
+        elif feat_view == "Artists with the most consecutive week reigns at #1":
+            mode = st.radio(
+                "Artist #1 reign view",
+                ["Consecutive #1 weeks", "2+ week reigns at #1"],
+                horizontal=True,
+                key="quick_feats_artist_num1_reign_mode",
+            )
+            internal_view = "Artists with the most 2+ week reigns at #1" if mode == "2+ week reigns at #1" else feat_view
         elif feat_view == "Most weeks at same position":
             internal_view = "Most consecutive weeks at same position" if same_position_mode == "Most consecutive weeks" else feat_view
         st.markdown(f"**{feat_view}**")
