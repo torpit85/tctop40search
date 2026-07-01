@@ -5834,13 +5834,979 @@ def admin_data_quality_checks() -> dict[str, pd.DataFrame]:
     return checks
 
 
+
+# --- Year-End chart imports -------------------------------------------------
+# Added by patch_tc_top40_year_end_imports.py
+
+def _ye_clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def _ye_norm(value: object) -> str:
+    try:
+        return normalize_search_text(value)
+    except Exception:
+        text = _ye_clean_text(value).lower()
+        text = re.sub(r"[\u2018\u2019]", "'", text)
+        text = re.sub(r"[\u201c\u201d]", '"', text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+
+def _ye_full_artist(artist: object, featured: object = "") -> str:
+    artist_txt = _ye_clean_text(artist)
+    feat_txt = _ye_clean_text(featured)
+    if artist_txt and feat_txt:
+        return f"{artist_txt} feat. {feat_txt}"
+    return artist_txt or feat_txt
+
+
+def _ye_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _ye_table_cols(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    if not _ye_table_exists(conn, table_name):
+        return set()
+    return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+
+def ensure_year_end_schema(conn: sqlite3.Connection | None = None) -> None:
+    own_conn = conn is None
+    if conn is None:
+        conn = get_connection()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS year_end_chart (
+            year INTEGER PRIMARY KEY,
+            source_name TEXT,
+            source_file TEXT,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS year_end_entry (
+            year_end_entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            points REAL,
+            raw_artist TEXT,
+            raw_featured TEXT,
+            raw_song_title TEXT,
+            raw_slug TEXT,
+            artist_display TEXT,
+            featured_display TEXT,
+            full_artist_display TEXT,
+            song_title_display TEXT,
+            normalized_artist TEXT,
+            normalized_featured TEXT,
+            normalized_full_artist TEXT,
+            normalized_song_title TEXT,
+            normalized_display TEXT,
+            canonical_song_id INTEGER,
+            source_file TEXT,
+            source_row INTEGER,
+            FOREIGN KEY(year) REFERENCES year_end_chart(year) ON DELETE CASCADE,
+            UNIQUE(year, position)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_year_end_entry_year_pos
+            ON year_end_entry(year, position);
+        CREATE INDEX IF NOT EXISTS idx_year_end_entry_canonical_song
+            ON year_end_entry(canonical_song_id);
+        CREATE INDEX IF NOT EXISTS idx_year_end_entry_norm
+            ON year_end_entry(normalized_song_title, normalized_full_artist);
+        """
+    )
+    conn.commit()
+    if own_conn and hasattr(conn, "close"):
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+_YE_COL_ALIASES = {
+    "position": ["position", "pos", "rank", "ranking", "year end rank", "year-end rank", "year_end_rank", "#"],
+    "song": ["song", "song title", "title", "track", "track title", "name"],
+    "artist": ["artist", "lead artist", "main artist", "artist name", "artists"],
+    "featured": ["featured", "feature", "featuring", "feat", "feat.", "guest", "guests"],
+    "full_artist": ["full artist", "full_artist", "combined artist", "combined_artist", "artist + featured", "artist/featured"],
+    "points": ["points", "pts", "score", "year end points", "year-end points", "plays", "playcount", "weighted plays"],
+    "slug": ["slug", "raw slug", "crownnote slug", "url", "link"],
+    "year": ["year", "chart year", "year-end year", "year_end_year"],
+}
+
+
+def _ye_col_key(col: object) -> str:
+    return re.sub(r"[^0-9a-z]+", " ", _ye_clean_text(col).lower()).strip()
+
+
+def _ye_find_col(columns: list[object], logical_name: str) -> object | None:
+    keyed = {_ye_col_key(c): c for c in columns}
+    for alias in _YE_COL_ALIASES.get(logical_name, []):
+        key = _ye_col_key(alias)
+        if key in keyed:
+            return keyed[key]
+    # Loose contains fallback, useful for exported headers like "Year End Points".
+    aliases = [_ye_col_key(a) for a in _YE_COL_ALIASES.get(logical_name, [])]
+    for key, original in keyed.items():
+        if any(alias and alias in key for alias in aliases):
+            return original
+    return None
+
+
+def _ye_year_from_text(text: object) -> int | None:
+    s = _ye_clean_text(text)
+    if not s:
+        return None
+    # Prefer explicit 4-digit years in filenames/sheets.
+    years = [int(y) for y in re.findall(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", s)]
+    if years:
+        return years[-1]
+    # Accept compact names such as TCTOP40YE23 only as a fallback.
+    m = re.search(r"(?:^|[^0-9])([0-9]{2})(?:[^0-9]|$)", s)
+    if m:
+        yy = int(m.group(1))
+        return 2000 + yy if yy <= 69 else 1900 + yy
+    return None
+
+
+def _ye_read_spreadsheet_bytes(name: str, raw: bytes) -> list[tuple[str, pd.DataFrame]]:
+    import io as _io
+    suffix = Path(name).suffix.lower()
+    sheets: list[tuple[str, pd.DataFrame]] = []
+    if suffix == ".csv":
+        df = pd.read_csv(_io.BytesIO(raw), dtype=str, keep_default_na=False)
+        sheets.append((Path(name).name, df))
+    elif suffix in {".xlsx", ".xls"}:
+        excel = pd.ExcelFile(_io.BytesIO(raw))
+        for sheet in excel.sheet_names:
+            df = pd.read_excel(excel, sheet_name=sheet, dtype=str, keep_default_na=False)
+            if not df.empty:
+                sheets.append((f"{Path(name).name}::{sheet}", df))
+    return sheets
+
+
+def _ye_uploaded_file_members(file_name: str, raw: bytes) -> list[tuple[str, bytes]]:
+    import io as _io
+    import zipfile as _zipfile
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".zip":
+        out: list[tuple[str, bytes]] = []
+        with _zipfile.ZipFile(_io.BytesIO(raw)) as zf:
+            for member in sorted(zf.namelist()):
+                if member.endswith("/"):
+                    continue
+                if Path(member).suffix.lower() in {".csv", ".xlsx", ".xls"}:
+                    out.append((member, zf.read(member)))
+        return out
+    return [(file_name, raw)]
+
+
+def _ye_coerce_position(value: object) -> int | None:
+    text = _ye_clean_text(value).lstrip("#")
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except Exception:
+        m = re.search(r"\d+", text)
+        return int(m.group(0)) if m else None
+
+
+def _ye_coerce_points(value: object) -> float | None:
+    text = _ye_clean_text(value).replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def parse_year_end_uploads(uploaded_files: list[object], default_year: int | None = None) -> tuple[pd.DataFrame, list[str]]:
+    rows: list[dict[str, object]] = []
+    issues: list[str] = []
+    for uploaded in uploaded_files or []:
+        file_name = getattr(uploaded, "name", "uploaded_file")
+        raw = uploaded.getvalue() if hasattr(uploaded, "getvalue") else bytes(uploaded)
+        try:
+            members = _ye_uploaded_file_members(file_name, raw)
+        except Exception as exc:
+            issues.append(f"{file_name}: could not open file/zip ({exc})")
+            continue
+        if not members:
+            issues.append(f"{file_name}: no CSV/XLSX/XLS files found")
+            continue
+        for member_name, member_bytes in members:
+            try:
+                sheets = _ye_read_spreadsheet_bytes(member_name, member_bytes)
+            except Exception as exc:
+                issues.append(f"{file_name} :: {member_name}: could not read ({exc})")
+                continue
+            for sheet_name, df in sheets:
+                if df is None or df.empty:
+                    continue
+                df = df.dropna(how="all").copy()
+                if df.empty:
+                    continue
+                columns = list(df.columns)
+                pos_col = _ye_find_col(columns, "position")
+                song_col = _ye_find_col(columns, "song")
+                artist_col = _ye_find_col(columns, "artist")
+                featured_col = _ye_find_col(columns, "featured")
+                full_artist_col = _ye_find_col(columns, "full_artist")
+                points_col = _ye_find_col(columns, "points")
+                slug_col = _ye_find_col(columns, "slug")
+                year_col = _ye_find_col(columns, "year")
+
+                if pos_col is None or song_col is None or (artist_col is None and full_artist_col is None):
+                    issues.append(
+                        f"{file_name} :: {sheet_name}: missing required columns. Need rank/position, song/title, and artist/full artist. Found: {', '.join(map(str, columns))}"
+                    )
+                    continue
+
+                guessed_year = _ye_year_from_text(sheet_name) or _ye_year_from_text(member_name) or _ye_year_from_text(file_name) or default_year
+                for source_idx, row in df.reset_index(drop=True).iterrows():
+                    position = _ye_coerce_position(row.get(pos_col))
+                    if position is None:
+                        continue
+                    song = _ye_clean_text(row.get(song_col))
+                    artist = _ye_clean_text(row.get(artist_col)) if artist_col is not None else ""
+                    featured = _ye_clean_text(row.get(featured_col)) if featured_col is not None else ""
+                    full_artist = _ye_clean_text(row.get(full_artist_col)) if full_artist_col is not None else _ye_full_artist(artist, featured)
+                    if not artist and full_artist:
+                        artist = full_artist
+                    year_val = _ye_year_from_text(row.get(year_col)) if year_col is not None else guessed_year
+                    if not year_val:
+                        issues.append(f"{file_name} :: {sheet_name}: could not determine year; set Default year before import")
+                        continue
+                    if not song or not full_artist:
+                        issues.append(f"{file_name} :: {sheet_name} row {source_idx + 2}: missing song or artist")
+                        continue
+                    slug = _ye_clean_text(row.get(slug_col)) if slug_col is not None else ""
+                    points = _ye_coerce_points(row.get(points_col)) if points_col is not None else None
+                    rows.append(
+                        {
+                            "year": int(year_val),
+                            "position": int(position),
+                            "points": points,
+                            "song": song,
+                            "artist": artist,
+                            "featured": featured,
+                            "full_artist": full_artist,
+                            "slug": slug,
+                            "source_file": Path(file_name).name if file_name != member_name else Path(member_name).name,
+                            "source_member": member_name,
+                            "source_row": int(source_idx + 2),
+                        }
+                    )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["year", "position", "source_file", "source_row"]).reset_index(drop=True)
+        dupes = out[out.duplicated(subset=["year", "position"], keep=False)]
+        if not dupes.empty:
+            pairs = dupes[["year", "position"]].drop_duplicates().head(12)
+            issues.append("Duplicate year/position rows found: " + ", ".join(f"{int(r.year)} #{int(r.position)}" for r in pairs.itertuples()))
+    return out, issues
+
+
+def _ye_match_canonical_song_id(conn: sqlite3.Connection, song: str, full_artist: str, artist: str = "") -> int | None:
+    song_n = _ye_norm(song)
+    full_n = _ye_norm(full_artist)
+    artist_n = _ye_norm(artist or full_artist)
+    if not song_n:
+        return None
+
+    if _ye_table_exists(conn, "song_alias"):
+        alias_cols = _ye_table_cols(conn, "song_alias")
+        if {"canonical_song_id", "alias_song_title", "alias_artist"}.issubset(alias_cols):
+            rows = conn.execute(
+                "SELECT canonical_song_id, alias_song_title, alias_artist FROM song_alias WHERE COALESCE(alias_song_title, '') <> ''",
+            ).fetchall()
+            for r in rows:
+                if _ye_norm(r[1]) == song_n and _ye_norm(r[2]) in {full_n, artist_n}:
+                    try:
+                        return int(r[0])
+                    except Exception:
+                        return None
+
+    if _ye_table_exists(conn, "canonical_song"):
+        cols = _ye_table_cols(conn, "canonical_song")
+        title_col = "canonical_title" if "canonical_title" in cols else None
+        id_col = "canonical_song_id" if "canonical_song_id" in cols else None
+        artist_candidates = [c for c in ["canonical_full_artist", "canonical_artist", "canonical_lead_artist"] if c in cols]
+        if title_col and id_col:
+            select_cols = ", ".join([id_col, title_col] + artist_candidates)
+            rows = conn.execute(f"SELECT {select_cols} FROM canonical_song WHERE COALESCE({title_col}, '') <> ''").fetchall()
+            for r in rows:
+                cid = r[0]
+                title = r[1]
+                artists = list(r[2:]) if len(r) > 2 else []
+                if _ye_norm(title) == song_n and any(_ye_norm(a) in {full_n, artist_n} for a in artists if a is not None):
+                    try:
+                        return int(cid)
+                    except Exception:
+                        return None
+    return None
+
+
+def import_year_end_rows(preview_df: pd.DataFrame, replace_existing: bool = True) -> dict[str, object]:
+    if preview_df is None or preview_df.empty:
+        return {"years": [], "entries": 0, "matched": 0, "unmatched": 0, "issues": ["No rows to import."]}
+    conn = get_connection()
+    ensure_year_end_schema(conn)
+    issues: list[str] = []
+    years = sorted(int(y) for y in preview_df["year"].dropna().unique().tolist())
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN")
+        for year in years:
+            exists = conn.execute("SELECT COUNT(*) FROM year_end_entry WHERE year = ?", (year,)).fetchone()[0]
+            if exists and not replace_existing:
+                issues.append(f"{year}: existing Year-End rows found; skipped because Replace existing is off")
+                continue
+            if replace_existing:
+                conn.execute("DELETE FROM year_end_entry WHERE year = ?", (year,))
+                conn.execute("DELETE FROM year_end_chart WHERE year = ?", (year,))
+            year_rows = preview_df.loc[preview_df["year"] == year].sort_values(["position", "source_file", "source_row"]).copy()
+            source_files = ", ".join(sorted(set(year_rows.get("source_file", pd.Series(dtype=str)).dropna().astype(str).tolist())))
+            notes = None
+            if year_rows["position"].duplicated().any():
+                notes = "Duplicate positions were present in the source preview."
+                issues.append(f"{year}: duplicate positions present; import will keep the last row for each position")
+                year_rows = year_rows.drop_duplicates(subset=["position"], keep="last")
+            conn.execute(
+                """
+                INSERT INTO year_end_chart(year, source_name, source_file, row_count, imported_at, notes)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                """,
+                (year, f"Torrey's Corner Top 40 Year-End {year}", source_files, int(len(year_rows)), notes),
+            )
+            for r in year_rows.itertuples(index=False):
+                artist = _ye_clean_text(getattr(r, "artist", ""))
+                featured = _ye_clean_text(getattr(r, "featured", ""))
+                song = _ye_clean_text(getattr(r, "song", ""))
+                full_artist = _ye_clean_text(getattr(r, "full_artist", "")) or _ye_full_artist(artist, featured)
+                slug = _ye_clean_text(getattr(r, "slug", ""))
+                normalized_display = _ye_norm(f"{song} {full_artist} {artist} {featured} {slug}")
+                canonical_song_id = _ye_match_canonical_song_id(conn, song, full_artist, artist)
+                conn.execute(
+                    """
+                    INSERT INTO year_end_entry (
+                        year, position, points,
+                        raw_artist, raw_featured, raw_song_title, raw_slug,
+                        artist_display, featured_display, full_artist_display, song_title_display,
+                        normalized_artist, normalized_featured, normalized_full_artist,
+                        normalized_song_title, normalized_display, canonical_song_id,
+                        source_file, source_row
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(getattr(r, "year")), int(getattr(r, "position")), getattr(r, "points", None),
+                        artist, featured, song, slug,
+                        artist, featured, full_artist, song,
+                        _ye_norm(artist), _ye_norm(featured), _ye_norm(full_artist),
+                        _ye_norm(song), normalized_display, canonical_song_id,
+                        _ye_clean_text(getattr(r, "source_file", "")), int(getattr(r, "source_row", 0) or 0),
+                    ),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    imported = pd.read_sql_query(
+        "SELECT COUNT(*) AS entries, SUM(CASE WHEN canonical_song_id IS NOT NULL THEN 1 ELSE 0 END) AS matched FROM year_end_entry WHERE year IN (%s)" % ",".join("?" for _ in years),
+        conn,
+        params=years,
+    ) if years else pd.DataFrame([{"entries": 0, "matched": 0}])
+    entries = int(imported["entries"].iloc[0] or 0)
+    matched = int(imported["matched"].iloc[0] or 0)
+    return {"years": years, "entries": entries, "matched": matched, "unmatched": entries - matched, "issues": issues}
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_year_end_years() -> list[int]:
+    conn = get_connection()
+    if not _ye_table_exists(conn, "year_end_chart"):
+        return []
+    rows = conn.execute("SELECT year FROM year_end_chart ORDER BY year DESC").fetchall()
+    return [int(r[0]) for r in rows]
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_year_end_chart(year: int) -> pd.DataFrame:
+    conn = get_connection()
+    if not _ye_table_exists(conn, "year_end_entry"):
+        return pd.DataFrame()
+    return pd.read_sql_query(
+        """
+        WITH weekly_year_positions AS (
+            SELECT
+                e.canonical_song_id,
+                e.position,
+                cw.chart_date
+            FROM entry e
+            JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+            WHERE e.canonical_song_id IS NOT NULL
+              AND CAST(strftime('%Y', cw.chart_date) AS INTEGER) = ?
+        ),
+        weekly_year_peak AS (
+            SELECT
+                canonical_song_id,
+                MIN(position) AS year_peak
+            FROM weekly_year_positions
+            GROUP BY canonical_song_id
+        ),
+        weekly_year_peak_date AS (
+            SELECT
+                wyp.canonical_song_id,
+                wyp.year_peak,
+                MIN(wyp_pos.chart_date) AS date_hit_year_peak
+            FROM weekly_year_peak wyp
+            JOIN weekly_year_positions wyp_pos
+              ON wyp_pos.canonical_song_id = wyp.canonical_song_id
+             AND wyp_pos.position = wyp.year_peak
+            GROUP BY wyp.canonical_song_id, wyp.year_peak
+        )
+        SELECT
+            yee.position AS Position,
+            COALESCE(NULLIF(cs.canonical_title, ''), yee.song_title_display) AS Song,
+            COALESCE(NULLIF(cs.canonical_full_artist, ''), NULLIF(cs.canonical_artist, ''), yee.full_artist_display) AS Artist,
+            wypd.year_peak AS "Year Peak",
+            wypd.date_hit_year_peak AS "Date Hit Year Peak",
+            yee.source_file AS source_file,
+            yee.source_row AS source_row
+        FROM year_end_entry yee
+        LEFT JOIN canonical_song cs ON cs.canonical_song_id = yee.canonical_song_id
+        LEFT JOIN weekly_year_peak_date wypd ON wypd.canonical_song_id = yee.canonical_song_id
+        WHERE yee.year = ?
+        ORDER BY yee.position
+        """,
+        conn,
+        params=(int(year), int(year)),
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_year_end_for_canonical_song(canonical_song_id: int) -> pd.DataFrame:
+    """Year-End rows linked to one canonical song.
+
+    These are deliberately kept separate from weekly chart history so Year-End
+    appearances do not inflate weekly chart-week totals, peaks, #1 counts, or
+    other weekly records.
+    """
+    conn = get_connection()
+    if not _ye_table_exists(conn, "year_end_entry"):
+        return pd.DataFrame()
+    return pd.read_sql_query(
+        """
+        SELECT
+            yee.year AS Year,
+            yee.position AS Position,
+            yee.points AS Points,
+            COALESCE(NULLIF(cs.canonical_title, ''), yee.song_title_display) AS Song,
+            COALESCE(NULLIF(cs.canonical_full_artist, ''), NULLIF(cs.canonical_artist, ''), yee.full_artist_display) AS Artist,
+            yee.song_title_display AS "Imported Song",
+            yee.full_artist_display AS "Imported Artist",
+            yee.source_file AS "Source file",
+            yee.source_row AS "Source row"
+        FROM year_end_entry yee
+        LEFT JOIN canonical_song cs ON cs.canonical_song_id = yee.canonical_song_id
+        WHERE yee.canonical_song_id = ?
+        ORDER BY yee.year DESC, yee.position ASC
+        """,
+        conn,
+        params=(int(canonical_song_id),),
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_year_end_for_artist(artist_key: str, role_mode: str = "Full credit") -> pd.DataFrame:
+    """Year-End rows linked to canonical songs for one artist credit.
+
+    Uses linked canonical_song fields, then splits lead/featured credits the same
+    way the weekly Artist History tab does. Unlinked Year-End rows are omitted
+    because there is no reliable canonical artist identity yet.
+    """
+    conn = get_connection()
+    if not _ye_table_exists(conn, "year_end_entry") or not _ye_table_exists(conn, "canonical_song"):
+        return pd.DataFrame()
+
+    base = pd.read_sql_query(
+        """
+        SELECT
+            yee.year_end_entry_id,
+            yee.year AS Year,
+            yee.position AS Position,
+            yee.points AS Points,
+            COALESCE(NULLIF(cs.canonical_title, ''), yee.song_title_display) AS Song,
+            COALESCE(NULLIF(cs.canonical_full_artist, ''), NULLIF(cs.canonical_artist, ''), yee.full_artist_display) AS full_artist,
+            COALESCE(NULLIF(cs.canonical_lead_artist, ''), NULLIF(cs.canonical_artist, ''), yee.artist_display, yee.full_artist_display) AS lead_artist,
+            COALESCE(cs.canonical_featured_artist, '') AS featured_artist,
+            yee.song_title_display AS imported_song,
+            yee.full_artist_display AS imported_artist,
+            yee.source_file AS source_file,
+            yee.source_row AS source_row
+        FROM year_end_entry yee
+        JOIN canonical_song cs ON cs.canonical_song_id = yee.canonical_song_id
+        WHERE yee.canonical_song_id IS NOT NULL
+        ORDER BY yee.year DESC, yee.position ASC
+        """,
+        conn,
+    )
+    if base.empty:
+        return pd.DataFrame()
+
+    target_key = resolve_artist_key_alias(artist_key)
+    target_key = normalize_search_text(target_key)
+    if not target_key:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    for row in base.to_dict("records"):
+        lead_people = _split_credit_people(normalize_search_text(row.get("lead_artist")), row.get("lead_artist"))
+        featured_people = _split_credit_people(normalize_search_text(row.get("featured_artist")), row.get("featured_artist"))
+        for credit_role, people in [("Lead", lead_people), ("Featured", featured_people)]:
+            for key, display_artist in people:
+                if key != target_key:
+                    continue
+                rows.append({
+                    "year_end_entry_id": row.get("year_end_entry_id"),
+                    "Year": row.get("Year"),
+                    "Position": row.get("Position"),
+                    "Song": row.get("Song"),
+                    "Artist": preferred_artist_display(key, display_artist),
+                    "Credit": credit_role,
+                    "Full Artist": row.get("full_artist"),
+                    "Points": row.get("Points"),
+                    "Imported Song": row.get("imported_song"),
+                    "Imported Artist": row.get("imported_artist"),
+                    "Source file": row.get("source_file"),
+                    "Source row": row.get("source_row"),
+                })
+
+    if not rows:
+        return pd.DataFrame()
+
+    credits = pd.DataFrame(rows)
+    selected_mode = role_mode if role_mode in {"Full credit", "Lead artist", "Featured artist"} else "Full credit"
+    if selected_mode == "Lead artist":
+        credits = credits.loc[credits["Credit"] == "Lead"].copy()
+    elif selected_mode == "Featured artist":
+        credits = credits.loc[credits["Credit"] == "Featured"].copy()
+    if credits.empty:
+        return credits
+
+    # Collapse any accidental lead+featured duplicate for the same song/year row.
+    def _credit_summary(values: pd.Series) -> str:
+        roles = [str(v) for v in values.dropna().unique().tolist() if str(v).strip()]
+        roles = sorted(set(roles), key=lambda role: {"Lead": 0, "Featured": 1}.get(role, 99))
+        return " + ".join(roles)
+
+    out = (
+        credits.groupby("year_end_entry_id", dropna=False)
+        .agg(
+            Year=("Year", "first"),
+            Position=("Position", "first"),
+            Song=("Song", "first"),
+            Artist=("Artist", "first"),
+            Credit=("Credit", _credit_summary),
+            **{
+                "Full Artist": ("Full Artist", "first"),
+                "Points": ("Points", "first"),
+                "Imported Song": ("Imported Song", "first"),
+                "Imported Artist": ("Imported Artist", "first"),
+                "Source file": ("Source file", "first"),
+                "Source row": ("Source row", "first"),
+            },
+        )
+        .reset_index(drop=True)
+        .sort_values(["Year", "Position", "Song"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def _render_year_end_history_table(df: pd.DataFrame, *, key_prefix: str, empty_message: str) -> None:
+    """Display linked Year-End appearances without mixing them into weekly stats."""
+    st.markdown("**Year-End chart appearances**")
+    if df.empty:
+        st.caption(empty_message)
+        return
+
+    pos = pd.to_numeric(df.get("Position"), errors="coerce")
+    years = pd.to_numeric(df.get("Year"), errors="coerce")
+    best = int(pos.min()) if pos.notna().any() else None
+    first_year = int(years.min()) if years.notna().any() else None
+    last_year = int(years.max()) if years.notna().any() else None
+    year_span = f"{first_year}–{last_year}" if first_year is not None and last_year is not None and first_year != last_year else (str(first_year) if first_year is not None else "—")
+    render_kpis([
+        ("Year-End appearances", int(len(df))),
+        ("Best Year-End rank", f"#{best}" if best is not None else "—"),
+        ("Year span", year_span),
+    ])
+
+    controls = st.columns([1, 1, 2])
+    show_imported = controls[0].checkbox("Show imported spellings", value=False, key=f"{key_prefix}_show_imported")
+    show_source = controls[1].checkbox("Show source columns", value=False, key=f"{key_prefix}_show_source")
+
+    base_cols = ["Year", "Position", "Song", "Artist", "Credit", "Full Artist", "Points"]
+    imported_cols = ["Imported Song", "Imported Artist"]
+    source_cols = ["Source file", "Source row"]
+    cols = [c for c in base_cols if c in df.columns]
+    if show_imported:
+        cols += [c for c in imported_cols if c in df.columns and c not in cols]
+    if show_source:
+        cols += [c for c in source_cols if c in df.columns and c not in cols]
+    _ye_display_df(df[cols])
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_year_end_unmatched(year: int | None = None) -> pd.DataFrame:
+    conn = get_connection()
+    if not _ye_table_exists(conn, "year_end_entry"):
+        return pd.DataFrame()
+    params: list[object] = []
+    where = "WHERE yee.canonical_song_id IS NULL"
+    if year is not None:
+        where += " AND yee.year = ?"
+        params.append(int(year))
+    return pd.read_sql_query(
+        f"""
+        SELECT
+            yee.year_end_entry_id AS year_end_entry_id,
+            yee.year AS Year,
+            yee.position AS Position,
+            yee.song_title_display AS Song,
+            yee.full_artist_display AS Artist,
+            yee.source_file AS source_file,
+            yee.source_row AS source_row
+        FROM year_end_entry yee
+        {where}
+        ORDER BY yee.year DESC, yee.position
+        """,
+        conn,
+        params=params,
+    )
+
+
+def _ye_display_df(df: pd.DataFrame, **kwargs) -> None:
+    try:
+        _display_df(df, **kwargs)
+    except TypeError:
+        _display_df(df)
+    except NameError:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def resolve_year_end_entry_link(year_end_entry_id: int, canonical_song_id: int, add_alias: bool = True) -> tuple[bool, str]:
+    """Link one imported Year-End row to an existing canonical song."""
+    if not Path(DB_PATH).exists():
+        return False, f"Database not found: {DB_PATH}"
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        ensure_year_end_schema(cur.connection)
+        row = cur.execute(
+            """
+            SELECT year_end_entry_id, year, position, song_title_display, full_artist_display
+            FROM year_end_entry
+            WHERE year_end_entry_id = ?
+            """,
+            (int(year_end_entry_id),),
+        ).fetchone()
+        if row is None:
+            return False, "That Year-End row was not found. Refresh and try again."
+
+        target = cur.execute(
+            """
+            SELECT canonical_song_id, canonical_title,
+                   COALESCE(canonical_full_artist, canonical_artist) AS canonical_artist
+            FROM canonical_song
+            WHERE canonical_song_id = ?
+            """,
+            (int(canonical_song_id),),
+        ).fetchone()
+        if target is None:
+            return False, "The selected canonical song was not found."
+
+        cur.execute("BEGIN")
+        cur.execute(
+            "UPDATE year_end_entry SET canonical_song_id = ? WHERE year_end_entry_id = ?",
+            (int(canonical_song_id), int(year_end_entry_id)),
+        )
+        if add_alias:
+            try:
+                _insert_song_alias_row(
+                    cur,
+                    int(canonical_song_id),
+                    _ye_clean_text(row["song_title_display"]),
+                    _ye_clean_text(row["full_artist_display"]),
+                )
+            except Exception:
+                # The link is the important part; alias insertion is best-effort.
+                pass
+        conn.commit()
+        try:
+            _reset_app_caches()
+        except Exception:
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+        return (
+            True,
+            f"Linked {int(row['year'])} #{int(row['position'])} — {row['song_title_display']} to "
+            f"{target['canonical_title']} — {target['canonical_artist']}.",
+        )
+    except Exception as exc:
+        conn.rollback()
+        return False, f"Year-End link update failed: {exc}"
+    finally:
+        conn.close()
+
+
+def _ye_candidate_label(row: object) -> str:
+    """Human-readable label for canonical-song search results."""
+    try:
+        title = getattr(row, "canonical_title")
+        artist = getattr(row, "canonical_artist")
+        cid = int(getattr(row, "canonical_song_id"))
+        weeks = getattr(row, "chart_weeks", "")
+        peak = getattr(row, "peak", "")
+        first_date = getattr(row, "first_date", "")
+        last_date = getattr(row, "last_date", "")
+    except Exception:
+        return str(row)
+    bits = [f"{title} — {artist}", f"ID {cid}"]
+    if weeks not in (None, ""):
+        try:
+            bits.append(f"{int(weeks)} week(s)")
+        except Exception:
+            bits.append(f"{weeks} week(s)")
+    if peak not in (None, "") and not pd.isna(peak):
+        try:
+            bits.append(f"peak #{int(peak)}")
+        except Exception:
+            bits.append(f"peak {peak}")
+    if first_date and last_date:
+        bits.append(f"{first_date} to {last_date}")
+    return " | ".join(bits)
+
+
+
+def render_year_end_charts_tab() -> None:
+    st.subheader("Year-End charts")
+    st.caption("Browse imported Year-End charts. Canonical titles/artists are shown automatically when a row has been linked; import and mismatch tools remain under Admin → Year-End Imports.")
+
+    years = load_year_end_years()
+    if not years:
+        st.info("No Year-End charts have been imported yet. Use Admin → Year-End Imports to import yearly charts first.")
+        return
+
+    controls = st.columns([1, 1, 2])
+    year = controls[0].selectbox("Year", years, index=0, key="year_end_charts_section_year")
+    show_source = controls[1].checkbox(
+        "Show import/source columns",
+        value=False,
+        key="year_end_charts_show_source_cols",
+    )
+
+    df = load_year_end_chart(int(year))
+    st.markdown(f"### {int(year)} Year-End chart")
+    if df.empty:
+        st.info("No rows found for that year.")
+        return
+
+    peak_mask = pd.to_numeric(df.get("Year Peak"), errors="coerce").notna() if "Year Peak" in df.columns else pd.Series(False, index=df.index)
+    render_kpis([
+        ("Rows", len(df)),
+        ("Year peaks found", int(peak_mask.sum())),
+        ("Missing year peaks", int((~peak_mask).sum())),
+    ])
+
+    display = df.copy()
+    if "Year Peak" in display.columns:
+        display["Year Peak"] = pd.to_numeric(display["Year Peak"], errors="coerce").map(
+            lambda v: "—" if pd.isna(v) else f"#{int(v)}"
+        )
+    if "Date Hit Year Peak" in display.columns:
+        display["Date Hit Year Peak"] = pd.to_datetime(display["Date Hit Year Peak"], errors="coerce").dt.strftime("%Y-%m-%d")
+        display["Date Hit Year Peak"] = display["Date Hit Year Peak"].fillna("—")
+
+    display = display.rename(columns={
+        "source_file": "Source file",
+        "source_row": "Source row",
+    })
+
+    base_cols = ["Position", "Song", "Artist", "Year Peak", "Date Hit Year Peak"]
+    source_cols = ["Source file", "Source row"]
+    cols = [c for c in base_cols + (source_cols if show_source else []) if c in display.columns]
+    _ye_display_df(display[cols])
+
+    if not show_source and any(c in display.columns for c in source_cols):
+        with st.expander("Show source/import details", expanded=False):
+            detail_cols = [c for c in ["Position", "Song", "Artist", "Year Peak", "Date Hit Year Peak", "Source file", "Source row"] if c in display.columns]
+            _ye_display_df(display[detail_cols])
+
+
+def render_year_end_import_tab() -> None:
+    st.markdown("### Year-End chart imports")
+    st.caption("Imports yearly ranked charts into separate Year-End tables, leaving weekly chart rows untouched.")
+    conn = get_connection()
+    ensure_year_end_schema(conn)
+
+    import_tab, unmatched_tab = st.tabs(["Import", "Unmatched review"])
+
+    with import_tab:
+        st.markdown("#### Upload Year-End chart file(s)")
+        st.caption("Accepted formats: CSV, XLSX/XLS, or ZIP containing CSV/XLSX files. Required columns: Position/Rank, Song/Title, and Artist or Full Artist. Optional columns: Featured, Points, Slug, Year.")
+        files = st.file_uploader(
+            "Year-End chart files",
+            type=["csv", "xlsx", "xls", "zip"],
+            accept_multiple_files=True,
+            key="year_end_import_files",
+        )
+        c1, c2 = st.columns([1, 1])
+        default_year = int(c1.number_input("Default year if the file does not say", min_value=2003, max_value=2100, value=2025, step=1, key="year_end_default_year"))
+        replace_existing = c2.checkbox("Replace existing rows for imported year(s)", value=True, key="year_end_replace_existing")
+
+        if files:
+            preview, issues = parse_year_end_uploads(files, default_year=default_year)
+            if issues:
+                with st.expander("Import warnings / parse notes", expanded=True):
+                    for issue in issues[:50]:
+                        st.warning(issue)
+                    if len(issues) > 50:
+                        st.info(f"{len(issues) - 50} additional warning(s) not shown.")
+            if preview.empty:
+                st.error("No importable Year-End rows were found.")
+            else:
+                years = ", ".join(str(int(y)) for y in sorted(preview["year"].unique()))
+                st.success(f"Preview ready: {len(preview):,} row(s) across {years}.")
+                preview_display = preview[["year", "position", "song", "full_artist", "points", "source_file", "source_row"]].copy()
+                preview_display = preview_display.rename(columns={
+                    "year": "Year",
+                    "position": "Position",
+                    "song": "Song",
+                    "full_artist": "Artist",
+                    "points": "Points",
+                    "source_file": "Source file",
+                    "source_row": "Source row",
+                })
+                _ye_display_df(preview_display.head(250))
+                if len(preview_display) > 250:
+                    st.caption(f"Showing first 250 of {len(preview_display):,} preview rows.")
+
+                if st.button("Import Year-End chart rows", type="primary", key="year_end_import_btn"):
+                    result = import_year_end_rows(preview, replace_existing=replace_existing)
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.success(
+                        f"Imported {result['entries']:,} Year-End row(s) across {len(result['years'])} year(s). "
+                        f"Canonical matches: {result['matched']:,}; unmatched: {result['unmatched']:,}."
+                    )
+                    for issue in result.get("issues", []):
+                        st.warning(issue)
+                    st.rerun()
+        else:
+            st.info("Upload a Year-End CSV/XLSX/ZIP to preview it before importing.")
+
+    with unmatched_tab:
+        years = load_year_end_years()
+        year_options = ["All years"] + [str(y) for y in years]
+        choice = st.selectbox("Unmatched scope", year_options, key="year_end_unmatched_scope") if year_options else "All years"
+        year_val = None if choice == "All years" else int(choice)
+        unmatched = load_year_end_unmatched(year_val)
+        if unmatched.empty:
+            st.success("No unmatched Year-End entries in that scope.")
+        else:
+            st.caption("These imported rows did not auto-match to canonical_song/song_alias. Use the resolver below to link one row at a time to an existing canonical song.")
+            display_cols = [c for c in unmatched.columns if c != "year_end_entry_id"]
+            _ye_display_df(unmatched[display_cols])
+
+            st.divider()
+            st.markdown("#### Resolve selected Year-End row")
+            st.caption("Pick the imported row, search the canonical-song table, then save the link. The weekly chart rows are not changed.")
+
+            row_options: dict[str, int] = {}
+            for r in unmatched.itertuples(index=False):
+                entry_id = int(getattr(r, "year_end_entry_id"))
+                label = f"{int(getattr(r, 'Year'))} #{int(getattr(r, 'Position'))} — {getattr(r, 'Song')} — {getattr(r, 'Artist')}"
+                row_options[label] = entry_id
+
+            selected_label = st.selectbox("Unmatched row", list(row_options.keys()), key="year_end_resolve_row")
+            selected_entry_id = row_options[selected_label]
+            selected_row = unmatched.loc[unmatched["year_end_entry_id"] == selected_entry_id].iloc[0]
+
+            default_search = _ye_clean_text(selected_row.get("Song", ""))
+            search_key = f"year_end_resolve_search_{selected_entry_id}"
+            search_term = st.text_input("Search canonical songs", value=default_search, key=search_key)
+
+            candidates = canonical_song_matches(search_term.strip(), limit=100) if search_term.strip() else pd.DataFrame()
+            if candidates.empty:
+                st.info("No canonical-song candidates found yet. Try a shorter title search, or fix/merge the song under Admin → Songs first.")
+            else:
+                preview_cols = [
+                    "canonical_song_id", "canonical_title", "canonical_artist",
+                    "chart_weeks", "peak", "first_date", "last_date",
+                ]
+                st.caption("Candidate matches")
+                _ye_display_df(candidates[[c for c in preview_cols if c in candidates.columns]].head(25))
+
+                candidate_options = {
+                    _ye_candidate_label(r): int(r.canonical_song_id)
+                    for r in candidates.itertuples(index=False)
+                }
+                candidate_label = st.selectbox(
+                    "Canonical song to link",
+                    list(candidate_options.keys()),
+                    key=f"year_end_resolve_candidate_{selected_entry_id}",
+                )
+                add_alias = st.checkbox(
+                    "Also add this Year-End spelling as a song alias for future imports",
+                    value=True,
+                    key=f"year_end_resolve_alias_{selected_entry_id}",
+                )
+                if st.button("Link Year-End row to selected canonical song", type="primary", key=f"year_end_resolve_btn_{selected_entry_id}"):
+                    ok, msg = resolve_year_end_entry_link(selected_entry_id, candidate_options[candidate_label], add_alias=add_alias)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+# --- End Year-End chart imports ---------------------------------------------
+
 def render_admin_tab() -> None:
     st.subheader("Admin")
     admin_section = st.selectbox(
         "Admin section",
-        ["Songs", "Artists", "Data Quality", "Data Health / Import QA", "Maintenance"],
+        ["Songs", "Artists", "Year-End Imports", "Data Quality", "Data Health / Import QA", "Maintenance"],
         key="admin_section_selector",
     )
+
+    if admin_section == "Year-End Imports":
+        render_year_end_import_tab()
+        return
 
     if admin_section == "Songs":
         st.markdown("### Canonical songs")
@@ -7522,6 +8488,13 @@ def render_song_history_tab() -> None:
                     if not aliases.empty:
                         with st.expander("Aliases / source variants"):
                             _display_df(aliases)
+
+                year_end_history = load_year_end_for_canonical_song(selected_song_id)
+                _render_year_end_history_table(
+                    year_end_history,
+                    key_prefix=f"canonical_song_year_end_{selected_song_id}",
+                    empty_message="No linked Year-End chart appearances for this canonical song yet.",
+                )
     else:
         st.info("Type part of a title or artist to load a canonical song history.")
 
@@ -7603,6 +8576,13 @@ def render_artist_history_tab() -> None:
                     _display_df(yearly.sort_values("year"))
                     st.markdown("**Full artist history**")
                     _display_df(history)
+
+                year_end_artist = load_year_end_for_artist(selected_artist, role_mode)
+                _render_year_end_history_table(
+                    year_end_artist,
+                    key_prefix=f"artist_year_end_{normalize_search_text(selected_artist)}_{normalize_search_text(role_mode)}",
+                    empty_message=f"No linked Year-End chart appearances for this {artist_role_config(role_mode)['label']} yet.",
+                )
     else:
         st.info("Type part of an artist name to load an artist history.")
 
@@ -10376,6 +11356,7 @@ def main() -> None:
         [
             "Full-text search",
             "Week browser",
+            "Year-End charts",
             "Canonical song history",
             "Artist history",
             "Chart Recap Generator",
@@ -10413,6 +11394,8 @@ def main() -> None:
 
     elif main_section == "Week browser":
         render_week_browser_tab()
+    elif main_section == "Year-End charts":
+        render_year_end_charts_tab()
     elif main_section == "Canonical song history":
         render_song_history_tab()
     elif main_section == "Artist history":
