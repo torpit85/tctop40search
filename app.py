@@ -11159,12 +11159,656 @@ def render_quick_seasonal_tables() -> None:
         st.caption("Songs that reached #1 during summer chart weeks.")
         _display_df(build_quick_summer_num1_songs(selected_year, limit))
 
+
+# -----------------------------------------------------------------------------
+# Quick tables: Records Sheet (current record holders only)
+# -----------------------------------------------------------------------------
+
+
+def _records_date(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except Exception:
+        text = "" if value is None else str(value).strip()
+        return text[:10] if text else "—"
+
+
+def _records_int(value: object) -> int | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        return int(round(float(value)))
+    except Exception:
+        return None
+
+
+def _records_weeks(value: object) -> str:
+    iv = _records_int(value)
+    if iv is None:
+        return "—"
+    return f"{iv:,} week" if iv == 1 else f"{iv:,} weeks"
+
+
+def _records_count(value: object) -> str:
+    iv = _records_int(value)
+    return "—" if iv is None else f"{iv:,}"
+
+
+def _records_move(value: object) -> str:
+    iv = _records_int(value)
+    return "—" if iv is None else f"{iv:+,} positions"
+
+
+def _records_positions(value: object) -> str:
+    iv = _records_int(value)
+    if iv is None:
+        return "—"
+    return f"{iv:,} position" if iv == 1 else f"{iv:,} positions"
+
+
+def _records_position(value: object) -> str:
+    iv = _records_int(value)
+    return "—" if iv is None else f"#{iv}"
+
+
+def _records_span(start_value: object, end_value: object | None = None) -> str:
+    start = _records_date(start_value)
+    end = _records_date(end_value) if end_value is not None else "—"
+    if end_value is None or end == "—" or start == end:
+        return start
+    if start == "—":
+        return end
+    return f"{start} – {end}"
+
+
+def _records_join_unique(values: Iterable[object], max_items: int = 4) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value).strip()
+        if not text or text == "—" or text in seen:
+            continue
+        out.append(text)
+        seen.add(text)
+    if not out:
+        return "—"
+    if len(out) > max_items:
+        return "; ".join(out[:max_items]) + f"; +{len(out) - max_items} more"
+    return "; ".join(out)
+
+
+def _records_song_holder(row: pd.Series | dict[str, object]) -> str:
+    song = str(row.get("Song", row.get("title", row.get("song", ""))) or "").strip()
+    artist = str(row.get("Artist", row.get("artist", "")) or "").strip()
+    if song and artist:
+        return f"{song} — {artist}"
+    return song or artist or "—"
+
+
+def _records_artist_holder(row: pd.Series | dict[str, object]) -> str:
+    return str(row.get("Artist", row.get("artist", "")) or "—").strip() or "—"
+
+
+def _records_chart_week_holder(row: pd.Series | dict[str, object]) -> str:
+    return _records_date(row.get("Chart Date", row.get("chart_date", "")))
+
+
+def _records_tied_rows(df: pd.DataFrame, value_col: str, highest: bool = True, require_positive: bool = True) -> tuple[pd.DataFrame, object]:
+    if df.empty or value_col not in df.columns:
+        return pd.DataFrame(), None
+    working = df.copy()
+    working["__record_value"] = pd.to_numeric(working[value_col], errors="coerce")
+    working = working.dropna(subset=["__record_value"])
+    if require_positive:
+        working = working.loc[working["__record_value"] > 0].copy()
+    if working.empty:
+        return pd.DataFrame(), None
+    target = working["__record_value"].max() if highest else working["__record_value"].min()
+    winners = working.loc[working["__record_value"].eq(target)].copy()
+    return winners, target
+
+
+def _records_append(
+    rows: list[dict[str, object]],
+    category: str,
+    record: str,
+    df: pd.DataFrame,
+    value_col: str,
+    holder_func,
+    value_func=_records_count,
+    date_func=None,
+    notes_func=None,
+    highest: bool = True,
+    require_positive: bool = True,
+) -> None:
+    winners, target = _records_tied_rows(df, value_col, highest=highest, require_positive=require_positive)
+    if winners.empty:
+        return
+    holder_text = _records_join_unique((holder_func(row) for _, row in winners.iterrows()))
+    date_text = _records_join_unique((date_func(row) for _, row in winners.iterrows())) if date_func else "—"
+    notes_text = _records_join_unique((notes_func(row) for _, row in winners.iterrows()), max_items=3) if notes_func else ""
+    if len(winners) > 1:
+        tie_note = f"Tied holders: {len(winners):,}"
+        notes_text = f"{notes_text}; {tie_note}" if notes_text and notes_text != "—" else tie_note
+    rows.append({
+        "Category": category,
+        "Record": record,
+        "Holder": holder_text,
+        "Value": value_func(target),
+        "Date / Span": date_text,
+        "Notes": notes_text or "—",
+        "Tied Holders": int(len(winners)),
+    })
+
+
+def _records_empty_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["Category", "Record", "Holder", "Value", "Date / Span", "Notes", "Tied Holders"])
+
+
+def _records_selected_categories(selected_category: str) -> set[str]:
+    categories = {"Songs", "Artists", "Movement", "Chart weeks", "Chart years"}
+    selected_category = (selected_category or "Songs").strip()
+    if selected_category == "All records":
+        return categories
+    if selected_category in categories:
+        return {selected_category}
+    return {"Songs"}
+
+
+def _records_first_top10_rows(chart: pd.DataFrame) -> pd.DataFrame:
+    if chart.empty:
+        return pd.DataFrame()
+    ordered = chart.sort_values(["song_key", "chart_date", "position", "entry_id"]).copy()
+    ordered["song_week_index"] = ordered.groupby("song_key", dropna=False).cumcount()
+    first_rows = (
+        ordered.drop_duplicates("song_key", keep="first")
+        [["song_key", "title", "artist", "chart_date", "position"]]
+        .rename(columns={
+            "title": "Song",
+            "artist": "Artist",
+            "chart_date": "Debut Date",
+            "position": "Debut Position",
+        })
+    )
+    first_top10 = (
+        ordered.loc[pd.to_numeric(ordered["position"], errors="coerce").le(10)]
+        .drop_duplicates("song_key", keep="first")
+        [["song_key", "chart_date", "position", "song_week_index"]]
+        .rename(columns={
+            "chart_date": "First Top 10 Week",
+            "position": "First Top 10 Position",
+            "song_week_index": "Weeks Before Top 10",
+        })
+    )
+    peaks = ordered.groupby("song_key", dropna=False)["position"].min().reset_index(name="Peak")
+    out = first_rows.merge(first_top10, on="song_key", how="inner").merge(peaks, on="song_key", how="left")
+    out = out.loc[pd.to_numeric(out["Weeks Before Top 10"], errors="coerce").gt(0)].copy()
+    return out
+
+
+def _records_song_run_rows(chart: pd.DataFrame, date_index: dict[pd.Timestamp, int]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return compact song-run summaries used by the Records Sheet.
+
+    This replaces several expensive leaderboard builders with a single pass per song.
+    """
+    separate_rows: list[dict[str, object]] = []
+    same_position_rows: list[dict[str, object]] = []
+    initial_run_rows: list[dict[str, object]] = []
+    gap_rows: list[dict[str, object]] = []
+
+    if chart.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    def _count_runs(flags: list[bool], idxs: list[int]) -> int:
+        runs = 0
+        in_run = False
+        prev_idx = None
+        for flag, cur_idx in zip(flags, idxs):
+            consecutive = prev_idx is not None and cur_idx == prev_idx + 1
+            if flag:
+                if not in_run or not consecutive:
+                    runs += 1
+                in_run = True
+            else:
+                in_run = False
+            prev_idx = cur_idx
+        return int(runs)
+
+    for _, g in chart.groupby("song_key", sort=False):
+        g = g.sort_values(["chart_date", "position", "entry_id"]).copy()
+        if g.empty:
+            continue
+        # Avoid leading-underscore column names here: pandas.itertuples() renames
+        # those attributes, so row.__idx is not available on some versions.
+        g["chart_index"] = pd.to_datetime(g["chart_date"], errors="coerce").map(date_index)
+        g = g.dropna(subset=["chart_index"])
+        if g.empty:
+            continue
+        g["chart_index"] = g["chart_index"].astype(int)
+
+        title = g["title"].iloc[0]
+        artist = g["artist"].iloc[0]
+        idxs = g["chart_index"].tolist()
+        positions = pd.to_numeric(g["position"], errors="coerce").astype(int).tolist()
+
+        top10_runs = _count_runs([p <= 10 for p in positions], idxs)
+        num1_runs = _count_runs([p == 1 for p in positions], idxs)
+        separate_rows.append({
+            "Song": title,
+            "Artist": artist,
+            "Top 10 Runs": top10_runs,
+            "#1 Runs": num1_runs,
+            "Top 10 Weeks": int((pd.to_numeric(g["position"], errors="coerce") <= 10).sum()),
+            "#1 Weeks": int((pd.to_numeric(g["position"], errors="coerce") == 1).sum()),
+            "Chart Weeks": int(len(g)),
+            "Peak": int(pd.to_numeric(g["position"], errors="coerce").min()),
+            "First Week": g["chart_date"].iloc[0],
+            "Last Week": g["chart_date"].iloc[-1],
+        })
+
+        # Initial run before the song's first gap/re-entry.
+        initial_len = 1
+        for prev_idx, cur_idx in zip(idxs, idxs[1:]):
+            if cur_idx == prev_idx + 1:
+                initial_len += 1
+            else:
+                break
+        initial_g = g.iloc[:initial_len]
+        initial_run_rows.append({
+            "Song": title,
+            "Artist": artist,
+            "Initial Run Weeks": int(initial_len),
+            "Initial Run Start": initial_g["chart_date"].iloc[0],
+            "Initial Run End": initial_g["chart_date"].iloc[-1],
+            "Initial Peak": int(pd.to_numeric(initial_g["position"], errors="coerce").min()),
+            "Returned After Initial Run": "Yes" if len(g) > initial_len else "No",
+        })
+
+        # Longest gap between consecutive appearances.
+        best_gap = 0
+        best_prev_date = None
+        best_return_date = None
+        for prev_idx, cur_idx, prev_date, cur_date in zip(idxs, idxs[1:], g["chart_date"].tolist(), g["chart_date"].tolist()[1:]):
+            gap = int(cur_idx - prev_idx - 1)
+            if gap > best_gap:
+                best_gap = gap
+                best_prev_date = prev_date
+                best_return_date = cur_date
+        if best_gap > 0:
+            gap_rows.append({
+                "Song": title,
+                "Artist": artist,
+                "Gap Weeks": int(best_gap),
+                "Previous Appearance": best_prev_date,
+                "Return Appearance": best_return_date,
+            })
+
+        # Total and consecutive weeks at the same position, computed in one scan.
+        total_by_position = pd.Series(positions).value_counts().to_dict()
+        best_by_position: dict[int, tuple[int, object, object]] = {}
+        cur_pos = None
+        cur_len = 0
+        cur_start = None
+        prev_idx = None
+        prev_date = None
+
+        def _finalize_position_run(pos: int | None, length: int, start: object, end: object) -> None:
+            if pos is None or length <= 0:
+                return
+            old = best_by_position.get(pos)
+            if old is None or length > old[0]:
+                best_by_position[pos] = (int(length), start, end)
+
+        for row in g.itertuples(index=False):
+            pos = _records_int(getattr(row, "position"))
+            cur_idx = int(getattr(row, "chart_index"))
+            cur_date = getattr(row, "chart_date")
+            if pos == cur_pos and prev_idx is not None and cur_idx == prev_idx + 1:
+                cur_len += 1
+            else:
+                _finalize_position_run(cur_pos, cur_len, cur_start, prev_date)
+                cur_pos = pos
+                cur_len = 1
+                cur_start = cur_date
+            prev_idx = cur_idx
+            prev_date = cur_date
+        _finalize_position_run(cur_pos, cur_len, cur_start, prev_date)
+
+        for pos, total_weeks in total_by_position.items():
+            best_len, streak_start, streak_end = best_by_position.get(int(pos), (0, None, None))
+            same_position_rows.append({
+                "Song": title,
+                "Artist": artist,
+                "Position": int(pos),
+                "Weeks at Position": int(total_weeks),
+                "Consecutive Weeks at Position": int(best_len),
+                "Streak Start": streak_start,
+                "Streak End": streak_end,
+                "Chart Weeks": int(len(g)),
+                "Peak": int(pd.to_numeric(g["position"], errors="coerce").min()),
+            })
+
+    return pd.DataFrame(separate_rows), pd.DataFrame(same_position_rows), pd.DataFrame(initial_run_rows), pd.DataFrame(gap_rows)
+
+
+def _records_artist_streak_rows(artist_presence: pd.DataFrame, count_col: str, record_col: str, date_index: dict[pd.Timestamp, int]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    if artist_presence.empty or count_col not in artist_presence.columns:
+        return pd.DataFrame(rows)
+
+    for artist_key, g in artist_presence.groupby("artist_key", dropna=True, sort=False):
+        g = g.sort_values(["chart_date", "artist"]).copy()
+        best = cur = 0
+        cur_start = best_start = best_end = None
+        prev_date = None
+        max_entries_in_streak = 0
+        best_max_entries = 0
+        for row in g.itertuples(index=False):
+            cur_date = pd.to_datetime(getattr(row, "chart_date"))
+            qualifies = int(getattr(row, count_col, 0) or 0) > 0
+            consecutive = prev_date is not None and date_index.get(cur_date) == date_index.get(prev_date, -999) + 1
+            if qualifies:
+                if cur > 0 and consecutive:
+                    cur += 1
+                else:
+                    cur = 1
+                    cur_start = cur_date
+                    max_entries_in_streak = 0
+                max_entries_in_streak = max(max_entries_in_streak, int(getattr(row, count_col, 0) or 0))
+                if cur > best:
+                    best = cur
+                    best_start = cur_start
+                    best_end = cur_date
+                    best_max_entries = max_entries_in_streak
+            else:
+                cur = 0
+                cur_start = None
+                max_entries_in_streak = 0
+            prev_date = cur_date
+        if best > 0:
+            artist_vals = g["artist"].dropna().astype(str)
+            fallback_artist = artist_vals.mode().iloc[0] if not artist_vals.empty else str(artist_key)
+            rows.append({
+                "Artist": preferred_artist_display(artist_key, fallback_artist),
+                record_col: int(best),
+                "Start": best_start,
+                "End": best_end,
+                "Max Entries in Streak": int(best_max_entries),
+            })
+    return pd.DataFrame(rows)
+
+
+def _records_artist_num1_reigns_rows(chart: pd.DataFrame, date_index: dict[pd.Timestamp, int]) -> pd.DataFrame:
+    """Compute artists with the most 2+ week #1 song reigns without invoking Chart Feats."""
+    if chart.empty:
+        return pd.DataFrame()
+    num1 = chart.loc[pd.to_numeric(chart["position"], errors="coerce").eq(1)].copy()
+    if num1.empty:
+        return pd.DataFrame()
+    credits = build_artist_credit_rows(num1)
+    if credits.empty:
+        return pd.DataFrame()
+    credits = credits.drop_duplicates(subset=["artist_key", "song_key", "chart_date"]).copy()
+    credits["chart_date"] = pd.to_datetime(credits["chart_date"], errors="coerce")
+    credits = credits.dropna(subset=["chart_date", "artist_key", "song_key"])
+    if credits.empty:
+        return pd.DataFrame()
+
+    artist_names = (
+        credits.groupby("artist_key", dropna=True)["artist"]
+        .agg(lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else "")
+        .to_dict()
+    )
+    stats: dict[str, dict[str, object]] = {}
+
+    for (artist_key, song_key), g in credits.groupby(["artist_key", "song_key"], dropna=True):
+        g = g.sort_values("chart_date").copy()
+        dates = g["chart_date"].tolist()
+        if not dates:
+            continue
+        cur_len = 0
+        cur_start = None
+        prev_date = None
+
+        def _finalize(length: int, start: object, end: object) -> None:
+            if length < 2:
+                return
+            rec = stats.setdefault(str(artist_key), {
+                "Artist": preferred_artist_display(artist_key, artist_names.get(artist_key, str(artist_key))),
+                "2+ Week #1 Reigns": 0,
+                "Longest #1 Reign": 0,
+                "Total Weeks in 2+ Week Reigns": 0,
+                "Latest 2+ Week Reign": "—",
+                "__latest_end": pd.Timestamp.min,
+            })
+            rec["2+ Week #1 Reigns"] = int(rec["2+ Week #1 Reigns"]) + 1
+            rec["Longest #1 Reign"] = max(int(rec["Longest #1 Reign"]), int(length))
+            rec["Total Weeks in 2+ Week Reigns"] = int(rec["Total Weeks in 2+ Week Reigns"]) + int(length)
+            end_ts = pd.to_datetime(end)
+            if end_ts > rec["__latest_end"]:
+                rec["__latest_end"] = end_ts
+                rec["Latest 2+ Week Reign"] = _records_span(start, end)
+
+        for cur_date in dates:
+            consecutive = prev_date is not None and date_index.get(cur_date) == date_index.get(prev_date, -999) + 1
+            if cur_len > 0 and consecutive:
+                cur_len += 1
+            else:
+                _finalize(cur_len, cur_start, prev_date)
+                cur_len = 1
+                cur_start = cur_date
+            prev_date = cur_date
+        _finalize(cur_len, cur_start, prev_date)
+
+    if not stats:
+        return pd.DataFrame()
+    out = pd.DataFrame(stats.values()).drop(columns=["__latest_end"], errors="ignore")
+    return out
+
+
+def _records_weekly_summary_fast(chart: pd.DataFrame) -> pd.DataFrame:
+    if chart.empty:
+        return pd.DataFrame()
+    df = chart.copy()
+    for col in ["is_debut", "is_reentry", "dropped_out_next_week", "is_up", "is_down", "is_hold", "entered_top10_this_week"]:
+        if col not in df.columns:
+            df[col] = False
+        df[col] = df[col].fillna(False).astype(bool)
+    grouped = df.groupby("chart_date", dropna=False)
+    out = grouped.agg(
+        year=("year", "first"),
+        month=("month", "first"),
+        debuts=("is_debut", "sum"),
+        reentries=("is_reentry", "sum"),
+        dropouts=("dropped_out_next_week", "sum"),
+        upward_movers=("is_up", "sum"),
+        downward_movers=("is_down", "sum"),
+        holds=("is_hold", "sum"),
+        top10_churn=("entered_top10_this_week", "sum"),
+    ).reset_index()
+    for col in ["debuts", "reentries", "dropouts", "upward_movers", "downward_movers", "holds", "top10_churn"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0).astype(int)
+    out["turnover_total"] = out["debuts"] + out["reentries"] + out["dropouts"]
+    return out.sort_values("chart_date")
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_quick_records_sheet(selected_category: str = "Songs") -> pd.DataFrame:
+    selected_categories = _records_selected_categories(selected_category)
+    rows: list[dict[str, object]] = []
+
+    chart = load_analytics_base().copy()
+    if chart.empty:
+        return _records_empty_df()
+
+    chart["chart_date"] = pd.to_datetime(chart["chart_date"], errors="coerce")
+    chart = chart.dropna(subset=["chart_date"])
+    if chart.empty:
+        return _records_empty_df()
+
+    date_index = _available_date_index(chart)
+    songs = pd.DataFrame()
+
+    if "Songs" in selected_categories:
+        songs = build_song_summary(chart).copy()
+        if not songs.empty:
+            for col in ["first_chart_date", "last_chart_date", "peak_date"]:
+                if col in songs.columns:
+                    songs[col] = pd.to_datetime(songs[col], errors="coerce")
+
+            song_date_span = lambda r: _records_span(r.get("first_chart_date"), r.get("last_chart_date"))
+            song_peak_note = lambda r: f"Peak {_records_position(r.get('peak_position'))}; first week {_records_date(r.get('first_chart_date'))}"
+            _records_append(rows, "Songs", "Most weeks charted", songs, "total_chart_weeks", _records_song_holder, _records_weeks, song_date_span, song_peak_note)
+            _records_append(rows, "Songs", "Most weeks at #1", songs, "num1_weeks", _records_song_holder, _records_weeks, lambda r: _records_date(r.get("peak_date")), lambda r: f"Chart weeks: {_records_count(r.get('total_chart_weeks'))}")
+            _records_append(rows, "Songs", "Longest consecutive #1 run", songs, "longest_consecutive_num1_run", _records_song_holder, _records_weeks, lambda r: _records_date(r.get("peak_date")), lambda r: f"Total #1 weeks: {_records_count(r.get('num1_weeks'))}")
+            _records_append(rows, "Songs", "Most Top 5 weeks", songs, "top5_weeks", _records_song_holder, _records_weeks, song_date_span, lambda r: f"Peak {_records_position(r.get('peak_position'))}")
+            _records_append(rows, "Songs", "Most Top 10 weeks", songs, "top10_weeks", _records_song_holder, _records_weeks, song_date_span, lambda r: f"Peak {_records_position(r.get('peak_position'))}")
+            _records_append(rows, "Songs", "Longest consecutive Top 10 run", songs, "longest_consecutive_top10_run", _records_song_holder, _records_weeks, song_date_span, lambda r: f"Total Top 10 weeks: {_records_count(r.get('top10_weeks'))}")
+            _records_append(rows, "Songs", "Most re-entries", songs, "reentry_count", _records_song_holder, _records_count, song_date_span, lambda r: f"Chart weeks: {_records_count(r.get('total_chart_weeks'))}")
+
+            num1_wait = songs.loc[pd.to_numeric(songs.get("peak_position"), errors="coerce").eq(1)].copy()
+            _records_append(rows, "Songs", "Most weeks before hitting #1", num1_wait, "weeks_to_peak", _records_song_holder, _records_weeks, lambda r: _records_date(r.get("peak_date")), lambda r: f"Debuted {_records_position(r.get('debut_position'))} on {_records_date(r.get('first_chart_date'))}")
+
+            no_num1 = songs.loc[pd.to_numeric(songs.get("peak_position"), errors="coerce").gt(1)].copy()
+            _records_append(rows, "Songs", "Longest-running song without reaching #1", no_num1, "total_chart_weeks", _records_song_holder, _records_weeks, song_date_span, lambda r: f"Peak {_records_position(r.get('peak_position'))}")
+            no_top10 = songs.loc[pd.to_numeric(songs.get("peak_position"), errors="coerce").gt(10)].copy()
+            _records_append(rows, "Songs", "Longest-running song without reaching Top 10", no_top10, "total_chart_weeks", _records_song_holder, _records_weeks, song_date_span, lambda r: f"Peak {_records_position(r.get('peak_position'))}")
+
+        first_top10 = _records_first_top10_rows(chart)
+        _records_append(rows, "Songs", "Most weeks before hitting Top 10", first_top10, "Weeks Before Top 10", _records_song_holder, _records_weeks, lambda r: _records_span(r.get("Debut Date"), r.get("First Top 10 Week")), lambda r: f"Debuted {_records_position(r.get('Debut Position'))}; peak {_records_position(r.get('Peak'))}")
+
+        separate_runs, same_position_rows, initial_runs, gap_rows = _records_song_run_rows(chart, date_index)
+        _records_append(rows, "Songs", "Longest initial chart run", initial_runs, "Initial Run Weeks", _records_song_holder, _records_weeks, lambda r: _records_span(r.get("Initial Run Start"), r.get("Initial Run End")), lambda r: f"Initial peak {_records_position(r.get('Initial Peak'))}; returned later: {r.get('Returned After Initial Run', '—')}")
+        _records_append(rows, "Songs", "Longest gap between appearances", gap_rows, "Gap Weeks", _records_song_holder, _records_weeks, lambda r: _records_span(r.get("Previous Appearance"), r.get("Return Appearance")), lambda r: "Between consecutive chart appearances")
+        _records_append(rows, "Songs", "Most separate Top 10 runs", separate_runs, "Top 10 Runs", _records_song_holder, _records_count, lambda r: _records_span(r.get("First Week"), r.get("Last Week")), lambda r: f"Top 10 weeks: {_records_count(r.get('Top 10 Weeks'))}; peak {_records_position(r.get('Peak'))}")
+        _records_append(rows, "Songs", "Most separate #1 runs", separate_runs, "#1 Runs", _records_song_holder, _records_count, lambda r: _records_span(r.get("First Week"), r.get("Last Week")), lambda r: f"#1 weeks: {_records_count(r.get('#1 Weeks'))}")
+        _records_append(rows, "Songs", "Most weeks at the same position", same_position_rows, "Weeks at Position", _records_song_holder, _records_weeks, lambda r: _records_position(r.get("Position")), lambda r: f"Position {_records_position(r.get('Position'))}; chart weeks: {_records_count(r.get('Chart Weeks'))}")
+        _records_append(rows, "Songs", "Most consecutive weeks at the same position", same_position_rows, "Consecutive Weeks at Position", _records_song_holder, _records_weeks, lambda r: _records_span(r.get("Streak Start"), r.get("Streak End")), lambda r: f"Position {_records_position(r.get('Position'))}")
+
+    if "Movement" in selected_categories:
+        valid_moves = chart.loc[chart["move"].notna()].copy()
+        if not valid_moves.empty:
+            _records_append(rows, "Movement", "Biggest single-week climb", valid_moves, "move", _records_song_holder, _records_move, lambda r: _records_date(r.get("chart_date")), lambda r: f"{_records_position(r.get('last_week_position'))} → {_records_position(r.get('position'))}")
+            _records_append(rows, "Movement", "Biggest single-week fall", valid_moves, "move", _records_song_holder, _records_move, lambda r: _records_date(r.get("chart_date")), lambda r: f"{_records_position(r.get('last_week_position'))} → {_records_position(r.get('position'))}", highest=False, require_positive=False)
+            gains_to_num1 = valid_moves.loc[valid_moves["position"].eq(1) & valid_moves["last_week_position"].gt(1)].copy()
+            if not gains_to_num1.empty:
+                gains_to_num1["Gain to #1"] = pd.to_numeric(gains_to_num1["last_week_position"], errors="coerce") - 1
+            _records_append(rows, "Movement", "Biggest gain to #1", gains_to_num1, "Gain to #1", _records_song_holder, _records_move, lambda r: _records_date(r.get("chart_date")), lambda r: f"{_records_position(r.get('last_week_position'))} → #1")
+            falls_from_num1 = valid_moves.loc[valid_moves["last_week_position"].eq(1) & valid_moves["position"].gt(1)].copy()
+            if not falls_from_num1.empty:
+                falls_from_num1["Fall from #1"] = pd.to_numeric(falls_from_num1["position"], errors="coerce") - 1
+            _records_append(rows, "Movement", "Biggest fall from #1", falls_from_num1, "Fall from #1", _records_song_holder, _records_positions, lambda r: _records_date(r.get("chart_date")), lambda r: f"#1 → {_records_position(r.get('position'))}")
+
+        if "dropped_out_next_week" in chart.columns:
+            dropouts = chart.loc[chart["dropped_out_next_week"].fillna(False)].copy()
+        else:
+            dropouts = pd.DataFrame()
+        if not dropouts.empty:
+            chart_size = chart.groupby("chart_date", dropna=False)["position"].max().rename("chart_size")
+            dropouts["chart_size"] = dropouts["chart_date"].map(chart_size)
+            dropouts["Drop"] = pd.to_numeric(dropouts["chart_size"], errors="coerce") + 1 - pd.to_numeric(dropouts["position"], errors="coerce")
+            _records_append(rows, "Movement", "Biggest drop off the chart", dropouts, "Drop", _records_song_holder, _records_positions, lambda r: _records_span(r.get("chart_date"), r.get("next_chart_date")), lambda r: f"Final on-chart position: {_records_position(r.get('position'))}")
+
+    if "Artists" in selected_categories:
+        if songs.empty:
+            songs = build_song_summary(chart).copy()
+        artist_credits = build_artist_credit_rows(chart)
+        artist_presence = build_artist_weekly_presence(artist_credits)
+        artists = build_artist_summary(artist_credits, songs, artist_presence) if not artist_credits.empty else pd.DataFrame()
+
+        if not artists.empty:
+            artist_span = lambda r: _records_span(r.get("first_chart_date"), r.get("last_chart_date"))
+            _records_append(rows, "Artists", "Most #1 songs", artists, "num1_hits", _records_artist_holder, _records_count, lambda r: str(r.get("num1_date_range", "—") or "—"), lambda r: f"Total #1 weeks: {_records_count(r.get('total_num1_weeks'))}")
+            _records_append(rows, "Artists", "Most Top 5 hits", artists, "top5_hits", _records_artist_holder, _records_count, artist_span, lambda r: f"#1 songs: {_records_count(r.get('num1_hits'))}")
+            _records_append(rows, "Artists", "Most Top 10 hits", artists, "top10_hits", _records_artist_holder, _records_count, artist_span, lambda r: f"#1 songs: {_records_count(r.get('num1_hits'))}")
+            _records_append(rows, "Artists", "Most chart entries", artists, "distinct_songs", _records_artist_holder, _records_count, artist_span, lambda r: f"Chart weeks: {_records_count(r.get('total_chart_weeks'))}")
+            _records_append(rows, "Artists", "Most cumulative chart weeks", artists, "total_chart_weeks", _records_artist_holder, _records_weeks, artist_span, lambda r: f"Distinct songs: {_records_count(r.get('distinct_songs'))}")
+            _records_append(rows, "Artists", "Most cumulative weeks at #1", artists, "total_num1_weeks", _records_artist_holder, _records_weeks, lambda r: str(r.get("num1_date_range", "—") or "—"), lambda r: f"#1 songs: {_records_count(r.get('num1_hits'))}")
+            _records_append(rows, "Artists", "Most cumulative Top 10 weeks", artists, "total_top10_weeks", _records_artist_holder, _records_weeks, artist_span, lambda r: f"Top 10 hits: {_records_count(r.get('top10_hits'))}")
+            _records_append(rows, "Artists", "Most simultaneous chart entries", artists, "max_simultaneous_entries", _records_artist_holder, _records_count, lambda r: _records_date(r.get("week_of_max_simultaneous_entries")), lambda r: "Songs on one chart week")
+
+        if not artist_presence.empty:
+            _records_append(rows, "Artists", "Most simultaneous Top 10 entries", artist_presence, "entries_top10", _records_artist_holder, _records_count, lambda r: _records_date(r.get("chart_date")), lambda r: "Songs in the Top 10 on one chart week")
+            _records_append(rows, "Artists", "Most simultaneous Top 5 entries", artist_presence, "entries_top5", _records_artist_holder, _records_count, lambda r: _records_date(r.get("chart_date")), lambda r: "Songs in the Top 5 on one chart week")
+            artist_chart_streaks = _records_artist_streak_rows(artist_presence, "entries_on_chart", "Streak Weeks", date_index)
+            _records_append(rows, "Artists", "Longest consecutive weeks with a charted song", artist_chart_streaks, "Streak Weeks", _records_artist_holder, _records_weeks, lambda r: _records_span(r.get("Start"), r.get("End")), lambda r: f"Max entries during streak: {_records_count(r.get('Max Entries in Streak'))}")
+            artist_top10_streaks = _records_artist_streak_rows(artist_presence, "entries_top10", "Streak Weeks", date_index)
+            _records_append(rows, "Artists", "Longest consecutive weeks with a Top 10 song", artist_top10_streaks, "Streak Weeks", _records_artist_holder, _records_weeks, lambda r: _records_span(r.get("Start"), r.get("End")), lambda r: f"Max Top 10 entries during streak: {_records_count(r.get('Max Entries in Streak'))}")
+            artist_num1_streaks = _records_artist_streak_rows(artist_presence, "entries_num1", "Streak Weeks", date_index)
+            _records_append(rows, "Artists", "Longest consecutive weeks with a #1 song", artist_num1_streaks, "Streak Weeks", _records_artist_holder, _records_weeks, lambda r: _records_span(r.get("Start"), r.get("End")), lambda r: f"Max #1 entries during streak: {_records_count(r.get('Max Entries in Streak'))}")
+
+        artist_reigns = _records_artist_num1_reigns_rows(chart, date_index)
+        _records_append(rows, "Artists", "Most 2+ week #1 reigns", artist_reigns, "2+ Week #1 Reigns", _records_artist_holder, _records_count, lambda r: str(r.get("Latest 2+ Week Reign", "—") or "—"), lambda r: f"Longest reign: {_records_weeks(r.get('Longest #1 Reign'))}; total weeks in 2+ week reigns: {_records_count(r.get('Total Weeks in 2+ Week Reigns'))}")
+
+    if "Chart weeks" in selected_categories:
+        weekly = _records_weekly_summary_fast(chart)
+        if not weekly.empty:
+            weekly_display = weekly.copy()
+            weekly_display["Chart Date"] = weekly_display["chart_date"]
+            _records_append(rows, "Chart weeks", "Most debuts in one week", weekly_display, "debuts", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: f"Re-entries: {_records_count(r.get('reentries'))}; dropouts: {_records_count(r.get('dropouts'))}")
+            _records_append(rows, "Chart weeks", "Most re-entries in one week", weekly_display, "reentries", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: f"Debuts: {_records_count(r.get('debuts'))}; dropouts: {_records_count(r.get('dropouts'))}")
+            _records_append(rows, "Chart weeks", "Most dropouts in one week", weekly_display, "dropouts", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: f"Debuts: {_records_count(r.get('debuts'))}; re-entries: {_records_count(r.get('reentries'))}")
+            _records_append(rows, "Chart weeks", "Largest Top 10 turnover", weekly_display, "top10_churn", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: f"Total turnover: {_records_count(r.get('turnover_total'))}")
+            _records_append(rows, "Chart weeks", "Most songs gaining", weekly_display, "upward_movers", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: f"Songs falling: {_records_count(r.get('downward_movers'))}; holds: {_records_count(r.get('holds'))}")
+            _records_append(rows, "Chart weeks", "Most songs falling", weekly_display, "downward_movers", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: f"Songs gaining: {_records_count(r.get('upward_movers'))}; holds: {_records_count(r.get('holds'))}")
+            _records_append(rows, "Chart weeks", "Most unchanged songs", weekly_display, "holds", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: f"Songs gaining: {_records_count(r.get('upward_movers'))}; songs falling: {_records_count(r.get('downward_movers'))}")
+
+        top10_debuts = chart.loc[chart["is_debut"].fillna(False) & chart["position"].le(10)].groupby("chart_date", dropna=False).size().reset_index(name="Top 10 Debuts")
+        top10_debuts = top10_debuts.rename(columns={"chart_date": "Chart Date"})
+        _records_append(rows, "Chart weeks", "Most Top 10 debuts in one week", top10_debuts, "Top 10 Debuts", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: "Debuts inside the Top 10")
+
+        total_movement = chart.loc[chart["abs_move"].notna()].groupby("chart_date", dropna=False)["abs_move"].sum().reset_index(name="Total Movement")
+        total_movement = total_movement.rename(columns={"chart_date": "Chart Date"})
+        _records_append(rows, "Chart weeks", "Largest total movement", total_movement, "Total Movement", _records_chart_week_holder, _records_count, lambda r: _records_date(r.get("Chart Date")), lambda r: "Sum of absolute position changes")
+
+    if "Chart years" in selected_categories:
+        num1_by_year = (
+            chart.loc[chart["position"].eq(1)]
+            .groupby("year", dropna=False)["song_key"]
+            .nunique()
+            .reset_index(name="#1 Songs")
+            .rename(columns={"year": "Year"})
+        )
+        _records_append(rows, "Chart years", "Most songs reaching #1 in a year", num1_by_year, "#1 Songs", lambda r: str(_records_int(r.get("Year")) or "—"), _records_count, lambda r: str(_records_int(r.get("Year")) or "—"), lambda r: "Distinct #1 songs in the calendar year")
+
+    if not rows:
+        return _records_empty_df()
+
+    out = pd.DataFrame(rows)
+    category_order = {"Songs": 0, "Artists": 1, "Movement": 2, "Chart weeks": 3, "Chart years": 4}
+    out["__category_order"] = out["Category"].map(category_order).fillna(99).astype(int)
+    out["__record_order"] = range(len(out))
+    out = out.sort_values(["__category_order", "__record_order"]).drop(columns=["__category_order", "__record_order"]).reset_index(drop=True)
+    return out[["Category", "Record", "Holder", "Value", "Date / Span", "Notes", "Tied Holders"]]
+
+
+def render_quick_records_sheet() -> None:
+    st.markdown("**Records Sheet**")
+    st.caption("Current record holders only. Choose a category first for faster loading; All records is available but does the most work.")
+    categories = ["Songs", "Artists", "Movement", "Chart weeks", "Chart years", "All records"]
+    selected_category = st.radio(
+        "Record category",
+        categories,
+        horizontal=True,
+        key="quick_records_sheet_category",
+    )
+    records = build_quick_records_sheet(selected_category)
+    if records.empty:
+        st.info("No records are available yet.")
+        return
+
+    st.write(f"{len(records):,} current record(s)")
+    _display_df(records)
+
 def render_special_tables_tab() -> None:
     st.subheader("Quick tables")
     subsection = st.selectbox(
         "Section",
         [
             "Hits & milestones",
+            "Records sheet",
             "Movement",
             "Artists",
             "Seasonal",
@@ -11174,7 +11818,10 @@ def render_special_tables_tab() -> None:
         key="quick_tables_section",
     )
 
-    if subsection == "Hits & milestones":
+    if subsection == "Records sheet":
+        render_quick_records_sheet()
+
+    elif subsection == "Hits & milestones":
         table_kind = st.selectbox(
             "View",
             ["#1 hits", "Top 10 hits"],
