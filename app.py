@@ -2382,6 +2382,350 @@ def _longest_presence_run(chart_dates: pd.Series, ordered_dates: list[pd.Timesta
     return max(best, cur)
 
 
+
+TRAJECTORY_VERSION = "1.0"
+TRAJECTORY_WIND_THRESHOLD = 5
+TRAJECTORY_TIMING_WEIGHT = 0.50
+TRAJECTORY_PATH_WEIGHT = 0.30
+TRAJECTORY_REVIVAL_WEIGHT = 0.20
+
+
+def _format_signed_score(value: object) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+        return f"{float(value):+.1f}"
+    except Exception:
+        return "—"
+
+
+def _trajectory_timing_label(score: object) -> str:
+    try:
+        value = float(score)
+    except Exception:
+        return "Unknown"
+    if value >= 8:
+        return "Immediate peak"
+    if value >= 3:
+        return "Early peak"
+    if value > -3:
+        return "Median-timed peak"
+    if value > -8:
+        return "Late peak"
+    return "Deep slow burn"
+
+
+def _career_trajectory_label(score: object) -> str:
+    try:
+        value = float(score)
+    except Exception:
+        return "Unknown"
+    if value >= 7:
+        return "Dominant trajectory"
+    if value >= 3:
+        return "Strong trajectory"
+    if value > -3:
+        return "Mixed / balanced"
+    if value > -7:
+        return "Slow / uneven"
+    return "Deep slow burn"
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_trajectory_benchmark() -> dict[str, object]:
+    """Return the all-history median song run used to anchor Trajectory Score v1."""
+    if not Path(DB_PATH).exists():
+        return {"median_weeks": 10.0, "song_count": 0, "version": TRAJECTORY_VERSION}
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        rows = conn.execute(
+            """
+            SELECT COUNT(DISTINCT chart_week_id) AS chart_weeks
+            FROM entry
+            GROUP BY
+                CASE
+                    WHEN canonical_song_id IS NOT NULL THEN 'cs:' || canonical_song_id
+                    WHEN COALESCE(TRIM(normalized_song_title), '') <> ''
+                     AND COALESCE(TRIM(normalized_full_artist), '') <> ''
+                    THEN LOWER(TRIM(REPLACE(normalized_song_title, '.', '')))
+                      || '||'
+                      || LOWER(TRIM(REPLACE(normalized_full_artist, '.', '')))
+                    ELSE 'entry:' || entry_id
+                END
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    values = pd.Series([int(row[0]) for row in rows if row and row[0] is not None], dtype="float64")
+    median_weeks = float(values.median()) if not values.empty else 10.0
+    if not math.isfinite(median_weeks) or median_weeks < 2:
+        median_weeks = 10.0
+    return {
+        "median_weeks": median_weeks,
+        "song_count": int(len(values)),
+        "version": TRAJECTORY_VERSION,
+    }
+
+
+def _peak_timing_score(peak_chart_week: object, median_weeks: object) -> float:
+    """Map debut-week peak to +10, the median run week to 0, and ~2x median to -10."""
+    peak_week = max(1, _safe_int(peak_chart_week) or 1)
+    try:
+        benchmark = max(2.0, float(median_weeks))
+    except Exception:
+        benchmark = 10.0
+    score = 10.0 - 10.0 * (peak_week - 1.0) / (benchmark - 1.0)
+    return round(max(-10.0, min(10.0, score)), 1)
+
+
+def _trajectory_path_quality_from_positions(positions: list[float], median_weeks: float) -> tuple[float, float]:
+    """Score directional consistency, rank-point balance, and time retained near the career peak."""
+    if not positions:
+        return 0.0, 0.0
+    movements = [positions[idx - 1] - positions[idx] for idx in range(1, len(positions))]
+    gains = [move for move in movements if move > 0]
+    losses = [-move for move in movements if move < 0]
+
+    directional_denominator = len(gains) + len(losses)
+    directional_balance = (
+        (len(gains) - len(losses)) / directional_denominator
+        if directional_denominator
+        else 0.0
+    )
+    gain_points = float(sum(gains))
+    loss_points = float(sum(losses))
+    point_denominator = gain_points + loss_points
+    point_balance = (
+        (gain_points - loss_points) / point_denominator
+        if point_denominator
+        else 0.0
+    )
+    peak_position = min(positions)
+    near_peak_share = sum(position <= peak_position + 5 for position in positions) / len(positions)
+    near_peak_balance = 2.0 * near_peak_share - 1.0
+
+    raw_score = 10.0 * (
+        0.40 * directional_balance
+        + 0.40 * point_balance
+        + 0.20 * near_peak_balance
+    )
+    # Shrink tiny samples toward neutral until a song has roughly a median-length run.
+    confidence = min(1.0, max(0.0, (len(positions) - 1.0) / max(1.0, median_weeks - 1.0)))
+    score = max(-10.0, min(10.0, raw_score * confidence))
+    return round(score, 1), round(confidence, 3)
+
+
+def _trajectory_path_quality_score(history: pd.DataFrame, median_weeks: float) -> tuple[float, float]:
+    positions = [
+        float(value)
+        for value in pd.to_numeric(history.get("position", pd.Series(dtype="float64")), errors="coerce").dropna().tolist()
+    ]
+    return _trajectory_path_quality_from_positions(positions, median_weeks)
+
+
+def _ordinal(value: int) -> str:
+    if 10 <= value % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+    return f"{value}{suffix}"
+
+
+def _trajectory_wind_events_from_lists(
+    positions: list[float],
+    chart_dates: list[pd.Timestamp],
+    reentries: list[bool],
+    threshold: int = TRAJECTORY_WIND_THRESHOLD,
+) -> list[dict[str, object]]:
+    """Detect non-overlapping later winds from already ordered song-history lists."""
+    if len(positions) < 3:
+        return []
+    state = "looking"
+    local_peak_pos = positions[0]
+    career_best = positions[0]
+    trough_idx: int | None = None
+    trough_pos: float | None = None
+    wind_best_idx: int | None = None
+    wind_best_pos: float | None = None
+    started_with_reentry = False
+    events: list[dict[str, object]] = []
+
+    def _finish_event() -> None:
+        nonlocal career_best
+        if trough_idx is None or trough_pos is None or wind_best_idx is None or wind_best_pos is None:
+            return
+        gain = float(trough_pos - wind_best_pos)
+        if gain < threshold:
+            return
+        new_career_peak = bool(wind_best_pos < career_best)
+        gain_component = 7.0 * min(gain, 30.0) / 30.0
+        score = min(
+            10.0,
+            gain_component
+            + (2.0 if new_career_peak else 0.0)
+            + (1.0 if started_with_reentry else 0.0),
+        )
+        event_number = len(events) + 2
+        events.append({
+            "wind_number": event_number,
+            "wind_label": f"{_ordinal(event_number)} wind",
+            "start_chart_date": chart_dates[trough_idx],
+            "start_position": int(round(trough_pos)),
+            "peak_chart_date": chart_dates[wind_best_idx],
+            "peak_position": int(round(wind_best_pos)),
+            "positions_recovered": int(round(gain)),
+            "weeks_to_wind_peak": int(wind_best_idx - trough_idx),
+            "new_career_peak": new_career_peak,
+            "reentry_revival": bool(started_with_reentry),
+            "revival_score": round(score, 1),
+        })
+        career_best = min(career_best, wind_best_pos)
+
+    for idx in range(1, len(positions)):
+        position = positions[idx]
+        is_reentry = reentries[idx] if idx < len(reentries) else False
+        if state == "looking":
+            if position < local_peak_pos:
+                local_peak_pos = position
+                career_best = min(career_best, position)
+            elif is_reentry or position - local_peak_pos >= threshold:
+                state = "decline"
+                trough_idx = idx
+                trough_pos = position
+                started_with_reentry = is_reentry
+        elif state == "decline":
+            if trough_pos is None or position > trough_pos:
+                trough_idx = idx
+                trough_pos = position
+            started_with_reentry = started_with_reentry or is_reentry
+            if trough_pos is not None and trough_pos - position >= threshold:
+                state = "wind"
+                wind_best_idx = idx
+                wind_best_pos = position
+        else:  # wind
+            if wind_best_pos is None or position < wind_best_pos:
+                wind_best_idx = idx
+                wind_best_pos = position
+            elif is_reentry or position - wind_best_pos >= threshold:
+                _finish_event()
+                state = "decline"
+                local_peak_pos = wind_best_pos if wind_best_pos is not None else position
+                trough_idx = idx
+                trough_pos = position
+                wind_best_idx = None
+                wind_best_pos = None
+                started_with_reentry = is_reentry
+
+    if state == "wind":
+        _finish_event()
+    return events
+
+
+def _trajectory_wind_events(history: pd.DataFrame, threshold: int = TRAJECTORY_WIND_THRESHOLD) -> list[dict[str, object]]:
+    """Detect non-overlapping second/third winds after a meaningful decline and recovery."""
+    if history.empty or "position" not in history.columns:
+        return []
+    sort_columns = ["chart_date", "position"] + (["entry_id"] if "entry_id" in history.columns else [])
+    g = history.copy().sort_values(sort_columns).reset_index(drop=True)
+    g["position"] = pd.to_numeric(g["position"], errors="coerce")
+    g["chart_date"] = pd.to_datetime(g["chart_date"], errors="coerce")
+    g = g.dropna(subset=["position", "chart_date"]).reset_index(drop=True)
+    positions = [float(value) for value in g["position"].tolist()]
+    chart_dates = g["chart_date"].tolist()
+    reentries = g.get("is_reentry", pd.Series(False, index=g.index)).fillna(False).astype(bool).tolist()
+    return _trajectory_wind_events_from_lists(positions, chart_dates, reentries, threshold)
+
+
+def _trajectory_status(last_chart_date: object, latest_chart_date: object) -> str:
+    try:
+        return "Provisional — active" if pd.to_datetime(last_chart_date) == pd.to_datetime(latest_chart_date) else "Inactive"
+    except Exception:
+        return "Unknown"
+
+
+def build_trajectory_summary(df_chart: pd.DataFrame, median_weeks: float) -> pd.DataFrame:
+    """Build all-history Peak Timing and Career Trajectory scores by canonical/fallback song identity."""
+    if df_chart.empty:
+        return pd.DataFrame()
+    sort_columns = ["song_key", "chart_date", "position"] + (["entry_id"] if "entry_id" in df_chart.columns else [])
+    ordered = df_chart.sort_values(sort_columns).copy()
+    ordered["chart_date"] = pd.to_datetime(ordered["chart_date"], errors="coerce")
+    ordered["position"] = pd.to_numeric(ordered["position"], errors="coerce")
+    ordered = ordered.dropna(subset=["song_key", "chart_date", "position"])
+    if ordered.empty:
+        return pd.DataFrame()
+    latest_chart_date = ordered["chart_date"].max()
+    rows: list[dict[str, object]] = []
+
+    for song_key, g in ordered.groupby("song_key", sort=False):
+        positions = [float(value) for value in g["position"].tolist()]
+        chart_dates = g["chart_date"].tolist()
+        reentries = g.get("is_reentry", pd.Series(False, index=g.index)).fillna(False).astype(bool).tolist()
+        peak_position_value = min(positions)
+        peak_idx = positions.index(peak_position_value)
+        peak_position = int(round(peak_position_value))
+        peak_chart_week = peak_idx + 1
+        timing_score = _peak_timing_score(peak_chart_week, median_weeks)
+        path_score, path_confidence = _trajectory_path_quality_from_positions(positions, median_weeks)
+        wind_events = _trajectory_wind_events_from_lists(positions, chart_dates, reentries)
+        wind_scores = [float(event["revival_score"]) for event in wind_events]
+        best_wind_score = max(wind_scores, default=0.0)
+        multiple_wind_bonus = min(2.0, 0.5 * max(0, len(wind_events) - 1))
+        revival_score = round(min(10.0, best_wind_score + multiple_wind_bonus), 1)
+        career_score = round(max(-10.0, min(10.0,
+            TRAJECTORY_TIMING_WEIGHT * timing_score
+            + TRAJECTORY_PATH_WEIGHT * path_score
+            + TRAJECTORY_REVIVAL_WEIGHT * revival_score
+        )), 1)
+        best_event = max(wind_events, key=lambda event: float(event["revival_score"]), default=None)
+        canonical_values = g["canonical_song_id"].dropna() if "canonical_song_id" in g.columns else pd.Series(dtype="float64")
+        rows.append({
+            "song_key": song_key,
+            "canonical_song_id": canonical_values.iloc[0] if not canonical_values.empty else pd.NA,
+            "title": g["title"].iloc[0],
+            "artist": g["artist"].iloc[0],
+            "first_chart_date": chart_dates[0],
+            "last_chart_date": chart_dates[-1],
+            "total_chart_weeks": int(len(positions)),
+            "peak_position": peak_position,
+            "peak_date": chart_dates[peak_idx],
+            "peak_chart_week": int(peak_chart_week),
+            "peak_timing_score": timing_score,
+            "peak_timing_type": _trajectory_timing_label(timing_score),
+            "path_quality_score": path_score,
+            "path_confidence": path_confidence,
+            "wind_count": int(len(wind_events)),
+            "new_peak_wind_count": int(sum(bool(event["new_career_peak"]) for event in wind_events)),
+            "reentry_wind_count": int(sum(bool(event["reentry_revival"]) for event in wind_events)),
+            "best_revival_score": round(best_wind_score, 1),
+            "revival_score": revival_score,
+            "best_wind_gain": int(best_event["positions_recovered"]) if best_event else 0,
+            "best_wind_start_date": best_event["start_chart_date"] if best_event else pd.NaT,
+            "best_wind_peak_date": best_event["peak_chart_date"] if best_event else pd.NaT,
+            "career_trajectory_score": career_score,
+            "career_trajectory_type": _career_trajectory_label(career_score),
+            "trajectory_status": _trajectory_status(chart_dates[-1], latest_chart_date),
+            "trajectory_version": TRAJECTORY_VERSION,
+            "trajectory_median_weeks": float(median_weeks),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_trajectory_summary() -> pd.DataFrame:
+    benchmark = load_trajectory_benchmark()
+    return build_trajectory_summary(load_analytics_base(), float(benchmark["median_weeks"]))
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_song_wind_events(song_key: str) -> pd.DataFrame:
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+    history = chart.loc[chart["song_key"].eq(song_key)].copy()
+    events = _trajectory_wind_events(history)
+    return pd.DataFrame(events)
+
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_song_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
     if df_chart.empty:
@@ -2425,6 +2769,7 @@ def build_song_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
             "avg_abs_move": float(g["abs_move"].dropna().mean()) if not g["abs_move"].dropna().empty else float('nan'),
             "reentry_count": int(g["is_reentry"].sum()),
             "weeks_to_peak": int(peak_seq),
+            "peak_chart_week": int(peak_seq + 1),
             "post_peak_weeks": int(len(g) - peak_seq - 1),
             "peaked_on_debut": bool(int(g["position"].iloc[0]) == peak_position),
             "returned_after_exit": bool(g["is_reentry"].sum() > 0),
@@ -2824,6 +3169,26 @@ DISPLAY_COLUMN_SHORT_NAMES = {
     "Negative Weeks": "-Wks",
     "Momentum Impact Weeks": "Impact Wks",
     "Greatest Gainer Weeks": "Gainer Wks",
+
+    # Trajectory columns
+    "peak_chart_week": "Peak Wk",
+    "Peak Chart Week": "Peak Wk",
+    "peak_timing_score": "Peak Timing",
+    "Peak Timing Score": "Peak Timing",
+    "peak_timing_type": "Timing Type",
+    "path_quality_score": "Path",
+    "Path Quality Score": "Path",
+    "wind_count": "Winds",
+    "Wind Count": "Winds",
+    "new_peak_wind_count": "New-Peak Winds",
+    "reentry_wind_count": "RE Winds",
+    "best_revival_score": "Best Revival",
+    "revival_score": "Revival",
+    "best_wind_gain": "Best Wind Gain",
+    "career_trajectory_score": "Career Traj",
+    "Career Trajectory Score": "Career Traj",
+    "career_trajectory_type": "Career Type",
+    "trajectory_status": "Status",
 
     # Raw Momentum expander columns
     "Raw Position Score": "Pos Score",
@@ -4129,6 +4494,21 @@ def _render_longevity(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     if songs.empty:
         st.info("No song-summary rows available for the selected filters.")
         return
+
+    trajectory_all = load_trajectory_summary()
+    trajectory = trajectory_all.loc[trajectory_all["song_key"].isin(set(songs["song_key"].tolist()))].copy() if not trajectory_all.empty else pd.DataFrame()
+    trajectory_columns = [
+        "song_key", "peak_chart_week", "peak_timing_score", "peak_timing_type",
+        "path_quality_score", "path_confidence", "wind_count", "new_peak_wind_count",
+        "reentry_wind_count", "best_revival_score", "revival_score", "best_wind_gain",
+        "best_wind_start_date", "best_wind_peak_date", "career_trajectory_score",
+        "career_trajectory_type", "trajectory_status", "trajectory_version",
+        "trajectory_median_weeks",
+    ]
+    if not trajectory.empty:
+        songs = songs.drop(columns=[c for c in trajectory_columns if c != "song_key" and c in songs.columns], errors="ignore")
+        songs = songs.merge(trajectory[[c for c in trajectory_columns if c in trajectory.columns]], on="song_key", how="left")
+
     render_kpis([
         ("Avg run length", f"{songs['total_chart_weeks'].mean():.2f}"),
         ("Median run length", f"{songs['total_chart_weeks'].median():.2f}"),
@@ -4164,9 +4544,79 @@ def _render_longevity(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         st.markdown("**Most re-entries**")
         _display_df(songs.sort_values(["reentry_count", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "reentry_count", "total_chart_weeks", "peak_position"])
         st.markdown("**Longest climb to peak**")
-        _display_df(songs.sort_values(["weeks_to_peak", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "debut_position", "peak_position", "weeks_to_peak", "total_chart_weeks"])
+        _display_df(songs.sort_values(["weeks_to_peak", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "debut_position", "peak_position", "peak_chart_week", "weeks_to_peak", "total_chart_weeks"])
         st.markdown("**Longest post-peak survival**")
         _display_df(songs.sort_values(["post_peak_weeks", "total_chart_weeks"], ascending=[False, False]).head(top_n), ["title", "artist", "peak_position", "peak_date", "post_peak_weeks", "total_chart_weeks"])
+
+    st.divider()
+    st.markdown("### Trajectory")
+    benchmark = load_trajectory_benchmark()
+    benchmark_weeks = float(benchmark.get("median_weeks") or 10.0)
+    benchmark_label = f"{benchmark_weeks:g} weeks"
+    st.caption(
+        f"Trajectory Score v{benchmark.get('version', TRAJECTORY_VERSION)} uses the all-history median run of {benchmark_label} across "
+        f"{int(benchmark.get('song_count') or 0):,} songs. Peak Timing is +10 for a debut-week peak, 0 when the peak arrives in the median run week, "
+        "and bottoms at -10 near twice the median. Career Trajectory = 50% Peak Timing + 30% Path Quality + 20% Revival."
+    )
+
+    if trajectory.empty:
+        st.info("No all-history trajectory rows matched the selected Analytics filters.")
+    else:
+        render_kpis([
+            ("Median benchmark", benchmark_label),
+            ("Avg peak timing", _format_signed_score(trajectory["peak_timing_score"].mean())),
+            ("Median career trajectory", _format_signed_score(trajectory["career_trajectory_score"].median())),
+            ("Songs with another wind", int(trajectory["wind_count"].gt(0).sum())),
+            ("Songs with 2+ later winds", int(trajectory["wind_count"].ge(2).sum())),
+            ("Active / provisional", int(trajectory["trajectory_status"].eq("Provisional — active").sum())),
+        ])
+
+        tc1, tc2 = st.columns(2)
+        with tc1:
+            st.markdown("**Peak Timing Score distribution**")
+            timing_hist = trajectory.assign(score_bucket=trajectory["peak_timing_score"].round(0).astype("Int64")).groupby("score_bucket", dropna=True).size().rename("count").reset_index()
+            st.bar_chart(timing_hist.set_index("score_bucket")[["count"]], width="stretch")
+            st.markdown("**Highest Career Trajectory Scores**")
+            high = trajectory.sort_values(["career_trajectory_score", "peak_timing_score", "total_chart_weeks"], ascending=[False, False, False]).head(top_n).copy()
+            for col in ["career_trajectory_score", "peak_timing_score", "path_quality_score", "revival_score"]:
+                high[col] = high[col].map(_format_signed_score)
+            _display_df(high, ["title", "artist", "career_trajectory_score", "career_trajectory_type", "peak_timing_score", "path_quality_score", "revival_score", "wind_count", "total_chart_weeks", "trajectory_status"])
+        with tc2:
+            st.markdown("**Career Trajectory Score distribution**")
+            career_hist = trajectory.assign(score_bucket=trajectory["career_trajectory_score"].round(0).astype("Int64")).groupby("score_bucket", dropna=True).size().rename("count").reset_index()
+            st.bar_chart(career_hist.set_index("score_bucket")[["count"]], width="stretch")
+            st.markdown("**Deepest slow burns by Peak Timing**")
+            slow = trajectory.sort_values(["peak_timing_score", "peak_chart_week", "total_chart_weeks"], ascending=[True, False, False]).head(top_n).copy()
+            for col in ["peak_timing_score", "career_trajectory_score", "path_quality_score", "revival_score"]:
+                slow[col] = slow[col].map(_format_signed_score)
+            _display_df(slow, ["title", "artist", "peak_position", "peak_chart_week", "peak_timing_score", "career_trajectory_score", "wind_count", "total_chart_weeks"])
+
+        wt1, wt2 = st.columns(2)
+        with wt1:
+            st.markdown("**Most second / third winds**")
+            winds = trajectory.loc[trajectory["wind_count"].gt(0)].sort_values(["wind_count", "best_revival_score", "total_chart_weeks"], ascending=[False, False, False]).head(top_n).copy()
+            winds["best_revival_score"] = winds["best_revival_score"].map(_format_signed_score)
+            winds["career_trajectory_score"] = winds["career_trajectory_score"].map(_format_signed_score)
+            _display_df(winds, ["title", "artist", "wind_count", "new_peak_wind_count", "reentry_wind_count", "best_wind_gain", "best_revival_score", "career_trajectory_score", "total_chart_weeks"])
+        with wt2:
+            st.markdown("**Strongest revival components**")
+            revivals = trajectory.loc[trajectory["wind_count"].gt(0)].sort_values(["revival_score", "best_wind_gain", "wind_count"], ascending=[False, False, False]).head(top_n).copy()
+            for col in ["revival_score", "best_revival_score", "career_trajectory_score"]:
+                revivals[col] = revivals[col].map(_format_signed_score)
+            _display_df(revivals, ["title", "artist", "revival_score", "best_revival_score", "best_wind_gain", "wind_count", "best_wind_start_date", "best_wind_peak_date", "career_trajectory_score"])
+
+        with st.expander("How Trajectory Score v1 is calculated"):
+            st.markdown(
+                """
+- **Peak Timing Score:** `clip(10 - 10 × (peak chart week - 1) ÷ (median run - 1), -10, +10)`.
+- **Path Quality:** combines the balance of gaining versus declining weeks, rank points gained versus lost, and the share of the run spent within five positions of the song's peak. Very short runs are shrunk toward zero until they approach the median run length.
+- **Another wind:** requires a decline of at least five positions followed by a recovery of at least five positions. Re-entry revivals and winds that create a new career peak receive extra credit.
+- **Revival Score:** uses the strongest detected wind plus a small capped bonus for additional winds.
+- **Career Trajectory:** `0.50 × Peak Timing + 0.30 × Path Quality + 0.20 × Revival`.
+- Scores for songs on the latest chart are marked **Provisional — active** because a later peak or revival can change the career result.
+                """
+            )
+
     song_options = songs.sort_values(["artist", "title"])
     labels = {f"{row.title} — {row.artist}": row.song_key for row in song_options.itertuples(index=False)}
     if labels:
@@ -4174,14 +4624,47 @@ def _render_longevity(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
         selected = st.selectbox("Choose a song", list(labels.keys()), key="analytics_song_profile")
         key = labels[selected]
         row = songs.loc[songs["song_key"] == key].iloc[0]
-        render_kpis([
+        trajectory_row = trajectory.loc[trajectory["song_key"].eq(key)].iloc[0] if not trajectory.empty and trajectory["song_key"].eq(key).any() else None
+
+        latest_momentum = None
+        momentum_history = load_momentum_index_base()
+        selected_momentum = momentum_history.loc[momentum_history["song_key"].eq(key)].sort_values("chart_date") if not momentum_history.empty else pd.DataFrame()
+        if not selected_momentum.empty:
+            latest_momentum = selected_momentum.iloc[-1]
+
+        kpis = [
             ("Debut", _fmt_rank(row["debut_position"])),
             ("Peak", _fmt_rank(row["peak_position"])),
             ("Weeks", int(row["total_chart_weeks"])),
             ("Top 10 weeks", int(row["top10_weeks"])),
             ("#1 weeks", int(row["num1_weeks"])),
             ("Re-entries", int(row["reentry_count"])),
-        ])
+        ]
+        render_kpis(kpis)
+
+        if trajectory_row is not None:
+            render_kpis([
+                ("Career Trajectory", _format_signed_score(trajectory_row["career_trajectory_score"])),
+                ("Peak Timing", _format_signed_score(trajectory_row["peak_timing_score"])),
+                ("Path Quality", _format_signed_score(trajectory_row["path_quality_score"])),
+                ("Revival", _format_signed_score(trajectory_row["revival_score"])),
+                ("Later winds", int(trajectory_row["wind_count"])),
+                ("Latest Weekly Momentum", f"{float(latest_momentum['raw_momentum_index']):.1f}" if latest_momentum is not None and pd.notna(latest_momentum.get("raw_momentum_index")) else "—"),
+            ])
+            st.caption(
+                f"{trajectory_row['career_trajectory_type']} · {trajectory_row['peak_timing_type']} · "
+                f"Peak first reached in chart week {int(trajectory_row['peak_chart_week'])} · {trajectory_row['trajectory_status']}"
+            )
+
+            wind_events = load_song_wind_events(key)
+            if not wind_events.empty:
+                st.markdown("**Detected second / third winds**")
+                wind_display = wind_events.copy()
+                wind_display["revival_score"] = wind_display["revival_score"].map(_format_signed_score)
+                _display_df(wind_display, ["wind_label", "start_chart_date", "start_position", "peak_chart_date", "peak_position", "positions_recovered", "weeks_to_wind_peak", "new_career_peak", "reentry_revival", "revival_score"])
+            else:
+                st.caption("No later wind met the five-position decline-and-recovery rule.")
+
         history = chart.loc[chart["song_key"] == key, ["chart_date", "position", "last_week_position", "move", "weeks_on_chart", "derived_marker"]].copy().sort_values("chart_date")
         if not history.empty:
             st.line_chart((-history.set_index("chart_date")[["position"]]).rename(columns={"position": "inverted_position"}), width="stretch")
