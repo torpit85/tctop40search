@@ -2383,8 +2383,9 @@ def _longest_presence_run(chart_dates: pd.Series, ordered_dates: list[pd.Timesta
 
 
 
-TRAJECTORY_VERSION = "1.0"
-TRAJECTORY_WIND_THRESHOLD = 5
+TRAJECTORY_VERSION = "1.1"
+TRAJECTORY_WIND_DECLINE_THRESHOLD = 15
+TRAJECTORY_WIND_RECOVERY_THRESHOLD = 10
 TRAJECTORY_TIMING_WEIGHT = 0.50
 TRAJECTORY_PATH_WEIGHT = 0.30
 TRAJECTORY_REVIVAL_WEIGHT = 0.20
@@ -2433,7 +2434,7 @@ def _career_trajectory_label(score: object) -> str:
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def load_trajectory_benchmark() -> dict[str, object]:
-    """Return the all-history median song run used to anchor Trajectory Score v1."""
+    """Return the all-history median song run used to anchor the current Trajectory Score version."""
     if not Path(DB_PATH).exists():
         return {"median_weeks": 10.0, "song_count": 0, "version": TRAJECTORY_VERSION}
     conn = sqlite3.connect(str(DB_PATH))
@@ -2535,9 +2536,10 @@ def _trajectory_wind_events_from_lists(
     positions: list[float],
     chart_dates: list[pd.Timestamp],
     reentries: list[bool],
-    threshold: int = TRAJECTORY_WIND_THRESHOLD,
+    decline_threshold: int = TRAJECTORY_WIND_DECLINE_THRESHOLD,
+    recovery_threshold: int = TRAJECTORY_WIND_RECOVERY_THRESHOLD,
 ) -> list[dict[str, object]]:
-    """Detect non-overlapping later winds from already ordered song-history lists."""
+    """Detect non-overlapping later winds after a 15-position decline and 10-position recovery."""
     if len(positions) < 3:
         return []
     state = "looking"
@@ -2555,7 +2557,7 @@ def _trajectory_wind_events_from_lists(
         if trough_idx is None or trough_pos is None or wind_best_idx is None or wind_best_pos is None:
             return
         gain = float(trough_pos - wind_best_pos)
-        if gain < threshold:
+        if gain < recovery_threshold:
             return
         new_career_peak = bool(wind_best_pos < career_best)
         gain_component = 7.0 * min(gain, 30.0) / 30.0
@@ -2588,7 +2590,7 @@ def _trajectory_wind_events_from_lists(
             if position < local_peak_pos:
                 local_peak_pos = position
                 career_best = min(career_best, position)
-            elif is_reentry or position - local_peak_pos >= threshold:
+            elif position - local_peak_pos >= decline_threshold:
                 state = "decline"
                 trough_idx = idx
                 trough_pos = position
@@ -2598,7 +2600,7 @@ def _trajectory_wind_events_from_lists(
                 trough_idx = idx
                 trough_pos = position
             started_with_reentry = started_with_reentry or is_reentry
-            if trough_pos is not None and trough_pos - position >= threshold:
+            if trough_pos is not None and trough_pos - position >= recovery_threshold:
                 state = "wind"
                 wind_best_idx = idx
                 wind_best_pos = position
@@ -2606,7 +2608,7 @@ def _trajectory_wind_events_from_lists(
             if wind_best_pos is None or position < wind_best_pos:
                 wind_best_idx = idx
                 wind_best_pos = position
-            elif is_reentry or position - wind_best_pos >= threshold:
+            elif position - wind_best_pos >= decline_threshold:
                 _finish_event()
                 state = "decline"
                 local_peak_pos = wind_best_pos if wind_best_pos is not None else position
@@ -2621,8 +2623,12 @@ def _trajectory_wind_events_from_lists(
     return events
 
 
-def _trajectory_wind_events(history: pd.DataFrame, threshold: int = TRAJECTORY_WIND_THRESHOLD) -> list[dict[str, object]]:
-    """Detect non-overlapping second/third winds after a meaningful decline and recovery."""
+def _trajectory_wind_events(
+    history: pd.DataFrame,
+    decline_threshold: int = TRAJECTORY_WIND_DECLINE_THRESHOLD,
+    recovery_threshold: int = TRAJECTORY_WIND_RECOVERY_THRESHOLD,
+) -> list[dict[str, object]]:
+    """Detect non-overlapping second/third winds after a 15-position decline and 10-position recovery."""
     if history.empty or "position" not in history.columns:
         return []
     sort_columns = ["chart_date", "position"] + (["entry_id"] if "entry_id" in history.columns else [])
@@ -2633,7 +2639,7 @@ def _trajectory_wind_events(history: pd.DataFrame, threshold: int = TRAJECTORY_W
     positions = [float(value) for value in g["position"].tolist()]
     chart_dates = g["chart_date"].tolist()
     reentries = g.get("is_reentry", pd.Series(False, index=g.index)).fillna(False).astype(bool).tolist()
-    return _trajectory_wind_events_from_lists(positions, chart_dates, reentries, threshold)
+    return _trajectory_wind_events_from_lists(positions, chart_dates, reentries, decline_threshold, recovery_threshold)
 
 
 def _trajectory_status(last_chart_date: object, latest_chart_date: object) -> str:
@@ -4605,12 +4611,12 @@ def _render_longevity(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
                 revivals[col] = revivals[col].map(_format_signed_score)
             _display_df(revivals, ["title", "artist", "revival_score", "best_revival_score", "best_wind_gain", "wind_count", "best_wind_start_date", "best_wind_peak_date", "career_trajectory_score"])
 
-        with st.expander("How Trajectory Score v1 is calculated"):
+        with st.expander(f"How Trajectory Score v{benchmark.get('version', TRAJECTORY_VERSION)} is calculated"):
             st.markdown(
                 """
 - **Peak Timing Score:** `clip(10 - 10 × (peak chart week - 1) ÷ (median run - 1), -10, +10)`.
 - **Path Quality:** combines the balance of gaining versus declining weeks, rank points gained versus lost, and the share of the run spent within five positions of the song's peak. Very short runs are shrunk toward zero until they approach the median run length.
-- **Another wind:** requires a decline of at least five positions followed by a recovery of at least five positions. Re-entry revivals and winds that create a new career peak receive extra credit.
+- **Another wind:** requires a decline of at least 15 positions from a local peak followed by a recovery of at least 10 positions from the subsequent trough. Re-entry revivals and winds that create a new career peak receive extra credit.
 - **Revival Score:** uses the strongest detected wind plus a small capped bonus for additional winds.
 - **Career Trajectory:** `0.50 × Peak Timing + 0.30 × Path Quality + 0.20 × Revival`.
 - Scores for songs on the latest chart are marked **Provisional — active** because a later peak or revival can change the career result.
@@ -4663,7 +4669,7 @@ def _render_longevity(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
                 wind_display["revival_score"] = wind_display["revival_score"].map(_format_signed_score)
                 _display_df(wind_display, ["wind_label", "start_chart_date", "start_position", "peak_chart_date", "peak_position", "positions_recovered", "weeks_to_wind_peak", "new_career_peak", "reentry_revival", "revival_score"])
             else:
-                st.caption("No later wind met the five-position decline-and-recovery rule.")
+                st.caption("No later wind met the 15-position decline and 10-position recovery rule.")
 
         history = chart.loc[chart["song_key"] == key, ["chart_date", "position", "last_week_position", "move", "weeks_on_chart", "derived_marker"]].copy().sort_values("chart_date")
         if not history.empty:
