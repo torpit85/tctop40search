@@ -2395,6 +2395,226 @@ TRAJECTORY_PATH_WEIGHT = 0.30
 TRAJECTORY_REVIVAL_WEIGHT = 0.20
 
 
+
+# -----------------------------------------------------------------------------
+# Experimental Trajectory-Momentum Composite (TMC) v0.1
+# -----------------------------------------------------------------------------
+TMC_VERSION = "0.1"
+TMC_MOMENTUM_WEIGHT = 0.60
+TMC_TRAJECTORY_WEIGHT = 0.40
+TMC_WINDOW_WEEKS = 6
+TMC_MIN_HISTORY = 3
+
+
+def _tmc_recent_trajectory_score(group: pd.DataFrame) -> float:
+    """Return a 0-100 short-term trajectory score for one song at one chart week.
+
+    The score is intentionally separate from the existing Career Trajectory score.
+    It uses only recent chart-path information and is designed for the experimental
+    TMC ranking. Short histories are shrunk toward the neutral midpoint (50).
+    """
+    if group.empty:
+        return 50.0
+
+    g = group.sort_values("chart_date").tail(TMC_WINDOW_WEEKS).copy()
+    pos = pd.to_numeric(g["position"], errors="coerce")
+    moves = pd.to_numeric(g["move"], errors="coerce")
+    valid = pos.notna()
+    g = g.loc[valid].copy()
+    pos = pd.to_numeric(g["position"], errors="coerce")
+    moves = pd.to_numeric(g["move"], errors="coerce")
+    if len(g) < 2:
+        return 50.0
+
+    # Higher strength = better rank. Recent rank direction is therefore positive
+    # when the song is climbing. Scale a six-week endpoint gain to a bounded signal.
+    strength = 41.0 - pos
+    x = pd.Series(range(len(g)), index=g.index, dtype=float)
+    if len(g) >= 3:
+        slope = float(pd.Series(strength, index=g.index).cov(x) / x.var()) if x.var() else 0.0
+    else:
+        slope = float(strength.iloc[-1] - strength.iloc[0])
+    trend_component = 50.0 + max(-50.0, min(50.0, slope * 12.0))
+
+    actual_moves = moves.dropna()
+    nonzero_moves = actual_moves[actual_moves != 0]
+    consistency = 50.0
+    if not nonzero_moves.empty:
+        gain_share = float((nonzero_moves > 0).mean())
+        consistency = gain_share * 100.0
+        # Holds are neutral rather than negative for trajectory consistency.
+        if len(actual_moves) > 0:
+            hold_share = float((actual_moves == 0).mean())
+            consistency = consistency * (1.0 - 0.25 * hold_share) + 50.0 * 0.25 * hold_share
+
+    # Acceleration compares the latest two movements with the preceding movements.
+    accel_component = 50.0
+    if len(actual_moves) >= 4:
+        recent = float(actual_moves.tail(2).mean())
+        prior = float(actual_moves.iloc[-4:-2].mean())
+        accel_component = 50.0 + max(-50.0, min(50.0, (recent - prior) * 5.0))
+    elif len(actual_moves) >= 3:
+        recent = float(actual_moves.tail(1).mean())
+        prior = float(actual_moves.iloc[-3:-1].mean())
+        accel_component = 50.0 + max(-50.0, min(50.0, (recent - prior) * 5.0))
+
+    # Zone progression rewards actual conversion into stronger chart territory.
+    zone_bonus = 0.0
+    zone_thresholds = (30, 20, 10)
+    if len(pos) >= 2:
+        start_pos = float(pos.iloc[0])
+        end_pos = float(pos.iloc[-1])
+        for threshold in zone_thresholds:
+            if start_pos > threshold >= end_pos:
+                zone_bonus += {30: 6.0, 20: 8.0, 10: 10.0}[threshold]
+            elif start_pos <= threshold and end_pos <= threshold:
+                zone_bonus += {30: 1.5, 20: 2.0, 10: 2.5}[threshold]
+
+    raw = (
+        0.45 * trend_component
+        + 0.25 * consistency
+        + 0.20 * accel_component
+        + 0.10 * min(100.0, 50.0 + zone_bonus * 4.0)
+    )
+
+    # Confidence shrink: two/three appearances should not overwhelm an established
+    # trajectory. Six appearances receive full weight.
+    confidence = min(1.0, max(0.35, (len(g) - 1) / 5.0))
+    return round(50.0 + (raw - 50.0) * confidence, 2)
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_tmc_index_base() -> pd.DataFrame:
+    """Build the experimental TMC inputs from the existing Momentum Index base."""
+    momentum = load_momentum_index_base()
+    if momentum.empty:
+        return momentum
+
+    df = momentum.copy().sort_values(["song_key", "chart_date", "position", "entry_id"]).reset_index(drop=True)
+    # Preserve the existing run structure: a re-entry/debut starts a fresh short-term
+    # trajectory. This prevents an old disconnected run from contaminating the current one.
+    run_start = df["is_debut"].fillna(False) | df["is_reentry"].fillna(False)
+    first_in_song = df.groupby("song_key", dropna=False).cumcount().eq(0)
+    run_start = run_start | first_in_song
+    df["tmc_run_id"] = run_start.groupby(df["song_key"], dropna=False).cumsum()
+
+    # The first prototype recomputed the entire trajectory history for every row.
+    # That made TMC disproportionately expensive at startup. Keep the same score
+    # definition, but only retain the rolling six-week window needed for each row.
+    df["short_trajectory_score"] = 50.0
+    for (_, _run_id), group in df.groupby(["song_key", "tmc_run_id"], sort=False, dropna=False):
+        group = group.sort_values(["chart_date", "position", "entry_id"])
+        idxs = group.index.to_list()
+        scores: list[float] = []
+        for i in range(len(idxs)):
+            start = max(0, i - TMC_WINDOW_WEEKS + 1)
+            history = group.iloc[start:i + 1]
+            scores.append(_tmc_recent_trajectory_score(history))
+        df.loc[idxs, "short_trajectory_score"] = scores
+    df["short_trajectory_score"] = pd.to_numeric(df["short_trajectory_score"], errors="coerce").fillna(50.0)
+    df["tmc_score"] = (
+        TMC_MOMENTUM_WEIGHT * df["normalized_momentum_index"]
+        + TMC_TRAJECTORY_WEIGHT * df["short_trajectory_score"]
+    ).round(1)
+
+    df["tmc_rank"] = (
+        df.groupby("chart_date")["tmc_score"]
+        .rank(method="min", ascending=False)
+        .astype("Int64")
+    )
+    df["tmc_rank_delta_vs_chart"] = (df["position"] - df["tmc_rank"]).astype("Int64")
+
+    def _tmc_label(score: object) -> str:
+        try:
+            value = float(score)
+        except Exception:
+            return "Neutral"
+        if value >= 85:
+            return "Very Hot"
+        if value >= 70:
+            return "Hot"
+        if value >= 55:
+            return "Building"
+        if value >= 45:
+            return "Stable"
+        if value >= 30:
+            return "Cooling"
+        return "Cold"
+
+    df["tmc_status"] = df["tmc_score"].map(_tmc_label)
+    return df.sort_values(["chart_date", "tmc_rank", "position", "entry_id"]).reset_index(drop=True)
+
+
+def render_tmc_tab() -> None:
+    st.subheader(f"Trajectory-Momentum Composite (TMC) — Prototype {TMC_VERSION}")
+    st.caption(
+        "Experimental alternate Top 40 ranking. It combines the existing weekly Normalized Momentum Index "
+        "with a short-term trajectory score; it does not modify the existing Momentum Index or Career Trajectory systems."
+    )
+
+    with st.expander("How TMC Prototype 0.1 is calculated", expanded=False):
+        st.markdown(
+            f"""
+**TMC Score** = `{TMC_MOMENTUM_WEIGHT:.2f} × Normalized Momentum Index + {TMC_TRAJECTORY_WEIGHT:.2f} × Short-Term Trajectory`
+
+**Short-Term Trajectory** uses up to the last **{TMC_WINDOW_WEEKS} chart appearances in the current run** and combines:
+- recent directional slope
+- gain/loss consistency
+- acceleration or deceleration
+- progression through the Top 30 / Top 20 / Top 10 zones
+
+Short histories are shrunk toward a neutral score of 50 so a two-week sample cannot overwhelm a developed trajectory.
+
+This is intentionally a **chart-health / trend composite**, not a forecast model.
+            """
+        )
+
+    tmc = load_tmc_index_base()
+    if tmc.empty:
+        st.info("No TMC rows are available.")
+        return
+
+    dates = [d.strftime("%Y-%m-%d") for d in sorted(tmc["chart_date"].dropna().unique(), reverse=True)]
+    selected_date = st.selectbox("Chart week", dates, index=0, key="tmc_chart_week")
+    week = tmc.loc[tmc["chart_date"].dt.strftime("%Y-%m-%d") == selected_date].copy()
+    week = week.sort_values(["tmc_score", "position", "entry_id"], ascending=[False, True, True]).reset_index(drop=True)
+
+    cols = st.columns(4)
+    if not week.empty:
+        leader = week.iloc[0]
+        hottest = week.sort_values("short_trajectory_score", ascending=False).iloc[0]
+        biggest_up = week.sort_values("tmc_rank_delta_vs_chart", ascending=False).iloc[0]
+        biggest_down = week.sort_values("tmc_rank_delta_vs_chart", ascending=True).iloc[0]
+        cols[0].metric("TMC #1", f"{leader['title']} — {leader['artist']}", f"{leader['tmc_score']:.1f}")
+        cols[1].metric("Strongest Trajectory", f"{hottest['title']} — {hottest['artist']}", f"{hottest['short_trajectory_score']:.1f}")
+        cols[2].metric("Biggest TMC Lift", f"{biggest_up['title']} — {biggest_up['artist']}", f"+{int(biggest_up['tmc_rank_delta_vs_chart'])} places")
+        delta = int(biggest_down['tmc_rank_delta_vs_chart'])
+        cols[3].metric("Biggest TMC Drop", f"{biggest_down['title']} — {biggest_down['artist']}", f"{delta} places")
+
+    display = week[[
+        "tmc_rank", "position", "title", "artist", "tmc_score", "normalized_momentum_index",
+        "short_trajectory_score", "tmc_rank_delta_vs_chart", "tmc_status", "move", "weeks_on_chart",
+    ]].copy()
+    display = display.rename(columns={
+        "tmc_rank": "TMC Rank",
+        "position": "TC Rank",
+        "title": "Song",
+        "artist": "Artist",
+        "tmc_score": "TMC Score",
+        "normalized_momentum_index": "Norm. MI",
+        "short_trajectory_score": "Trajectory",
+        "tmc_rank_delta_vs_chart": "TMC vs TC",
+        "tmc_status": "Status",
+        "move": "Movement",
+        "weeks_on_chart": "Weeks",
+    })
+    display["Movement"] = display["Movement"].apply(_format_movement)
+    display["TMC vs TC"] = display["TMC vs TC"].map(lambda v: f"{int(v):+d}" if pd.notna(v) else "—")
+    for col in ["TMC Score", "Norm. MI", "Trajectory"]:
+        display[col] = display[col].map(lambda v: "—" if pd.isna(v) else f"{float(v):.1f}")
+    _display_df(display)
+
+
 def _format_signed_score(value: object) -> str:
     try:
         if value is None or pd.isna(value):
@@ -12572,6 +12792,7 @@ def main() -> None:
             "Weekly Top Artists",
             "Chart Dominance",
             "Momentum Index",
+            "TMC Prototype",
             "Forecast Lab",
             "Forecast Lab Scorecard",
             "Admin",
@@ -12620,6 +12841,8 @@ def main() -> None:
         render_chart_dominance_tab()
     elif main_section == "Momentum Index":
         render_momentum_index_tab()
+    elif main_section == "TMC Prototype":
+        render_tmc_tab()
     elif main_section == "Forecast Lab":
         render_forecast_lab_tab()
     elif main_section == "Forecast Lab Scorecard":
