@@ -3072,6 +3072,97 @@ def build_song_summary(df_chart: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+ONE_HIT_WONDER_TOP20_MIN_WEEKS = 20
+ONE_HIT_WONDER_BOTTOM40_MIN_WEEKS = 5
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_one_hit_wonders(artist_credit_mode: str = "Lead", wonder_type: str = "Strict one-hit wonder") -> pd.DataFrame:
+    """Return artists matching the selected TC Top 40 one-hit-wonder definition.
+
+    Hit qualification:
+      - Peak #1-#20: at least 20 weeks on chart.
+      - Peak #21-#40: at least 5 weeks on chart.
+
+    Strict one-hit wonder: exactly one distinct TC Top 40 song, and that song
+    qualifies as a hit.
+
+    One qualifying hit: exactly one distinct qualifying hit; additional
+    non-qualifying TC Top 40 songs are allowed.
+    """
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+
+    credits = build_artist_credit_rows(chart)
+    if credits.empty:
+        return pd.DataFrame()
+
+    credit_mode = artist_credit_mode if artist_credit_mode in {"All", "Lead", "Featured"} else "Lead"
+    if credit_mode in {"Lead", "Featured"}:
+        credits = credits.loc[credits["artist_role_mode"].eq(credit_mode)].copy()
+    if credits.empty:
+        return pd.DataFrame()
+
+    # Build song-level career statistics within the selected credit universe.
+    song_level = (
+        credits.groupby(["artist_key", "song_key"], dropna=True)
+        .agg(
+            title=("title", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+            artist=("artist", lambda s: s.dropna().astype(str).mode().iloc[0] if not s.dropna().empty else ""),
+            chart_weeks=("entry_id", "nunique"),
+            peak=("position", "min"),
+            first_date=("chart_date", "min"),
+            last_date=("chart_date", "max"),
+        )
+        .reset_index()
+    )
+    if song_level.empty:
+        return pd.DataFrame()
+
+    song_level["chart_weeks"] = pd.to_numeric(song_level["chart_weeks"], errors="coerce").fillna(0).astype(int)
+    song_level["peak"] = pd.to_numeric(song_level["peak"], errors="coerce")
+    song_level["qualifies_as_hit"] = (
+        ((song_level["peak"] <= 20) & (song_level["chart_weeks"] >= ONE_HIT_WONDER_TOP20_MIN_WEEKS))
+        | ((song_level["peak"] >= 21) & (song_level["peak"] <= 40) & (song_level["chart_weeks"] >= ONE_HIT_WONDER_BOTTOM40_MIN_WEEKS))
+    )
+
+    song_level["qualifies_as_hit"] = song_level["qualifies_as_hit"].astype(bool)
+    hit_songs = song_level.loc[song_level["qualifies_as_hit"]].copy()
+    if hit_songs.empty:
+        return pd.DataFrame()
+
+    artist_song_counts = song_level.groupby("artist_key", dropna=True)["song_key"].nunique()
+    artist_hit_counts = hit_songs.groupby("artist_key", dropna=True)["song_key"].nunique()
+    one_hit_keys = artist_hit_counts.loc[artist_hit_counts.eq(1)].index
+
+    if wonder_type == "Strict one-hit wonder":
+        # Conventional one-hit-wonder definition adapted to TC Top 40: the artist
+        # has exactly one distinct TC Top 40 song, and that song qualifies as a hit.
+        one_hit_keys = one_hit_keys.intersection(artist_song_counts.loc[artist_song_counts.eq(1)].index)
+    elif wonder_type != "One qualifying hit":
+        wonder_type = "Strict one-hit wonder"
+
+    if len(one_hit_keys) == 0:
+        return pd.DataFrame()
+
+    out = hit_songs.loc[hit_songs["artist_key"].isin(one_hit_keys)].copy()
+    out = out.sort_values(["artist_key", "peak", "chart_weeks", "title"], ascending=[True, True, False, True])
+    out = out.drop_duplicates(subset=["artist_key"], keep="first").copy()
+    out["artist"] = out.apply(lambda r: preferred_artist_display(r["artist_key"], r["artist"]), axis=1)
+    out["peak"] = out["peak"].astype(int)
+    out["distinct_songs"] = out["artist_key"].map(artist_song_counts).astype(int)
+    out["hit_type"] = out["peak"].map(lambda p: "Top 20 hit" if p <= 20 else "#21-#40 hit")
+
+    return out[[
+        "artist_key", "artist", "title", "peak", "chart_weeks", "distinct_songs",
+        "first_date", "last_date", "hit_type",
+    ]].sort_values(
+        ["peak", "chart_weeks", "last_date", "artist"],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
+
+
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_artist_weekly_presence(df_artist_credits: pd.DataFrame) -> pd.DataFrame:
     if df_artist_credits.empty:
@@ -4972,6 +5063,100 @@ def _render_artists(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     artists = pkg["artists"]
     songs = pkg["songs"]
     artist_presence = pkg["artist_presence"]
+
+    artist_view = st.radio(
+        "Artists view",
+        ["Artist analytics", "One-Hit Wonders"],
+        horizontal=True,
+        key="analytics_artists_view",
+    )
+
+    if artist_view == "One-Hit Wonders":
+        st.markdown("### TC Top 40 One-Hit Wonders")
+        st.caption(
+            "A hit is a song that peaked #1-#20 and charted at least 20 weeks, "
+            "or peaked #21-#40 and charted at least 5 weeks. Strict one-hit wonders have exactly one distinct TC Top 40 song; "
+            "One qualifying hit allows additional non-qualifying TC Top 40 songs. This list uses the artist's full TC Top 40 history, "
+            "not the selected Analytics date window."
+        )
+
+        control_cols = st.columns([1.5, 1.3, 1.0, 1.0])
+        wonder_type = control_cols[0].radio(
+            "One-Hit Wonder Type",
+            ["Strict one-hit wonder", "One qualifying hit"],
+            index=0,
+            horizontal=True,
+            key="analytics_one_hit_type",
+            help=(
+                "Strict one-hit wonder = exactly one distinct TC Top 40 song, and it qualifies as a hit. "
+                "One qualifying hit = exactly one qualifying hit; other non-qualifying TC Top 40 songs are allowed."
+            ),
+        )
+        credit_mode = control_cols[1].radio(
+            "Credit mode",
+            ["Lead", "All", "Featured"],
+            index=0,
+            horizontal=True,
+            key="analytics_one_hit_credit_mode",
+        )
+        min_peak = control_cols[2].selectbox(
+            "Peak filter",
+            ["Any peak", "#1", "Top 5", "Top 10", "Top 20", "#21-#40"],
+            index=0,
+            key="analytics_one_hit_peak_filter",
+        )
+        row_limit = int(control_cols[3].slider(
+            "Rows", 10, 500, max(25, min(top_n, 100)), 10, key="analytics_one_hit_rows"
+        ))
+
+        one_hit = build_one_hit_wonders(credit_mode, wonder_type)
+        if one_hit.empty:
+            st.info("No qualifying one-hit wonders were found under the selected credit mode.")
+            return
+
+        peak_values = pd.to_numeric(one_hit["peak"], errors="coerce")
+        if min_peak == "#1":
+            one_hit = one_hit.loc[peak_values.eq(1)].copy()
+        elif min_peak == "Top 5":
+            one_hit = one_hit.loc[peak_values.le(5)].copy()
+        elif min_peak == "Top 10":
+            one_hit = one_hit.loc[peak_values.le(10)].copy()
+        elif min_peak == "Top 20":
+            one_hit = one_hit.loc[peak_values.le(20)].copy()
+        elif min_peak == "#21-#40":
+            one_hit = one_hit.loc[peak_values.ge(21) & peak_values.le(40)].copy()
+
+        if one_hit.empty:
+            st.info("No one-hit wonders match the selected peak filter.")
+            return
+
+        top_peak = int(one_hit["peak"].min())
+        top_qualifying_weeks = int(one_hit["chart_weeks"].max())
+        render_kpis([
+            ("One-hit wonders", len(one_hit)),
+            ("#1 one-hit wonders", int((peak_values.loc[one_hit.index] == 1).sum())),
+            ("Top 20 one-hit wonders", int((peak_values.loc[one_hit.index] <= 20).sum())),
+            ("Longest qualifying hit", top_qualifying_weeks),
+            ("Best peak", _fmt_rank(top_peak)),
+        ])
+
+        display = one_hit.head(row_limit).copy().rename(columns={
+            "artist": "Artist",
+            "title": "Only Qualifying Hit",
+            "peak": "Peak",
+            "chart_weeks": "Weeks",
+            "distinct_songs": "TC Top 40 Songs",
+            "first_date": "First Week",
+            "last_date": "Last Week",
+            "hit_type": "Hit Type",
+        })
+        display["Peak"] = display["Peak"].map(_fmt_rank)
+        _display_df(display[[
+            "Artist", "Only Qualifying Hit", "Peak", "Weeks", "TC Top 40 Songs",
+            "Hit Type", "First Week", "Last Week",
+        ]])
+        return
+
     if artists.empty:
         st.info("No artist-summary rows available for the selected filters.")
         return
