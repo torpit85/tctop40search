@@ -3077,6 +3077,52 @@ ONE_HIT_WONDER_BOTTOM40_MIN_WEEKS = 5
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def load_one_hit_wonder_base() -> pd.DataFrame:
+    """Load only the fields needed for full-career One-Hit Wonder analysis.
+
+    This deliberately avoids load_analytics_base(), which computes movement, next-week,
+    debut/re-entry, and other Analytics columns that the One-Hit Wonder calculation does
+    not use. The result still covers the full TC Top 40 history.
+    """
+    conn = get_connection()
+    sql = """
+        SELECT
+            e.entry_id,
+            cw.chart_date,
+            e.position,
+            e.song_title_display AS title,
+            e.full_artist_display AS artist,
+            e.lead_artist_display AS lead_artist,
+            e.featured_artist_display AS featured_artist,
+            e.normalized_lead_artist,
+            e.normalized_featured_artist,
+            e.normalized_song_title,
+            e.normalized_full_artist,
+            e.canonical_song_id
+        FROM entry e
+        JOIN chart_week cw ON cw.chart_week_id = e.chart_week_id
+        WHERE e.position BETWEEN 1 AND 40
+        ORDER BY cw.chart_date, e.position, e.entry_id
+    """
+    df = pd.read_sql_query(sql, conn)
+    if df.empty:
+        return df
+
+    df["chart_date"] = pd.to_datetime(df["chart_date"], errors="coerce")
+    df["position"] = pd.to_numeric(df["position"], errors="coerce")
+    df["song_key"] = df["canonical_song_id"].apply(
+        lambda x: f"cs_{int(x)}" if pd.notna(x) else None
+    )
+    fallback_song_key = (
+        df["normalized_song_title"].fillna("").astype(str).str.strip().str.lower()
+        + "||"
+        + df["normalized_full_artist"].fillna("").astype(str).str.strip().str.lower()
+    )
+    df["song_key"] = df["song_key"].fillna(fallback_song_key)
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
 def build_one_hit_wonders(artist_credit_mode: str = "Lead", wonder_type: str = "Strict one-hit wonder") -> pd.DataFrame:
     """Return artists matching the selected TC Top 40 one-hit-wonder definition.
 
@@ -3090,7 +3136,7 @@ def build_one_hit_wonders(artist_credit_mode: str = "Lead", wonder_type: str = "
     One qualifying hit: exactly one distinct qualifying hit; additional
     non-qualifying TC Top 40 songs are allowed.
     """
-    chart = load_analytics_base()
+    chart = load_one_hit_wonder_base()
     if chart.empty:
         return pd.DataFrame()
 
@@ -3431,9 +3477,30 @@ def _analytics_filtered_chart(start_date: dt.date, end_date: dt.date, include_re
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
-def _analytics_pkg_for_section(section: str, start_date: dt.date, end_date: dt.date, include_reentries: bool, min_weeks_on_chart: int) -> dict[str, pd.DataFrame]:
-    chart = _analytics_filtered_chart(start_date, end_date, include_reentries)
+def _analytics_pkg_for_section(
+    section: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    include_reentries: bool,
+    min_weeks_on_chart: int,
+    artist_view: str = "Artist analytics",
+) -> dict[str, pd.DataFrame]:
     empty = pd.DataFrame()
+    if section == "Artists" and artist_view == "One-Hit Wonders":
+        # One-Hit Wonders is intentionally a full-career view. It has its own
+        # lightweight history loader, so do not load the selected Analytics range
+        # or build the much heavier artist package first.
+        return {
+            "chart": empty,
+            "weekly": empty,
+            "songs": empty,
+            "artist_credits": empty,
+            "artist_presence": empty,
+            "artists": empty,
+            "years": empty,
+        }
+
+    chart = _analytics_filtered_chart(start_date, end_date, include_reentries)
     pkg: dict[str, pd.DataFrame] = {
         "chart": chart,
         "weekly": empty,
@@ -3447,8 +3514,8 @@ def _analytics_pkg_for_section(section: str, start_date: dt.date, end_date: dt.d
         return pkg
 
     needs_weekly = section in {"Overview", "Movement", "Years & Eras", "Records & Outliers"}
-    needs_songs = section in {"Longevity", "Artists", "Years & Eras", "Records & Outliers"}
-    needs_artist_stack = section in {"Artists", "Records & Outliers"}
+    needs_songs = section in {"Longevity", "Years & Eras", "Records & Outliers"} or (section == "Artists" and artist_view == "Artist analytics")
+    needs_artist_stack = section in {"Records & Outliers"} or (section == "Artists" and artist_view == "Artist analytics")
     needs_years = section == "Years & Eras"
 
     weekly = build_weekly_summary(chart) if needs_weekly else empty
@@ -5059,17 +5126,10 @@ def _render_longevity(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
             _display_df(history, ["chart_date", "position", "last_week_position", "move", "weeks_on_chart", "derived_marker"])
 
 
-def _render_artists(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
+def _render_artists(pkg: dict[str, pd.DataFrame], top_n: int, artist_view: str) -> None:
     artists = pkg["artists"]
     songs = pkg["songs"]
     artist_presence = pkg["artist_presence"]
-
-    artist_view = st.radio(
-        "Artists view",
-        ["Artist analytics", "One-Hit Wonders"],
-        horizontal=True,
-        key="analytics_artists_view",
-    )
 
     if artist_view == "One-Hit Wonders":
         st.markdown("### TC Top 40 One-Hit Wonders")
@@ -8116,7 +8176,23 @@ def render_analytics_tab() -> None:
         st.caption("Analytics section data is paused. Turn on 'Load section' when you want to render the selected Analytics view.")
         return
 
-    pkg = _analytics_pkg_for_section(section, start_date, end_date, include_reentries, min_weeks)
+    artist_view = "Artist analytics"
+    if section == "Artists":
+        artist_view = st.radio(
+            "Artists view",
+            ["Artist analytics", "One-Hit Wonders"],
+            horizontal=True,
+            key="analytics_artists_view",
+        )
+
+    pkg = _analytics_pkg_for_section(
+        section,
+        start_date,
+        end_date,
+        include_reentries,
+        min_weeks,
+        artist_view,
+    )
 
     def _render_selected_section() -> None:
         if section == "Overview":
@@ -8126,7 +8202,7 @@ def render_analytics_tab() -> None:
         elif section == "Longevity":
             _render_longevity(pkg, top_n)
         elif section == "Artists":
-            _render_artists(pkg, top_n)
+            _render_artists(pkg, top_n, artist_view)
         elif section == "Years & Eras":
             _render_years_eras(pkg, top_n)
         elif section == "Records & Outliers":
