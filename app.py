@@ -1157,6 +1157,148 @@ def load_analytics_base() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=CACHE_MAX_ENTRIES)
+def build_showing_life_events(start_date: dt.date | None = None, end_date: dt.date | None = None) -> pd.DataFrame:
+    """Find Showing Life Gain events and evaluate the strict Showing Life feat.
+
+    A Showing Life Gain occurs during a song's initial uninterrupted run, at least
+    five chart weeks after debut, when the song moves directly from #31-40 to #1-10.
+
+    A strict Showing Life additionally requires:
+      - debut at #26-40;
+      - an initial peak of #6-24 before the first collapse into #31-40;
+      - the overall ultimate peak is reached within three chart weeks of the gain.
+
+    The full chart history is used to evaluate each song, while start/end dates
+    filter which Showing Life Gain events are displayed.
+    """
+    chart = load_analytics_base()
+    if chart.empty:
+        return pd.DataFrame()
+
+    needed = [
+        "song_key", "chart_date", "position", "title", "artist",
+        "derived_is_debut", "derived_is_reentry",
+    ]
+    work = chart[[c for c in needed if c in chart.columns]].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    for col in ["position", "derived_is_debut", "derived_is_reentry"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work["derived_is_debut"] = work["derived_is_debut"].fillna(0).astype(int)
+    work["derived_is_reentry"] = work["derived_is_reentry"].fillna(0).astype(int)
+    work = work.sort_values(["song_key", "chart_date", "position", "title"]).reset_index(drop=True)
+
+    rows: list[dict[str, object]] = []
+
+    for song_key, group in work.groupby("song_key", sort=False):
+        group = group.sort_values(["chart_date", "position", "title"]).reset_index(drop=True)
+        if group.empty:
+            continue
+
+        debut_idx_list = group.index[group["derived_is_debut"].eq(1)].tolist()
+        debut_idx = debut_idx_list[0] if debut_idx_list else 0
+        debut_date = group.loc[debut_idx, "chart_date"]
+        debut_position = int(group.loc[debut_idx, "position"])
+
+        reentry_idx_list = group.index[group["derived_is_reentry"].eq(1)].tolist()
+        first_reentry_idx = reentry_idx_list[0] if reentry_idx_list else None
+
+        # A Showing Life Gain must occur before the song's first re-entry.
+        initial_run_end = first_reentry_idx - 1 if first_reentry_idx is not None else len(group) - 1
+        if initial_run_end < 5:
+            continue
+        initial_run = group.iloc[: initial_run_end + 1].copy()
+
+        # At least five chart weeks following debut means the sixth chart
+        # appearance or later.
+        for idx in range(5, len(initial_run)):
+            current = initial_run.iloc[idx]
+            previous = initial_run.iloc[idx - 1]
+
+            if not (
+                pd.notna(previous["position"])
+                and 31 <= float(previous["position"]) <= 40
+                and pd.notna(current["position"])
+                and 1 <= float(current["position"]) <= 10
+            ):
+                continue
+
+            # Find the first collapse into #31-40 after the song has first
+            # established itself above the bottom third. The best rank before
+            # that collapse is the initial peak for this feat.
+            collapse_idx = None
+            had_above_bottom = False
+            for j in range(idx + 1):
+                pos_value = initial_run.iloc[j]["position"]
+                if pd.isna(pos_value):
+                    continue
+                pos_value = float(pos_value)
+                if pos_value <= 30:
+                    had_above_bottom = True
+                elif had_above_bottom and 31 <= pos_value <= 40:
+                    collapse_idx = j
+                    break
+
+            if collapse_idx is None or collapse_idx <= 0:
+                continue
+
+            pre_collapse = initial_run.iloc[:collapse_idx]
+            initial_peak = int(pre_collapse["position"].min())
+            initial_peak_row = pre_collapse.loc[pre_collapse["position"].idxmin()]
+
+            overall_peak = int(group["position"].min())
+            ultimate_peak_dates = group.loc[group["position"].eq(overall_peak), "chart_date"].tolist()
+            event_window_dates = initial_run.iloc[idx : min(idx + 4, len(initial_run))]["chart_date"].tolist()
+            ultimate_peak_within_3 = bool(set(ultimate_peak_dates).intersection(event_window_dates))
+
+            failures: list[str] = []
+            if not 26 <= debut_position <= 40:
+                failures.append("Debut outside #26–40")
+            if not 6 <= initial_peak <= 24:
+                failures.append("Initial peak outside #6–24")
+            if not ultimate_peak_within_3:
+                failures.append("Ultimate peak not within 3 weeks")
+
+            showing_life_date = current["chart_date"]
+            if start_date is not None and showing_life_date.date() < start_date:
+                continue
+            if end_date is not None and showing_life_date.date() > end_date:
+                continue
+
+            rows.append({
+                "song_key": song_key,
+                "song": str(current["title"]),
+                "artist": str(current["artist"]),
+                "debut_date": debut_date,
+                "debut_position": debut_position,
+                "initial_peak": initial_peak,
+                "initial_peak_date": initial_peak_row["chart_date"],
+                "collapse_date": initial_run.iloc[collapse_idx]["chart_date"],
+                "collapse_position": int(initial_run.iloc[collapse_idx]["position"]),
+                "showing_life_date": showing_life_date,
+                "from_position": int(previous["position"]),
+                "showing_life_position": int(current["position"]),
+                "gain": int(previous["position"] - current["position"]),
+                "weeks_after_debut": int(idx),
+                "ultimate_peak": overall_peak,
+                "ultimate_peak_date": group.loc[group["position"].eq(overall_peak), "chart_date"].min(),
+                "ultimate_peak_within_3": ultimate_peak_within_3,
+                "failures": "; ".join(failures) if failures else "",
+                "fail_count": len(failures),
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["fail_count", "showing_life_date", "song", "artist"], ascending=[True, False, True, True])
+        .reset_index(drop=True)
+    )
+
+
 def _momentum_debut_bonus(position: object) -> float:
     pos = _safe_int(position)
     if pos is None:
@@ -3583,6 +3725,20 @@ DISPLAY_COLUMN_SHORT_NAMES = {
     "best_peak": "Best Peak",
     "week_hit_peak": "Hit Peak",
     "Week Hit Peak": "Hit Peak",
+    "debut_date": "Debut",
+    "debut_position": "Debut Pos",
+    "initial_peak": "Initial Peak",
+    "initial_peak_date": "Initial Peak Wk",
+    "collapse_date": "Bottom-Third Wk",
+    "collapse_position": "Bottom Pos",
+    "showing_life_date": "Showing Life",
+    "from_position": "From",
+    "showing_life_position": "To",
+    "gain": "Gain",
+    "weeks_after_debut": "Wks After Debut",
+    "ultimate_peak": "Ultimate Peak",
+    "ultimate_peak_date": "Ultimate Peak Wk",
+    "failures": "Failed Rule",
     "derived_marker": "Marker",
     "derived_marker_with_momentum": "Marker",
 
@@ -5348,7 +5504,7 @@ def _render_years_eras(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
             _display_df(years.sort_values(["avg_chart_age", "year"], ascending=[False, False]).head(top_n), ["year", "avg_chart_age", "avg_top10_age", "debuts", "avg_turnover"])
 
 
-def _render_records_outliers(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
+def _render_records_outliers(pkg: dict[str, pd.DataFrame], top_n: int, start_date: dt.date | None = None, end_date: dt.date | None = None) -> None:
     songs = pkg["songs"]
     artists = pkg["artists"]
     weekly = pkg["weekly"]
@@ -5360,6 +5516,104 @@ def _render_records_outliers(pkg: dict[str, pd.DataFrame], top_n: int) -> None:
     def _analytics_table(title: str, df: pd.DataFrame, columns: list[str] | None = None) -> None:
         st.markdown(f"**{title}**")
         _display_df(df, columns)
+
+    showing_life = build_showing_life_events(start_date, end_date)
+    if showing_life.empty:
+        st.markdown("### Showing Life")
+        st.info("No Showing Life Gain events were found in the selected date range.")
+    else:
+        strict = showing_life.loc[showing_life["fail_count"].eq(0)].copy()
+        near_one = showing_life.loc[showing_life["fail_count"].eq(1)].copy()
+        near_broader = showing_life.loc[showing_life["fail_count"].ge(2)].copy()
+
+        render_kpis([
+            ("Showing Life Gains", int(len(showing_life))),
+            ("Distinct songs", int(showing_life["song_key"].nunique())),
+            ("Strict Showing Life", int(strict["song_key"].nunique())),
+            ("1-rule near-misses", int(near_one["song_key"].nunique())),
+        ])
+
+        st.markdown("### Showing Life")
+        st.caption(
+            "Showing Life Gain = an initial-run #31–40 → #1–10 jump at least five chart weeks after debut. "
+            "Strict Showing Life additionally requires a #26–40 debut, an initial #6–24 peak before the "
+            "bottom-third collapse, and the ultimate peak within three weeks of the gain. "
+            "The song's full chart history is used even when the Analytics date range is narrower."
+        )
+
+        sl_tabs = st.tabs(["Strict Showing Life", "Near-Misses", "All Showing Life Gains"])
+
+        with sl_tabs[0]:
+            if strict.empty:
+                st.info("No strict Showing Life songs in the selected date range.")
+            else:
+                strict_display = strict.sort_values(
+                    ["showing_life_date", "song", "artist"], ascending=[False, True, True]
+                ).head(top_n)
+                _analytics_table(
+                    f"Strict Showing Life ({len(strict):,} qualifying gain event(s))",
+                    strict_display,
+                    [
+                        "song", "artist", "debut_date", "debut_position", "initial_peak", "initial_peak_date",
+                        "collapse_date", "collapse_position", "showing_life_date", "from_position",
+                        "showing_life_position", "gain", "weeks_after_debut", "ultimate_peak",
+                        "ultimate_peak_date",
+                    ],
+                )
+
+        with sl_tabs[1]:
+            if near_one.empty:
+                st.info("No one-rule near-misses in the selected date range.")
+            else:
+                near_display = near_one.sort_values(
+                    ["showing_life_date", "song", "artist"], ascending=[False, True, True]
+                ).head(top_n)
+                _analytics_table(
+                    f"One-rule near-misses ({len(near_one):,} gain event(s))",
+                    near_display,
+                    [
+                        "song", "artist", "showing_life_date", "from_position", "showing_life_position",
+                        "gain", "debut_date", "debut_position", "initial_peak", "collapse_date",
+                        "ultimate_peak", "ultimate_peak_date", "weeks_after_debut", "failures",
+                    ],
+                )
+
+            with st.expander(
+                f"Broader near-misses (2+ failed rules: {len(near_broader):,} gain event(s))",
+                expanded=False,
+            ):
+                if near_broader.empty:
+                    st.caption("No broader near-misses in the selected date range.")
+                else:
+                    broader_display = near_broader.sort_values(
+                        ["fail_count", "showing_life_date", "song", "artist"],
+                        ascending=[True, False, True, True],
+                    ).head(top_n)
+                    _analytics_table(
+                        "Two-or-more-rule near-misses",
+                        broader_display,
+                        [
+                            "song", "artist", "showing_life_date", "from_position", "showing_life_position",
+                            "gain", "debut_date", "debut_position", "initial_peak", "collapse_date",
+                            "ultimate_peak", "ultimate_peak_date", "weeks_after_debut", "failures",
+                        ],
+                    )
+
+        with sl_tabs[2]:
+            all_gain_display = showing_life.sort_values(
+                ["showing_life_date", "song", "artist"], ascending=[False, True, True]
+            ).head(top_n)
+            _analytics_table(
+                f"Showing Life Gain events ({len(showing_life):,} total)",
+                all_gain_display,
+                [
+                    "song", "artist", "showing_life_date", "from_position", "showing_life_position",
+                    "gain", "weeks_after_debut", "debut_date", "debut_position", "initial_peak",
+                    "collapse_date", "ultimate_peak", "ultimate_peak_date", "fail_count", "failures",
+                ],
+            )
+
+        st.divider()
 
     valid_moves = chart.loc[chart["move"].notna()].copy()
     render_kpis([
@@ -8206,7 +8460,7 @@ def render_analytics_tab() -> None:
         elif section == "Years & Eras":
             _render_years_eras(pkg, top_n)
         elif section == "Records & Outliers":
-            _render_records_outliers(pkg, top_n)
+            _render_records_outliers(pkg, top_n, start_date, end_date)
 
     if show_charts:
         _render_selected_section()
