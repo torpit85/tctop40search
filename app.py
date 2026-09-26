@@ -1165,7 +1165,7 @@ def build_showing_life_events(start_date: dt.date | None = None, end_date: dt.da
     five chart weeks after debut, when the song moves directly from #31-40 to #1-10.
 
     A strict Showing Life additionally requires:
-      - debut at #26-40;
+      - debut at #11-40;
       - an initial peak of #6-24 before the first collapse into #31-40;
       - the overall ultimate peak is reached within three chart weeks of the gain.
 
@@ -1254,8 +1254,8 @@ def build_showing_life_events(start_date: dt.date | None = None, end_date: dt.da
             ultimate_peak_within_3 = bool(set(ultimate_peak_dates).intersection(event_window_dates))
 
             failures: list[str] = []
-            if not 26 <= debut_position <= 40:
-                failures.append("Debut outside #26–40")
+            if not 11 <= debut_position <= 40:
+                failures.append("Debut outside #11–40")
             if not 6 <= initial_peak <= 24:
                 failures.append("Initial peak outside #6–24")
             if not ultimate_peak_within_3:
@@ -5516,104 +5516,6 @@ def _render_records_outliers(pkg: dict[str, pd.DataFrame], top_n: int, start_dat
     def _analytics_table(title: str, df: pd.DataFrame, columns: list[str] | None = None) -> None:
         st.markdown(f"**{title}**")
         _display_df(df, columns)
-
-    showing_life = build_showing_life_events(start_date, end_date)
-    if showing_life.empty:
-        st.markdown("### Showing Life")
-        st.info("No Showing Life Gain events were found in the selected date range.")
-    else:
-        strict = showing_life.loc[showing_life["fail_count"].eq(0)].copy()
-        near_one = showing_life.loc[showing_life["fail_count"].eq(1)].copy()
-        near_broader = showing_life.loc[showing_life["fail_count"].ge(2)].copy()
-
-        render_kpis([
-            ("Showing Life Gains", int(len(showing_life))),
-            ("Distinct songs", int(showing_life["song_key"].nunique())),
-            ("Strict Showing Life", int(strict["song_key"].nunique())),
-            ("1-rule near-misses", int(near_one["song_key"].nunique())),
-        ])
-
-        st.markdown("### Showing Life")
-        st.caption(
-            "Showing Life Gain = an initial-run #31–40 → #1–10 jump at least five chart weeks after debut. "
-            "Strict Showing Life additionally requires a #26–40 debut, an initial #6–24 peak before the "
-            "bottom-third collapse, and the ultimate peak within three weeks of the gain. "
-            "The song's full chart history is used even when the Analytics date range is narrower."
-        )
-
-        sl_tabs = st.tabs(["Strict Showing Life", "Near-Misses", "All Showing Life Gains"])
-
-        with sl_tabs[0]:
-            if strict.empty:
-                st.info("No strict Showing Life songs in the selected date range.")
-            else:
-                strict_display = strict.sort_values(
-                    ["showing_life_date", "song", "artist"], ascending=[False, True, True]
-                ).head(top_n)
-                _analytics_table(
-                    f"Strict Showing Life ({len(strict):,} qualifying gain event(s))",
-                    strict_display,
-                    [
-                        "song", "artist", "debut_date", "debut_position", "initial_peak", "initial_peak_date",
-                        "collapse_date", "collapse_position", "showing_life_date", "from_position",
-                        "showing_life_position", "gain", "weeks_after_debut", "ultimate_peak",
-                        "ultimate_peak_date",
-                    ],
-                )
-
-        with sl_tabs[1]:
-            if near_one.empty:
-                st.info("No one-rule near-misses in the selected date range.")
-            else:
-                near_display = near_one.sort_values(
-                    ["showing_life_date", "song", "artist"], ascending=[False, True, True]
-                ).head(top_n)
-                _analytics_table(
-                    f"One-rule near-misses ({len(near_one):,} gain event(s))",
-                    near_display,
-                    [
-                        "song", "artist", "showing_life_date", "from_position", "showing_life_position",
-                        "gain", "debut_date", "debut_position", "initial_peak", "collapse_date",
-                        "ultimate_peak", "ultimate_peak_date", "weeks_after_debut", "failures",
-                    ],
-                )
-
-            with st.expander(
-                f"Broader near-misses (2+ failed rules: {len(near_broader):,} gain event(s))",
-                expanded=False,
-            ):
-                if near_broader.empty:
-                    st.caption("No broader near-misses in the selected date range.")
-                else:
-                    broader_display = near_broader.sort_values(
-                        ["fail_count", "showing_life_date", "song", "artist"],
-                        ascending=[True, False, True, True],
-                    ).head(top_n)
-                    _analytics_table(
-                        "Two-or-more-rule near-misses",
-                        broader_display,
-                        [
-                            "song", "artist", "showing_life_date", "from_position", "showing_life_position",
-                            "gain", "debut_date", "debut_position", "initial_peak", "collapse_date",
-                            "ultimate_peak", "ultimate_peak_date", "weeks_after_debut", "failures",
-                        ],
-                    )
-
-        with sl_tabs[2]:
-            all_gain_display = showing_life.sort_values(
-                ["showing_life_date", "song", "artist"], ascending=[False, True, True]
-            ).head(top_n)
-            _analytics_table(
-                f"Showing Life Gain events ({len(showing_life):,} total)",
-                all_gain_display,
-                [
-                    "song", "artist", "showing_life_date", "from_position", "showing_life_position",
-                    "gain", "weeks_after_debut", "debut_date", "debut_position", "initial_peak",
-                    "collapse_date", "ultimate_peak", "ultimate_peak_date", "fail_count", "failures",
-                ],
-            )
-
-        st.divider()
 
     valid_moves = chart.loc[chart["move"].notna()].copy()
     render_kpis([
@@ -12120,6 +12022,7 @@ QUICK_CHART_FEAT_CATEGORIES: dict[str, list[str]] = {
         "#1 songs with the lowest total chart weeks",
     ],
     "Comebacks & Re-entries": [
+        "Showing Life",
         "Biggest comeback to a new peak",
         "Songs that re-entered and later hit a new peak",
         "Longest gap between appearances",
@@ -12278,6 +12181,33 @@ def render_quick_chart_feats() -> None:
         st.markdown("**Artist-exclusive Top 2–5**")
         st.caption("Top 2 means an artist appears on both #1 and #2; Top 3 means #1–#3 only; Top 4 means #1–#4 only; Top 5 means #1–#5. Lead and featured/GUEST appearances count.")
         _display_df(build_quick_artist_exclusive_top25(limit))
+    elif feat_view == "Showing Life":
+        showing_life_view = st.radio(
+            "Showing Life view",
+            ["Strict Showing Life", "Near-Misses", "All Showing Life Gains"],
+            horizontal=True,
+            key="quick_showing_life_view",
+        )
+        showing_life = build_showing_life_events()
+        if showing_life.empty:
+            st.info("No Showing Life Gain events were found.")
+        else:
+            strict = showing_life.loc[showing_life["fail_count"].eq(0)].copy()
+            near_one = showing_life.loc[showing_life["fail_count"].eq(1)].copy()
+            if showing_life_view == "Strict Showing Life":
+                table = strict.sort_values(["showing_life_date", "song", "artist"], ascending=[False, True, True]).head(limit)
+                st.caption("Strict Showing Life requires a #11–40 debut, an initial #6–24 peak before the bottom-third collapse, and the ultimate peak within three chart weeks of the gain. The gain itself must be an initial-run #31–40 → #1–10 jump at least five chart weeks after debut.")
+            elif showing_life_view == "Near-Misses":
+                table = near_one.sort_values(["showing_life_date", "song", "artist"], ascending=[False, True, True]).head(limit)
+                st.caption("One-rule near-misses: Showing Life Gain events that miss exactly one strict rule.")
+            else:
+                table = showing_life.sort_values(["showing_life_date", "song", "artist"], ascending=[False, True, True]).head(limit)
+                st.caption("All Showing Life Gain events, including strict matches and near-misses.")
+            _display_df(table, [
+                "song", "artist", "showing_life_date", "from_position", "showing_life_position",
+                "gain", "weeks_after_debut", "debut_date", "debut_position", "initial_peak",
+                "collapse_date", "ultimate_peak", "ultimate_peak_date", "fail_count", "failures",
+            ])
     else:
         internal_view = feat_view
         if feat_view == "Most weeks at #2 without reaching #1":
