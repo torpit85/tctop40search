@@ -1167,7 +1167,8 @@ def build_showing_life_events(start_date: dt.date | None = None, end_date: dt.da
     A strict Showing Life additionally requires:
       - debut at #11-40;
       - an initial peak of #6-24 before the first collapse into #31-40;
-      - the overall ultimate peak is reached within three chart weeks of the gain.
+      - the overall ultimate peak is reached within five chart weeks of the gain;
+      - the Showing Life Gain occurs before or during the song's ultimate peak.
 
     The full chart history is used to evaluate each song, while start/end dates
     filter which Showing Life Gain events are displayed.
@@ -1250,18 +1251,22 @@ def build_showing_life_events(start_date: dt.date | None = None, end_date: dt.da
 
             overall_peak = int(group["position"].min())
             ultimate_peak_dates = group.loc[group["position"].eq(overall_peak), "chart_date"].tolist()
-            event_window_dates = initial_run.iloc[idx : min(idx + 4, len(initial_run))]["chart_date"].tolist()
-            ultimate_peak_within_3 = bool(set(ultimate_peak_dates).intersection(event_window_dates))
+            ultimate_peak_date = min(ultimate_peak_dates)
+            event_window_dates = initial_run.iloc[idx : min(idx + 6, len(initial_run))]["chart_date"].tolist()
+            ultimate_peak_within_5 = bool(set(ultimate_peak_dates).intersection(event_window_dates))
+
+            showing_life_date = current["chart_date"]
+            gain_before_or_during_ultimate_peak = showing_life_date <= ultimate_peak_date
 
             failures: list[str] = []
             if not 11 <= debut_position <= 40:
                 failures.append("Debut outside #11–40")
             if not 6 <= initial_peak <= 24:
                 failures.append("Initial peak outside #6–24")
-            if not ultimate_peak_within_3:
-                failures.append("Ultimate peak not within 3 weeks")
-
-            showing_life_date = current["chart_date"]
+            if not ultimate_peak_within_5:
+                failures.append("Ultimate peak not within 5 weeks")
+            if not gain_before_or_during_ultimate_peak:
+                failures.append("Showing Life Gain occurs after ultimate peak")
             if start_date is not None and showing_life_date.date() < start_date:
                 continue
             if end_date is not None and showing_life_date.date() > end_date:
@@ -1283,8 +1288,9 @@ def build_showing_life_events(start_date: dt.date | None = None, end_date: dt.da
                 "gain": int(previous["position"] - current["position"]),
                 "weeks_after_debut": int(idx),
                 "ultimate_peak": overall_peak,
-                "ultimate_peak_date": group.loc[group["position"].eq(overall_peak), "chart_date"].min(),
-                "ultimate_peak_within_3": ultimate_peak_within_3,
+                "ultimate_peak_date": ultimate_peak_date,
+                "ultimate_peak_within_5": ultimate_peak_within_5,
+                "gain_before_or_during_ultimate_peak": gain_before_or_during_ultimate_peak,
                 "failures": "; ".join(failures) if failures else "",
                 "fail_count": len(failures),
             })
